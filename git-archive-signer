@@ -64,6 +64,7 @@ fi
 echo -n "Generate signature note for ${PREFIX}.tar? [Y/n] "
 read YN
 
+[[ -z "${YN}" ]] && YN=y
 if [ "${YN}" != "y" ]; then
     exit 1
 fi
@@ -98,6 +99,7 @@ echo -n "Push to ${REMOTE}? [Y/n] "
 read YN
 echo
 
+[[ -z "${YN}" ]] && YN=y
 if [ "${YN}" != "y" ]; then
     echo "Remember to push it using:"
     echo "    git push ${REMOTE} refs/notes/*"
