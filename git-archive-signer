@@ -1,0 +1,108 @@
+#!/bin/bash
+#
+# git-archive-signer
+# ------------------
+# Use this script to create a tarball signature for a tag and store
+# it as part of the repo (using git notes, as supported by cgit).
+#
+# Pass the tag as the only parameter, or we'll grab the tag
+# corresponding to the latest commit.
+TAG=$1
+
+# Set this to your gitolite.kernel.org remote
+# We'll also use git config --get archive-signer.remote if we find it
+REMOTE="$(git config --get archive-signer.remote)"
+if [ -z "${REMOTE}" ]; then
+    REMOTE="origin"
+fi
+
+# Change this if your gpg2 is elsewhere
+GPGBIN="/usr/bin/gpg2"
+
+# If you want to use a specific key (or subkey) instead of the default,
+# then edit and uncomment this line. If you have multiple valid signing
+# subkeys, then add the exact subkey ID and add a "!" at the end.
+# We'll also use git config archive-signer.usekey value if we find it
+#USEKEY="Ox12345678DEADBEEF"
+USEKEY="$(git config --get archive-signer.usekey)"
+
+# We use TARNAME when making a git archive --prefix, e.g. $TARNAME-1.2.3/
+# Set it here if guessing basename is wrong.
+# We'll also use git config archive-signer.tarname value if we find it
+TARNAME="$(git config --get archive-signer.tarname)"
+if [ -z "${TARNAME}" ]; then
+    TARNAME="$(basename $(pwd))"
+fi
+
+# You shouldn't need to change anything below
+
+if [ -z "${TAG}" ]; then
+    # Assume you want the latest tag
+    TAG="$(git describe --abbrev=0)"
+    if [ -z "${TAG}" ]; then
+        echo "Could not figure out which tag you want"
+        exit 1
+    fi
+fi
+
+# The archive prefix will be created as $TARNAME-$TAG/ (sans leading v)
+# Change it here if it doesn't correspond to your needs
+# We'll add the trailing / where it is needed, so don't add it here
+PREFIX="${TARNAME}-${TAG#v}"
+
+# Don't change this if you want this to actually work
+NOTEREF="refs/notes/signatures/tar"
+
+# Do we already have a signature note for this tag?
+if git notes --ref=$NOTEREF list $TAG >/dev/null 2>&1; then
+    echo "Signature note for ${TAG} already exists!"
+    echo "To make a new one, delete it first:"
+    echo "    git notes --ref=${NOTEREF} remove ${TAG}"
+    exit 1
+fi
+
+echo -n "Generate signature note for ${PREFIX}.tar? [Y/n] "
+read YN
+
+if [ "${YN}" != "y" ]; then
+    exit 1
+fi
+
+# We add the exact archive line to sig comments,
+# so put it together here
+GIT_ARCHIVE_CMD="git archive --format tar --prefix=${PREFIX}/ ${TAG}"
+# Record the version of git that created this archive
+GIT_VERSION=$(git --version)
+
+if [ ! -z "${USEKEY}" ]; then
+    GPGBIN="${GPGBIN} -u ${USEKEY}"
+fi
+
+git notes --ref=$NOTEREF add -C "$(
+    $GIT_ARCHIVE_CMD | $GPGBIN -a -b -o - \
+        --comment "This signature is for the .tar version of the archive" \
+        --comment "$GIT_ARCHIVE_CMD" \
+        --comment "$GIT_VERSION" |
+        git hash-object -w --stdin)" "${TAG}"
+
+if [ "$?" != "0" ]; then
+    echo "git notes exited with error"
+    exit 1
+fi
+
+echo
+git --no-pager notes --ref=$NOTEREF show ${TAG}
+echo
+
+echo -n "Push to ${REMOTE}? [Y/n] "
+read YN
+echo
+
+if [ "${YN}" != "y" ]; then
+    echo "Remember to push it using:"
+    echo "    git push ${REMOTE} refs/notes/*"
+    exit 0
+fi
+
+echo "Pushing notes to ${REMOTE}..."
+git push ${REMOTE} refs/notes/*
