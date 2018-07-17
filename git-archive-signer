@@ -5,8 +5,8 @@
 # Use this script to create a tarball signature for a tag and store
 # it as part of the repo (using git notes, as supported by cgit).
 #
-# Pass the tag as the only parameter, or we'll grab the tag
-# corresponding to the latest commit.
+# Pass the tag as the only parameter, otherwise we grab the latest
+# annotated tag we find.
 TAG=$1
 
 # Set this to your gitolite.kernel.org remote
