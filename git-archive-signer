@@ -54,6 +54,9 @@ PREFIX="${TARNAME}-${TAG#v}"
 NOTEREF="refs/notes/signatures/tar"
 
 # Do we already have a signature note for this tag?
+# Start by fetching the origin notes
+echo "Updating notes from remote"
+git fetch $REMOTE "refs/notes/*:refs/notes/*"
 if git notes --ref=$NOTEREF list $TAG >/dev/null 2>&1; then
     echo "Signature note for ${TAG} already exists!"
     echo "To make a new one, delete it first:"
