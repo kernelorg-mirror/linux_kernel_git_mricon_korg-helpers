@@ -4,9 +4,18 @@
 # ------------------
 # Use this script to create a tarball signature for a tag and store
 # it as part of the repo (using git notes, as supported by cgit).
-#
+
+# Don't change this if you want this to actually work
+NOTEREF="refs/notes/signatures/tar"
+
 # Pass the tag as the only parameter, otherwise we grab the latest
-# annotated tag we find.
+# annotated tag we find. You may also pass "list" to list all tags that
+# already carry corresponding signature notes.
+if [ "$1" == "list" ]; then
+    git notes --ref $NOTEREF list | cut -d' ' -f2 | xargs git describe
+    exit 0
+fi
+
 TAG=$1
 
 # Set this to your gitolite.kernel.org remote
@@ -49,9 +58,6 @@ fi
 # Change it here if it doesn't correspond to your needs
 # We'll add the trailing / where it is needed, so don't add it here
 PREFIX="${TARNAME}-${TAG#v}"
-
-# Don't change this if you want this to actually work
-NOTEREF="refs/notes/signatures/tar"
 
 # Do we already have a signature note for this tag?
 # Start by fetching the origin notes
