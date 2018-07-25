@@ -1,0 +1,66 @@
+#!/bin/bash
+# linux-bundle-clone
+# ------------------
+# Use this script to clone a Linux repository using a CDN-hosted bundle.
+# This is the recommended way to clone Linux in a CI environment where
+# the full repository needs to be cloned every time.
+REMOTE=$1
+if [ -z "${REMOTE}" ]; then
+    echo "Please specify the remote to clone"
+    echo "Example: $0 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
+    exit 1
+fi
+
+TARGET=$2
+if [ -z "${TARGET}" ]; then
+    echo "Please specify the target directory"
+    echo "Example: $0 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
+    exit 1
+fi
+
+CHECKOUT=$3
+if [ -z "${CHECKOUT}" ]; then
+    CHECKOUT=master
+fi
+
+# You can also use "http" if you are behind a caching proxy and want to
+# benefit from a locally stored copy. Initial time to first byte may be
+# long if the CDN frontend doesn't have the copy of the bundle yet, but
+# repeat requests will use the cached CDN copy.
+#
+# NOTICE: Pick the tree that's likely to have most of the objects you want
+#         We have mainline, stable, and linux-next bundles for you to choose
+#CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/stable/linux/clone.bundle"
+#CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/next/linux-next/clone.bundle"
+CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/torvalds/linux/clone.bundle"
+
+# We'll put the bundle into a safe temp location, but WARNING -- it's a
+# 1Gb+ file, so if you have limited space in /tmp, you should consider
+# changing the path here. See "man mktemp".
+BUNDLELOCAL=$(mktemp /tmp/linux.XXXXXXXXXX.bundle)
+
+echo "Getting the bundle file"
+if ! curl -L $CDNBUNDLE -o $BUNDLELOCAL; then
+    echo "Getting the clone bundle failed."
+    # clean up to not litter huge files around
+    rm -f $BUNDLELOCAL
+    exit 1
+fi
+
+echo "Cloning from the bundle file"
+if ! git clone $BUNDLELOCAL $TARGET; then
+    echo "Cloning from bundle failed."
+    echo "The bundle is in ${BUNDLELOCAL}"
+    exit 1
+fi
+
+# We're done with the bundle now
+rm -f $BUNDLELOCAL
+
+cd $TARGET
+echo "Fetching latest objects"
+git remote remove origin
+git remote add origin $REMOTE
+git remote update origin
+
+git checkout $CHECKOUT
