@@ -36,6 +36,8 @@ GPGBIN="/usr/bin/gpg2"
 GPGVBIN="/usr/bin/gpgv2"
 # We need a compatible version of sha256sum, too
 SHA256SUMBIN="/usr/bin/sha256sum"
+# And curl
+CURLBIN="/usr/bin/curl"
 # And we need the xz binary
 XZBIN="/usr/bin/xz"
 
@@ -51,7 +53,7 @@ SHAKEYS="autosigner@kernel.org"
 VER=$1
 if [ -z "$VER" ]; then
     # Assume you want the latest stable
-    VER=$(curl -sL https://www.kernel.org/finger_banner \
+    VER=$($CURLBIN -sL https://www.kernel.org/finger_banner \
           | grep 'latest stable' \
           | awk -F: '{gsub(/ /,"", $0); print $2}')
 fi
@@ -141,7 +143,7 @@ SHA="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
 
 SHAFILE=$TMPDIR/sha256sums.asc
 echo "Downloading the checksums file for linux-$VER"
-if ! curl -sL -o $SHAFILE $SHA; then
+if ! $CURLBIN -sL -o $SHAFILE $SHA; then
     echo "Failed to download the checksums file"
     rm -rf $TMPDIR
     exit 1
@@ -161,14 +163,14 @@ grep "linux-$VER.tar.xz" $SHAFILE > $SHACHECK
 echo
 echo "Downloading the signature file for linux-$VER"
 SIGFILE=$TMPDIR/linux-${VER}.tar.asc
-if ! curl -sL -o $SIGFILE $SIG; then
-    echo "Failed to download the checksums file"
+if ! $CURLBIN -sL -o $SIGFILE $SIG; then
+    echo "Failed to download the signature file"
     rm -rf $TMPDIR
     exit 1
 fi
 echo "Downloading the XZ tarball for linux-$VER"
 TXZFILE=$TMPDIR/linux-$VER.tar.xz
-if ! curl -L -o $TXZFILE $TXZ; then
+if ! $CURLBIN -L -o $TXZFILE $TXZ; then
     echo "Failed to download the tarball"
     rm -rf $TMPDIR
     exit 1
