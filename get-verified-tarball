@@ -5,13 +5,21 @@
 # retrieving the PGP keys using the Web Key Directory (WKD)
 # protocol if they are not already in the keyring.
 #
+# Pass the kernel version as the only parameter, or
+# we'll grab the latest stable kernel.
+#
+# Example: ./get-verified-tarball 4.4.145
+#
+# Configurable parameters
+# -----------------------
 # Where to download the tarball and verification data.
 TARGETDIR="$HOME/Downloads"
 
 # If you set this to empty value, we'll make a temporary
 # directory and fetch the verification keys from the
-# Web Key Directory each time. Also, see the KEYRING= and the
-# note above it for the alternative.
+# Web Key Directory each time. Also, see the USEKEYRING=
+# configuration option for an alternative that doesn't
+# rely on WKD.
 GNUPGHOME="$HOME/.gnupg"
 
 # For CI and other automated infrastructure, you may want to
@@ -31,10 +39,15 @@ SHA256SUMBIN="/usr/bin/sha256sum"
 # And we need the xz binary
 XZBIN="/usr/bin/xz"
 
-# You shouldn't need to modify this
+# You shouldn't need to modify this, unless someone
+# other than Linus or Greg start releasing kernels.
 DEVKEYS="torvalds@kernel.org gregkh@kernel.org"
+# Don't add this to DEVKEYS, as it plays a wholly
+# different role and is NOT a key that should be used
+# to verify kernel tarball signatures (just the checksums).
 SHAKEYS="autosigner@kernel.org"
 
+# What kernel version do you want?
 VER=$1
 if [ -z "$VER" ]; then
     # Assume you want the latest stable
