@@ -27,11 +27,18 @@ GNUPGHOME="$HOME/.gnupg"
 #  - autosigner@kernel.org
 #  - torvalds@kernel.org
 #  - gregkh@kernel.org
-# Once you do, install it on your CI system and set this value
-# to the full path to it. If unset, we'll use GNUPGHOME instead.
+#
+# To generate the keyring with these keys, do:
+#   gpg --export autosigner@ torvalds@ gregkh@ > keyring.gpg
+#   (or use full keyids for maximum certainty)
+#
+# Once you have keyring.gpg, install it on your CI system and set
+# USEKEYRING to the full path to it. If unset, we generate our own
+# from GNUPGHOME.
 USEKEYRING=
 
-# Point this at your GnuPG binary version 2.1.11 or above
+# Point this at your GnuPG binary version 2.1.11 or above.
+# If you are using USEKEYRING, GnuPG-1 will work, too.
 GPGBIN="/usr/bin/gpg2"
 GPGVBIN="/usr/bin/gpgv2"
 # We need a compatible version of sha256sum, too
@@ -123,7 +130,7 @@ if [ -z "$USEKEYRING" ]; then
     USEKEYRING=$TMPDIR/keyring.gpg
     $GPGBIN --batch --export $DEVKEYS $SHAKEYS > $USEKEYRING
 fi
-# Now we make two keyrings -- out for the autosigner, and
+# Now we make two keyrings -- one for the autosigner, and
 # the other for kernel developers. We do this in order to
 # make sure that we never verify kernel tarballs using the
 # autosigner keys, only using developer keys.
@@ -141,6 +148,11 @@ TXZ="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VER}.tar.xz"
 SIG="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VER}.tar.sign"
 SHA="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
 
+# Before we verify the developer signature, we make sure that the
+# tarball matches what is on the kernel.org master. This avoids
+# CDN cache poisoning that could, in theory, use vulnerabilities in
+# the XZ binary to alter the verification process or compromise the
+# system performing the verification.
 SHAFILE=$TMPDIR/sha256sums.asc
 echo "Downloading the checksums file for linux-$VER"
 if ! $CURLBIN -sL -o $SHAFILE $SHA; then
