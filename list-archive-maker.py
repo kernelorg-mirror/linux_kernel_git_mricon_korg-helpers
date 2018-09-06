@@ -30,6 +30,13 @@ import os
 import sys
 import mailbox
 import email.utils
+import re
+
+# Used for pipermail integration
+try:
+    import urllib.request as urllib_request
+except ImportError:
+    import urllib2 as urllib_request
 
 # Remove headers that are likely to be either of the following:
 # - violating the privacy of the person donating the logs
@@ -62,8 +69,17 @@ def main(sources, outdir, msgids, listids):
             eaddrs.append(listid)
 
     for sourcefile in sources:
-        sys.stdout.write('Opening %s...' % sourcefile)
-        sys.stdout.flush()
+        is_pipermail = False
+        # do you have a '://' in you?
+        if sourcefile.find('://') > 0:
+            is_pipermail = True
+            sourcefile = grab_pipermail_archive(sourcefile, outdir)
+            sys.stdout.write('parsing...')
+            sys.stdout.flush()
+        else:
+            sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
+            sys.stdout.flush()
+
         inbox = mailbox.mbox(sourcefile)
         total = len(inbox)
         sys.stdout.write('%s messages\n' % total)
@@ -135,14 +151,24 @@ def main(sources, outdir, msgids, listids):
                 # LKML list-id, the archive may only contain the copy that arrived to
                 # linux-mm. We try to hedge for this by looking in the "To" and "Cc"
                 # fields for any indication that this was intended for our mailing list.
-                for eaddr in eaddrs:
-                    if ('to' in msg and msg['to'].find(eaddr) >= 0 or
-                            'cc' in msg and msg['cc'].find(eaddr) >= 0):
-                        # insert the list-id header
-                        # (assuming the first one in the list to be the canonical one)
-                        newhdrs.append(('List-ID', '<%s>' % listids[0]))
-                    
+                if is_pipermail:
+                    # Pipermail doesn't preserve the List-Id nor "To" headers,
+                    # so put them back in place
+                    newhdrs.append(('To', eaddrs[0]))
+                    newhdrs.append(('List-Id', listids[0]))
+                    is_our_list = True
                 else:
+                    for eaddr in eaddrs:
+                        if ('to' in msg and msg['to'].find(eaddr) >= 0 or
+                                'cc' in msg and msg['cc'].find(eaddr) >= 0):
+                            # insert the list-id header
+                            # (assuming the first one in the list to be the canonical one)
+                            newhdrs.append(('List-ID', '<%s>' % listids[0]))
+                            is_our_list = True
+                            break
+
+                if not is_our_list:
+                    # Well, we tried everything
                     skipped += 1
                     notourlist += 1
                     continue
@@ -170,6 +196,9 @@ def main(sources, outdir, msgids, listids):
             knownset.add(msgid)
 
         inbox.close()
+        if is_pipermail:
+            os.unlink(sourcefile)
+
         sys.stdout.write('  %s/%s (%s skipped: %s dupmsgid, %s nomsgid, %s notourlist)\n' %
                          (counter, total, skipped, dupmsgid, nomsgid, notourlist))
 
@@ -188,22 +217,87 @@ def main(sources, outdir, msgids, listids):
         return None
 
 
+def parse_pipermail_index(pipermail_url):
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as ex:
+        print('You need to install python-BeautifulSoup to parse pipermail URLs')
+        print(ex)
+        sys.exit(1)
+
+    print('Grabbing the pipermail index from %s' % pipermail_url)
+    response = urllib_request.urlopen(pipermail_url)
+    index = response.read()
+    response.close()
+
+    soup = BeautifulSoup(index, features='lxml')
+
+    mboxes = []
+    for tag in soup.find_all('a'):
+        # we are looking for a href that ends with .txt.gz
+        if 'href' in tag.attrs and tag.attrs['href'][-7:] == '.txt.gz':
+            mboxes.append(os.path.join(pipermail_url, tag.attrs['href']))
+
+    return mboxes
+
+
+def grab_pipermail_archive(pipermail_url, outdir):
+    import gzip
+
+    chunks = pipermail_url.split('/')
+
+    sys.stdout.write('Grabbing %s...' % chunks[-1])
+    sys.stdout.flush()
+    # stick it into outdir/_tmp_pipermail_%last-chunk
+    local_file = os.path.join(outdir, '_tmp_pipermail_%s' % chunks[-1])
+
+    with urllib_request.urlopen(pipermail_url) as response:
+        with gzip.GzipFile(fileobj=response) as uncompressed:
+            # XXX: this can be horribly large
+            mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+            uncompressed.close()
+        response.close()
+
+    # Fix pipermail mangling where it changes some email addresses
+    # to be ' at ' instead of '@'. This is easiest to do with a
+    # handful of regexes than via actual message body manipulation
+    # as parf of the python's email.message object
+    sys.stdout.write('demangling...')
+    sys.stdout.flush()
+    regex = r'(<[^>]+) at ([^>]+>)'
+    subst = '\\1@\\2'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
+    regex = r'(^From:? \S+) at (.*)'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
+
+    with open(local_file, 'wb') as out_fh:
+        out_fh.write(mboxdata.encode('utf-8'))
+
+    out_fh.close()
+    return local_file
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
         description="Make a mbox of LKML messages we haven't yet archived",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('-sourcembox', required=True, nargs='+',
+    parser.add_argument('-sourcembox', nargs='+',
                         help='Source mbox with your archives in it, can be multiple')
-    parser.add_argument('-exportdir', required=True,
+    parser.add_argument('-pipermail',
+                        help='Alternatively, get mailman pipermail archives from this URL')
+    parser.add_argument('-exportdir', required=True, default='list-archives',
                         help='Export dir where to put sanitized archives')
-    parser.add_argument('-knownids', default=None,
+    parser.add_argument('-knownids',
                         help='File with known Message-IDs (one per line)')
     parser.add_argument('-listids', required=True, nargs='+',
                         help='List ID to match, can be multiple')
 
     args = parser.parse_args()
+
+    if not os.path.isdir(args.exportdir):
+        os.mkdir(args.exportdir)
 
     if args.knownids:
         fh = open(args.knownids, 'r')
@@ -211,12 +305,24 @@ if __name__ == '__main__':
         fh.close()
         print('Loaded %s message-ids from "%s"' % (len(msgids), args.idlist))
     else:
+        # TODO: load message-ids from existing mailboxes found in the export dir?
         msgids = []
 
-    if not os.path.isdir(args.exportdir):
-        os.mkdir(args.exportdir)
+    # are you asking for a pipermail grab?
+    if args.pipermail is not None:
+        mboxes = parse_pipermail_index(args.pipermail)
+        if not mboxes:
+            print('Could not find any .txt.gz files listed at %s' % args.pipermail)
+            sys.exit(1)
 
-    newids = main(args.sourcembox, args.exportdir, msgids, args.listids)
+    if args.sourcembox:
+        mboxes += args.sourcembox
+
+    if not mboxes:
+        print('You have to specify a pipermail URL or a list of mbox files (or both)')
+        sys.exit(1)
+
+    newids = main(mboxes, args.exportdir, msgids, args.listids)
 
     if newids is None or not args.knownids:
         sys.exit(0)
