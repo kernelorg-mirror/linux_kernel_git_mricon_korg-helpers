@@ -26,20 +26,30 @@ import sys
 import mailbox
 import email.utils
 import re
+import fnmatch
 
-# Remove headers that are likely to be either of the following:
-# - violating the privacy of the person donating the logs
-# - useless for archiving
-# - useless in general
-#
-# header names must be lowercase
-TRIMHDRS = {'delivered-to', 'status', 'precedence', 'x-sender', 'x-status', 'x-uid', 'x-from_', 'x-keywords',
-            'x-authentication-warning', 'x-received', 'x-spam-checker-version', 'x-spam-level', 'x-spam-status',
-            'x-scanned-by', 'x-virus-scanned', 'x-virus-status', 'x-mimedefang-filter', 'dkim-signature',
-            'x-google-dkim-signature', 'x-gm-message-state', 'received-spf', 'x-original-to', 'x-source-folder',
-            'domainkey-signature', 'x-mimeole', 'x-spamprobe', 'x-evolution', 'x-loop', 'x-orcpt', 'x-antivirus',
-            'x-antivirus-status', 'x-greylist', 'x-face', 'x-priority', 'importance', 'x-provags-id'}
-
+# Only retain the headers that are important to us
+# must be lowercase for matching purposes.
+# We treat "Received" headers with extra care for privacy, but if you
+# want to exclude them entirely, you can remove them from this list.
+# We also consider shell-globbing style wildcards.
+WANTHDRS = {'return-path',
+            'received',
+            'sender',
+            'from',
+            'to',
+            'cc',
+            'subject',
+            'date',
+            'message-id',
+            'reply-to',
+            'in-reply-to',
+            'references',
+            'mime-*',
+            'list-*',
+            'content-type',
+            'errors-to',
+            }
 
 def main(sources, outdir, msgids, listids):
     outboxes = {}
@@ -102,36 +112,47 @@ def main(sources, outdir, msgids, listids):
                 dupmsgid += 1
                 continue
 
-            # Remove headers in the TRIMHDRS list and any Received:
+            # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
             newhdrs = []
             recvtime = None
             is_our_list = False
             for hdrname, hdrval in msg._headers:
                 lhdrname = hdrname.lower()
-                if lhdrname not in TRIMHDRS:
-                    if lhdrname == 'received':
-                        # noinspection PyBroadException
-                        try:
-                            if recvtime is None:
-                                # Use the first Received header we find for the message date
-                                # (for the purposes of knowing which mbox file to put it in)
-                                recvtime = email.utils.parsedate_tz(hdrval.split(';')[-1].strip())
-                            # does hdrval contain one of our email addresses?
-                            for eaddr in eaddrs:
-                                if hdrval.find(eaddr) >= 0:
-                                    newhdrs.append((hdrname, hdrval))
-                                    break
-                        except:
-                            # Something went horribly wrong, eh?
-                            pass
-                    elif lhdrname == 'list-id':
-                            this_listid = hdrval.strip().lower().lstrip('<').rstrip('>')
-                            if this_listid in listids:
+                wanthdr = False
+                for hdrmatch in WANTHDRS:
+                    if fnmatch.fnmatch(lhdrname, hdrmatch):
+                        wanthdr = True
+                        break
+
+                if not wanthdr:
+                    continue
+
+                if lhdrname == 'received':
+                    # noinspection PyBroadException
+                    try:
+                        if recvtime is None:
+                            # Use the first Received header we find for the message date
+                            # (for the purposes of knowing which mbox file to put it in)
+                            recvtime = email.utils.parsedate_tz(hdrval.split(';')[-1].strip())
+                        # does hdrval contain one of our email addresses?
+                        for eaddr in eaddrs:
+                            if hdrval.find(eaddr) >= 0:
+                                newhdrs.append((hdrname, hdrval))
+                                break
+                    except:
+                        # Something went horribly wrong, eh?
+                        pass
+
+                elif lhdrname == 'list-id':
+                        for listid in listids:
+                            if hdrval.lower().find(listid) >= 0:
                                 newhdrs.append((hdrname, hdrval))
                                 is_our_list = True
-                    else:
-                        newhdrs.append((hdrname, hdrval))
+                                break
+
+                else:
+                    newhdrs.append((hdrname, hdrval))
 
             if not is_our_list:
                 # Sometimes a message is cc'd to multiple mailing lists and the
@@ -248,16 +269,23 @@ def grab_pipermail_archive(pipermail_url, outdir):
             uncompressed.close()
         response.close()
 
+    # Pipermail does a nasty thing where it doesn't properly handle
+    # lines in the body that start with "From ". First, we add ">" to
+    # all lines starting with "From " and then fix some of them in the
+    # next step.
+    sys.stdout.write('demangling...')
+    sys.stdout.flush()
+    regex = r'^From '
+    subst = '>From '
+    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
     # Fix pipermail mangling where it changes some email addresses
     # to be ' at ' instead of '@'. This is easiest to do with a
     # handful of regexes than via actual message body manipulation
     # as parf of the python's email.message object
-    sys.stdout.write('demangling...')
-    sys.stdout.flush()
     regex = r'(<[^>]+) at ([^>]+>)'
     subst = '\\1@\\2'
     mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
-    regex = r'(^From:? \S+) at (.*)'
+    regex = r'^>?(From:? \S+) at (\S+\..*)'
     mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
 
     with open(local_file, 'wb') as out_fh:
@@ -289,11 +317,11 @@ if __name__ == '__main__':
     if not os.path.isdir(args.exportdir):
         os.mkdir(args.exportdir)
 
-    if args.knownids:
+    if args.knownids and os.path.exists(args.knownids):
         with open(args.knownids, 'r') as fh:
             knownids = fh.read().splitlines()
             fh.close()
-        print('Loaded %s message-ids from "%s"' % (len(knownids), args.idlist))
+        print('Loaded %s message-ids from "%s"' % (len(knownids), args.knownids))
     else:
         # should we load message-ids from existing mailboxes found in the export dir?
         # right now we're just appending to them, which is probably not expected behaviour.
