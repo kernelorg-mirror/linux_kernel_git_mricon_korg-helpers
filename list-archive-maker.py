@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # List archive collator and sanitizer
@@ -21,22 +21,11 @@
 # Author:  Konstantin Ryabitsev <konstantin@linuxfoundation.org>
 #
 
-from __future__ import (absolute_import,
-                        division,
-                        print_function,
-                        unicode_literals)
-
 import os
 import sys
 import mailbox
 import email.utils
 import re
-
-# Used for pipermail integration
-try:
-    import urllib.request as urllib_request
-except ImportError:
-    import urllib2 as urllib_request
 
 # Remove headers that are likely to be either of the following:
 # - violating the privacy of the person donating the logs
@@ -122,6 +111,7 @@ def main(sources, outdir, msgids, listids):
                 lhdrname = hdrname.lower()
                 if lhdrname not in TRIMHDRS:
                     if lhdrname == 'received':
+                        # noinspection PyBroadException
                         try:
                             if recvtime is None:
                                 # Use the first Received header we find for the message date
@@ -221,14 +211,14 @@ def parse_pipermail_index(pipermail_url):
     try:
         from bs4 import BeautifulSoup
     except ImportError as ex:
-        print('You need to install python-BeautifulSoup to parse pipermail URLs')
+        print('You need to install python-beautifulsoup4 to parse pipermail URLs')
         print(ex)
         sys.exit(1)
 
     print('Grabbing the pipermail index from %s' % pipermail_url)
-    response = urllib_request.urlopen(pipermail_url)
-    index = response.read()
-    response.close()
+    with urllib_request.urlopen(pipermail_url) as response:
+        index = response.read()
+        response.close()
 
     soup = BeautifulSoup(index, features='lxml')
 
@@ -300,16 +290,19 @@ if __name__ == '__main__':
         os.mkdir(args.exportdir)
 
     if args.knownids:
-        fh = open(args.knownids, 'r')
-        msgids = fh.read().splitlines()
-        fh.close()
-        print('Loaded %s message-ids from "%s"' % (len(msgids), args.idlist))
+        with open(args.knownids, 'r') as fh:
+            knownids = fh.read().splitlines()
+            fh.close()
+        print('Loaded %s message-ids from "%s"' % (len(knownids), args.idlist))
     else:
-        # TODO: load message-ids from existing mailboxes found in the export dir?
-        msgids = []
+        # should we load message-ids from existing mailboxes found in the export dir?
+        # right now we're just appending to them, which is probably not expected behaviour.
+        knownids = []
 
     # are you asking for a pipermail grab?
+    mboxes = []
     if args.pipermail is not None:
+        import urllib.request as urllib_request
         mboxes = parse_pipermail_index(args.pipermail)
         if not mboxes:
             print('Could not find any .txt.gz files listed at %s' % args.pipermail)
@@ -322,13 +315,13 @@ if __name__ == '__main__':
         print('You have to specify a pipermail URL or a list of mbox files (or both)')
         sys.exit(1)
 
-    newids = main(mboxes, args.exportdir, msgids, args.listids)
+    newids = main(mboxes, args.exportdir, knownids, args.listids)
 
     if newids is None or not args.knownids:
         sys.exit(0)
 
-    new_idlist = msgids + newids
+    new_idlist = knownids + newids
     print('Wrote %s msgids into %s (%s new)' % (len(new_idlist), args.knownids, len(newids)))
-    fh = open(args.knownids, 'w')
-    fh.write('\n'.join(new_idlist))
-    fh.close()
+    with open(args.knownids, 'w') as fh:
+        fh.write('\n'.join(new_idlist))
+        fh.close()
