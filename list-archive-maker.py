@@ -79,7 +79,12 @@ def main(sources, outdir, msgids, listids):
             sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
             sys.stdout.flush()
 
-        inbox = mailbox.mbox(sourcefile)
+        # If the filename ends with /, we treat as maildir
+        if sourcefile[-1] == '/':
+            inbox = mailbox.Maildir(sourcefile)
+        else:
+            inbox = mailbox.mbox(sourcefile)
+
         total = len(inbox)
         sys.stdout.write('%s messages\n' % total)
         sys.stdout.flush()
@@ -301,8 +306,9 @@ if __name__ == '__main__':
         description="Make a mbox of LKML messages we haven't yet archived",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('-sourcembox', nargs='+',
-                        help='Source mbox with your archives in it, can be multiple')
+    parser.add_argument('-source', nargs='+',
+                        help=('Source mailbox with your archives in it, can be multiple. '
+                              'Paths with trailing / will be treated as maildirs'))
     parser.add_argument('-pipermail',
                         help='Alternatively, get mailman pipermail archives from this URL')
     parser.add_argument('-exportdir', required=True, default='list-archives',
