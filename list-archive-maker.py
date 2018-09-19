@@ -175,8 +175,8 @@ def main(sources, outdir, msgids, listids):
                     is_our_list = True
                 else:
                     for eaddr in eaddrs:
-                        if (msg.get('to', '').find(eaddr) >= 0 or
-                                msg.get('cc', '').find(eaddr) >= 0):
+                        if (str(msg.get('to', '')).find(eaddr) >= 0 or
+                                str(msg.get('cc', '')).find(eaddr) >= 0):
                             # insert the list-id header
                             # (assuming the first one in the list to be the canonical one)
                             newhdrs.append(('List-ID', '<%s>' % listids[0]))
