@@ -175,8 +175,8 @@ def main(sources, outdir, msgids, listids):
                     is_our_list = True
                 else:
                     for eaddr in eaddrs:
-                        if ('to' in msg and msg['to'].find(eaddr) >= 0 or
-                                'cc' in msg and msg['cc'].find(eaddr) >= 0):
+                        if (msg.get('to', '').find(eaddr) >= 0 or
+                                msg.get('cc', '').find(eaddr) >= 0):
                             # insert the list-id header
                             # (assuming the first one in the list to be the canonical one)
                             newhdrs.append(('List-ID', '<%s>' % listids[0]))
@@ -342,8 +342,8 @@ if __name__ == '__main__':
             print('Could not find any .txt.gz files listed at %s' % args.pipermail)
             sys.exit(1)
 
-    if args.sourcembox:
-        mboxes += args.sourcembox
+    if args.source:
+        mboxes += args.source
 
     if not mboxes:
         print('You have to specify a pipermail URL or a list of mbox files (or both)')
