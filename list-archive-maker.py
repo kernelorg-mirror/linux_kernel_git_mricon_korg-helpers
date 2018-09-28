@@ -42,6 +42,7 @@ WANTHDRS = {'return-path',
             'subject',
             'date',
             'message-id',
+            'resent-message-id',
             'reply-to',
             'in-reply-to',
             'references',
@@ -49,9 +50,10 @@ WANTHDRS = {'return-path',
             'list-*',
             'content-type',
             'errors-to',
+            'x-mailing-list',
             }
 
-def main(sources, outdir, msgids, listids):
+def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlistfile):
     outboxes = {}
     writecount = {}
     seenids = []
@@ -66,6 +68,13 @@ def main(sources, outdir, msgids, listids):
             eaddrs.append(listid.replace('.', '@', 1))
         else:
             eaddrs.append(listid)
+
+    if nomsgidfile:
+        nomsgidbox = mailbox.mbox(nomsgidfile)
+    if dupmsgidfile:
+        dupmsgidbox = mailbox.mbox(dupmsgidfile)
+    if notourlistfile:
+        notourlistbox = mailbox.mbox(notourlistfile)
 
     for sourcefile in sources:
         is_pipermail = False
@@ -102,9 +111,14 @@ def main(sources, outdir, msgids, listids):
             sys.stdout.flush()
 
             msgid = msg['message-id']
+            if msgid is None and msg.get('resent-message-id', ''):
+                msgid = msg['resent-message-id']
+
             if msgid is None:
                 # Huh, no message-id? Most likely, FOLDER-INTERNAL DATA marker or some other
                 # system message.
+                if nomsgidfile:
+                    nomsgidbox.add(msg)
                 skipped += 1
                 nomsgid += 1
                 continue
@@ -113,6 +127,8 @@ def main(sources, outdir, msgids, listids):
                 # or because the inbox has messages with same IDs. There is no fix for the
                 # latter condition, so we just assume they got delivered multiple times and
                 # use the first one found.
+                if dupmsgidfile:
+                    dupmsgidbox.add(msg)
                 skipped += 1
                 dupmsgid += 1
                 continue
@@ -156,6 +172,15 @@ def main(sources, outdir, msgids, listids):
                                 is_our_list = True
                                 break
 
+                elif lhdrname == 'x-mailing-list':
+                        for listid in listids:
+                            if hdrval.lower().find(listid) >= 0:
+                                # Stick the list-id that's first in our collection,
+                                # since we assume that it's the canonical one
+                                newhdrs.append(('List-Id', listids[0]))
+                                is_our_list = True
+                                break
+
                 else:
                     newhdrs.append((hdrname, hdrval))
 
@@ -185,6 +210,8 @@ def main(sources, outdir, msgids, listids):
 
                 if not is_our_list:
                     # Well, we tried everything
+                    if notourlistfile:
+                        notourlistbox.add(msg)
                     skipped += 1
                     notourlist += 1
                     continue
@@ -317,6 +344,12 @@ if __name__ == '__main__':
                         help='File with known Message-IDs (one per line)')
     parser.add_argument('-listids', required=True, nargs='+',
                         help='List ID to match, can be multiple')
+    parser.add_argument('-nomsgid',
+                        help='Mailbox file where to save messages without a message-id')
+    parser.add_argument('-dupmsgid',
+                        help='Mailbox file where to save messages with duplicate message-ids')
+    parser.add_argument('-notourlist',
+                        help='Mailbox file where to save messages not belonging to the list')
 
     args = parser.parse_args()
 
@@ -349,7 +382,7 @@ if __name__ == '__main__':
         print('You have to specify a pipermail URL or a list of mbox files (or both)')
         sys.exit(1)
 
-    newids = main(mboxes, args.exportdir, knownids, args.listids)
+    newids = main(mboxes, args.exportdir, knownids, args.listids, args.nomsgid, args.dupmsgid, args.notourlist)
 
     if newids is None or not args.knownids:
         sys.exit(0)
