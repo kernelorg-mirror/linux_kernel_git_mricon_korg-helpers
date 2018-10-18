@@ -53,7 +53,7 @@ WANTHDRS = {'return-path',
             'x-mailing-list',
             }
 
-def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlistfile):
+def main(sources, outdir, msgids, listids, rejectsfile):
     outboxes = {}
     writecount = {}
     seenids = []
@@ -69,12 +69,8 @@ def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlist
         else:
             eaddrs.append(listid)
 
-    if nomsgidfile:
-        nomsgidbox = mailbox.mbox(nomsgidfile)
-    if dupmsgidfile:
-        dupmsgidbox = mailbox.mbox(dupmsgidfile)
-    if notourlistfile:
-        notourlistbox = mailbox.mbox(notourlistfile)
+    if rejectsfile:
+        rejectsbox = mailbox.mbox(rejectsfile)
 
     for sourcefile in sources:
         is_pipermail = False
@@ -117,8 +113,9 @@ def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlist
             if msgid is None:
                 # Huh, no message-id? Most likely, FOLDER-INTERNAL DATA marker or some other
                 # system message.
-                if nomsgidfile:
-                    nomsgidbox.add(msg)
+                if rejectsfile:
+                    msg._headers.append(('X-Import-Rejected-Reason', 'No Message-ID'))
+                    rejectsbox.add(msg)
                 skipped += 1
                 nomsgid += 1
                 continue
@@ -127,8 +124,9 @@ def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlist
                 # or because the inbox has messages with same IDs. There is no fix for the
                 # latter condition, so we just assume they got delivered multiple times and
                 # use the first one found.
-                if dupmsgidfile:
-                    dupmsgidbox.add(msg)
+                if rejectsfile:
+                    msg._headers.append(('X-Import-Rejected-Reason', 'Duplicate Message-ID'))
+                    rejectsbox.add(msg)
                 skipped += 1
                 dupmsgid += 1
                 continue
@@ -210,8 +208,9 @@ def main(sources, outdir, msgids, listids, nomsgidfile, dupmsgidfile, notourlist
 
                 if not is_our_list:
                     # Well, we tried everything
-                    if notourlistfile:
-                        notourlistbox.add(msg)
+                    if rejectsfile:
+                        msg._headers.append(('X-Import-Rejected-Reason', 'No matching List-ID'))
+                        rejectsbox.add(msg)
                     skipped += 1
                     notourlist += 1
                     continue
@@ -344,12 +343,9 @@ if __name__ == '__main__':
                         help='File with known Message-IDs (one per line)')
     parser.add_argument('-listids', required=True, nargs='+',
                         help='List ID to match, can be multiple')
-    parser.add_argument('-nomsgid',
-                        help='Mailbox file where to save messages without a message-id')
-    parser.add_argument('-dupmsgid',
-                        help='Mailbox file where to save messages with duplicate message-ids')
-    parser.add_argument('-notourlist',
-                        help='Mailbox file where to save messages not belonging to the list')
+    parser.add_argument('-rejected',
+                        help='Mailbox file where to save messages that were rejected '
+                             '(adds X-Import-Rejected-Reason header)')
 
     args = parser.parse_args()
 
@@ -382,7 +378,7 @@ if __name__ == '__main__':
         print('You have to specify a pipermail URL or a list of mbox files (or both)')
         sys.exit(1)
 
-    newids = main(mboxes, args.exportdir, knownids, args.listids, args.nomsgid, args.dupmsgid, args.notourlist)
+    newids = main(mboxes, args.exportdir, knownids, args.listids, args.rejected)
 
     if newids is None or not args.knownids:
         sys.exit(0)
