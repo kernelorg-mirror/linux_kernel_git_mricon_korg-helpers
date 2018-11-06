@@ -25,24 +25,26 @@ import logging
 import re
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
+from string import Template
 
 DB_VERSION = 1
 
 # Case doesn't matter
-PULL_SUBJECTS = [
+PULL_SUBJECT_RE = [
     re.compile(r'^\[GIT', re.IGNORECASE),
     re.compile(r'^\[PULL', re.IGNORECASE),
     re.compile(r'^\[PLEASE PULL', re.IGNORECASE),
 ]
 
 # I like these
-PULL_BODIES_WITH_COMMIT_ID = [
+PULL_BODY_WITH_COMMIT_ID_RE = [
     re.compile(r'^\s*for you to fetch changes up to ([0-9a-f]{5,40}):', re.MULTILINE | re.IGNORECASE),
 ]
 
 # I don't like these
-PULL_BODIES_WITHOUT_COMMIT_ID = [
-    re.compile(r'^\s*((?:git|https?)://[\w/._-]+)\s([\w/._-]+)$', re.MULTILINE | re.IGNORECASE),
+PULL_BODY_REMOTE_REF_RE = [
+    re.compile(r'^\s*((?:git|https?)://[\w/._-]+)\s+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*((?:git|https?)://[\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
 logger = logging.getLogger('prthanker')
@@ -157,11 +159,27 @@ def git_get_commit_id_from_repo_ref(repo, ref):
     return commit_id
 
 
+def get_remote_ref_from_body(body):
+    repo = None
+    ref = None
+    for reporef_re in PULL_BODY_REMOTE_REF_RE:
+        matches = reporef_re.search(body)
+        if matches:
+            chunks = matches.groups(0)
+            if len(chunks) > 1:
+                (repo, ref) = chunks
+            else:
+                repo = chunks[0]
+                ref = 'master'
+            break
+    return repo, ref
+
+
 def record_pr_data(msg_commit_id, msg, c):
     pr_commit_id = None
     for part in msg.walk():
         body = str(part.get_payload(decode=True))
-        for cid_re in PULL_BODIES_WITH_COMMIT_ID:
+        for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
             matches = cid_re.search(body)
             if matches:
                 (pr_commit_id,) = matches.groups(0)
@@ -171,12 +189,9 @@ def record_pr_data(msg_commit_id, msg, c):
         # Okay, try the one we like less :(
         for part in msg.walk():
             body = str(part.get_payload())
-            for reporef_re in PULL_BODIES_WITHOUT_COMMIT_ID:
-                matches = reporef_re.search(body)
-                if matches:
-                    (repo, ref) = matches.groups(0)
-                    pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
-                    break
+            repo, ref = get_remote_ref_from_body(body)
+            if repo is not None:
+                pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
 
     if pr_commit_id is None:
         return False
@@ -309,7 +324,7 @@ def parse_pull_requests(pirepo, topdir, dryrun):
     logger.info('Found %s new messages since last run', len(msgrevs))
     new_prs = 0
     for commit_id, subject in msgrevs:
-        for subject_re in PULL_SUBJECTS:
+        for subject_re in PULL_SUBJECT_RE:
             if subject_re.match(subject):
                 logger.debug('potential match: "%s"', subject)
                 msg = git_get_message_from_pi(pirepo, commit_id)
@@ -408,36 +423,67 @@ def get_all_new_prs(c, refname, prs, cutoffdays=30):
 
 def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun):
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
+    repo, ref = get_remote_ref_from_body(orig.get_payload(decode=True))
+
+    dest = email.utils.getaddresses(orig.get_all('from', []))
+    dest += email.utils.getaddresses(orig.get_all('to', []))
+    dest += email.utils.getaddresses(orig.get_all('cc', []))
+    targets = [chunk[1] for chunk in dest]
+
+    if 'onlyifto' in config:
+        # Don't send anything unless the required email is in to or cc
+        found = False
+        for onlyifto in config['onlyifto'].split(','):
+            if onlyifto.strip() in targets:
+                found = True
+                break
+        if not found:
+            logger.debug('To or CC do not contain: %s', config['onlyifto'])
+            logger.debug('Skipping this Pull Request')
+            return None
+
+    rechdr = orig.get('Received')
+    received = time.strftime('%Y-%m-%d at %H:%M:%S',
+                             email.utils.parsedate(rechdr.split(';')[-1].strip()))
+
     msgvalues = dict()
     msgvalues['refname'] = refname.rsplit('/', 1)[-1]
     msgvalues['merge_id'] = merge_id
     msgvalues['origsubject'] = orig['Subject']
+    msgvalues['remoteref'] = '%s %s' % (repo, ref)
+    msgvalues['reqdate'] = received
+    msgvalues['br'] = '\n'
+
     msg = email.message.Message()
-    msg['Subject'] = config['msgsubject'] % msgvalues
+    msg['Subject'] = Template(config['msgsubject']).safe_substitute(msgvalues)
     msg['From'] = config['from']
     # Set threading bits
     msg['In-Reply-To'] = orig['Message-Id']
+    if orig.get('References', ''):
+        msg['References'] = orig['References'] + ' ' + orig['Message-Id']
+    else:
+        msg['References'] = orig['Message-Id']
     msg['Message-Id'] = email.utils.make_msgid('prthanker-%s' % merge_id)
     msg['Date'] = email.utils.formatdate(localtime=True)
     # Set to and cc
     if 'onlyto' in config:
         msg['To'] = config['onlyto']
+        # Override dest/targets
         dest = email.utils.getaddresses([config['onlyto']])
+        targets = [config['onlyto']]
     else:
         msg['To'] = orig['From']
         msg['Cc'] = orig['To'] + ', ' + orig['Cc']
-        dest = email.utils.getaddresses(orig.get_all('from', []))
-        dest.append(email.utils.getaddresses(orig.get_all('to', [])))
-        dest.append(email.utils.getaddresses(orig.get_all('cc', [])))
     if 'alwayscc' in config:
         if msg.get('cc', ''):
             msg['Cc'] = msg.get('cc', '') + ', %s' % config['alwayscc']
         else:
             msg['Cc'] = config['alwayscc']
         dest += email.utils.getaddresses([config['alwayscc']])
-    msg.set_payload(config['msgbody'] % msgvalues)
+        targets.append(config['alwayscc'])
 
-    targets = [chunk[1] for chunk in dest]
+    msg.set_payload(Template(config['msgbody']).safe_substitute(msgvalues))
+
     logger.debug('Message follows')
     logger.debug(msg.as_string())
     if not dryrun:
@@ -491,6 +537,7 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
         logger.info('No new revs since last run.')
         return
 
+    tycount = 0
     for pirepo, settings in config.items():
         pirepo = get_pirepo_dir(pirepo, pitopdir)
         logger.info('Grabbing PR commits from %s', pirepo)
@@ -504,6 +551,7 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
         prs = get_all_prs(pirepo, cutoffdays=cutoffdays)
 
         for refname, revlines in newrevs.items():
+            logger.debug('Looking at %s', refname)
             revs = set([row[0] for row in revlines])
             for pr_commit_id, msg_commit_id in get_all_new_prs(c, refname, prs):
                 if pr_commit_id in revs:
@@ -520,7 +568,8 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
                     sent_msgid = mail_thanks_for_pr(refname, merge_id,
                                                     pirepo, msg_commit_id,
                                                     settings, dryrun)
-                    if not dryrun:
+                    if sent_msgid and not dryrun:
+                        tycount += 1
                         try:
                             c.execute('INSERT INTO thanks VALUES(?, ?, ?, ?)',
                                       (pr_commit_id, refname, sent_msgid,
@@ -532,6 +581,11 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
     if not dryrun:
         db_save_repo_heads(c, git_heads)
         dbconn.commit()
+
+    if tycount:
+        logger.info('Sent %s thank-you notes.', tycount)
+    else:
+        logger.info('No new thank-yous to send.')
 
 
 if __name__ == '__main__':
@@ -560,7 +614,7 @@ if __name__ == '__main__':
     if cmdargs.logfile:
         ch = logging.FileHandler(cmdargs.logfile)
         formatter = logging.Formatter(
-            '{%(funcName)s:%(lineno)s} %(message)s')
+            '[%(asctime)s] %(message)s')
         ch.setFormatter(formatter)
 
         ch.setLevel(logging.DEBUG)
