@@ -22,10 +22,9 @@ DB_VERSION = 1
 
 # Case doesn't matter
 PULL_SUBJECTS = [
-    re.compile(r'^\[GIT PULL', re.IGNORECASE),
-    re.compile(r'^\[PULL REQUEST', re.IGNORECASE),
-    re.compile(r'^\[PLEASE PULL', re.IGNORECASE),
+    re.compile(r'^\[GIT', re.IGNORECASE),
     re.compile(r'^\[PULL', re.IGNORECASE),
+    re.compile(r'^\[PLEASE PULL', re.IGNORECASE),
 ]
 
 # I like these
