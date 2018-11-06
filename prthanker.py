@@ -150,9 +150,12 @@ def git_get_commit_id_from_repo_ref(repo, ref):
     logger.debug('getting commit-id from: %s %s', repo, ref)
     lines = git_run_command('', ['ls-remote', repo, '%s^{}' % ref])
     if not lines:
-        # Oh well, we tried
-        logger.debug('did not find commit-id, ignoring pull request')
-        return None
+        # Try it as a head
+        lines = git_run_command('', ['ls-remote', repo, ref])
+        if not lines:
+            # Oh well, we tried
+            logger.debug('did not find commit-id, ignoring pull request')
+            return None
 
     commit_id = lines[0].split()[0]
     logger.debug('success, commit-id: %s', commit_id)
