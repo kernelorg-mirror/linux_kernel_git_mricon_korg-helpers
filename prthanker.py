@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
+# PR Thanker cronjob. Can be also run from post-update hooks with extra
+# wrappers. Better instructions to follow after a period of testing.
+#
 from __future__ import (absolute_import,
                         division,
                         print_function,
@@ -12,11 +15,16 @@ import os
 import sys
 import argparse
 import email
+import email.message
+import email.utils
+import smtplib
 import time
 import subprocess
 import sqlite3
 import logging
 import re
+
+from fcntl import lockf, LOCK_EX, LOCK_NB
 
 DB_VERSION = 1
 
@@ -141,18 +149,18 @@ def git_get_commit_id_from_repo_ref(repo, ref):
     lines = git_run_command('', ['ls-remote', repo, '%s^{}' % ref])
     if not lines:
         # Oh well, we tried
-        logger.debug('failed, ignoring pull request')
+        logger.debug('did not find commit-id, ignoring pull request')
         return None
 
     commit_id = lines[0].split()[0]
-    logger.debug('success: %s', commit_id)
+    logger.debug('success, commit-id: %s', commit_id)
     return commit_id
 
 
 def record_pr_data(msg_commit_id, msg, c):
     pr_commit_id = None
     for part in msg.walk():
-        body = str(part.get_payload())
+        body = str(part.get_payload(decode=True))
         for cid_re in PULL_BODIES_WITH_COMMIT_ID:
             matches = cid_re.search(body)
             if matches:
@@ -219,23 +227,61 @@ def git_get_new_revs(gitdir, db_heads, git_heads):
         rev_range = '%s..%s' % (db_commit_id, git_commit_id)
         lines = git_run_command(gitdir, ['rev-list', '--pretty=oneline',
                                          '--reverse', rev_range, refname])
-        if lines:
-            newrevs[refname] = lines
+        if not lines:
+            continue
+
+        newrevs[refname] = list()
+
+        for line in lines:
+            (commit_id, logmsg) = line.split(' ', 1)
+            logger.debug('commit_id=%s, subject=%s', commit_id, logmsg)
+            newrevs[refname].append((commit_id, logmsg))
 
     return newrevs
 
 
-def parse_pull_requests(pirepo, dryrun):
+def git_get_merge_id(repo, commit_id):
+    # get merge commit id
+    args = ['rev-list', '%s..' % commit_id, '--ancestry-path']
+    lines = git_run_command(repo, args)
+    return lines[-1]
+
+
+def get_pirepo_dir(projpath, topdir):
+    # Find the largest #.git in a public-inbox sharded repo
+    # TODO: handle roll-over between shards
+    if topdir:
+        projpath = os.path.join(topdir, projpath)
+    subs = os.listdir(projpath)
+    at = 0
+    while True:
+        at += 1
+        if '{0}.git'.format(at) not in subs:
+            break
+
+    pirepo = os.path.join(projpath, '{0}.git'.format(at-1))
     # Is it a git repo? It should always have a
     # refs/heads/master file (all Public-Inbox repos have a master ref)
     if not os.path.isfile(os.path.join(pirepo, 'refs/heads/master')):
-        logger.critical('Probably not a git repo: %s', pirepo)
+        logger.critical('Does not appear to be a public-inbox repo: %s', pirepo)
         sys.exit(1)
 
+    return pirepo
+
+
+def parse_pull_requests(pirepo, topdir, dryrun):
+    pirepo = get_pirepo_dir(pirepo, topdir)
     git_heads = git_get_repo_heads(pirepo)
     if not git_heads:
         logger.critical('Could not get the latest ref in %s', pirepo)
         sys.exit(1)
+
+    try:
+        with open(os.path.join(pirepo, '.prthanker.lock'), 'w') as lockfh:
+            lockf(lockfh, LOCK_EX | LOCK_NB)
+    except IOError:
+        logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
+        return
 
     # Do we have a prs.db there yet?
     dbpath = os.path.join(pirepo, 'prs.db')
@@ -249,25 +295,23 @@ def parse_pull_requests(pirepo, dryrun):
         db_save_repo_heads(c, git_heads)
         # Exit early
         dbconn.commit()
-        sys.exit(0)
+        return
 
     db_heads = db_get_repo_heads(c)
 
     newrevs = git_get_new_revs(pirepo, db_heads, git_heads)
     if not newrevs:
         logger.info('No new revs since last run.')
-        sys.exit(0)
+        return
 
     # We are only interested in refs/heads/master for public-inbox
     msgrevs = newrevs['refs/heads/master']
     logger.info('Found %s new messages since last run', len(msgrevs))
     new_prs = 0
-    for revline in msgrevs:
-        (commit_id, subject) = revline.split(' ', 1)
-        logger.debug('commit_id=%s, subject=%s', commit_id, subject)
+    for commit_id, subject in msgrevs:
         for subject_re in PULL_SUBJECTS:
             if subject_re.match(subject):
-                logger.debug('Potential match: "%s"', subject)
+                logger.debug('potential match: "%s"', subject)
                 msg = git_get_message_from_pi(pirepo, commit_id)
                 if record_pr_data(commit_id, msg, c):
                     new_prs += 1
@@ -282,7 +326,7 @@ def parse_pull_requests(pirepo, dryrun):
         dbconn.commit()
 
 
-def get_config_from_repo(repo):
+def get_config_from_repo(repo, cmdconfig):
     config = dict()
     args = ['config', '-z', '--local', '--get-regexp', 'prthanker\..*']
     out = git_run_command(repo, args, splitlines=False)
@@ -293,15 +337,30 @@ def get_config_from_repo(repo):
         if not line:
             continue
         key, value = line.split('\n', 1)
-        config[key] = value
+        try:
+            chunks = key.split('.')
+            pirepo = '.'.join(chunks[1:-1])
+            if pirepo not in config:
+                config[pirepo] = dict()
+            cfgkey = chunks[-1]
+            config[pirepo][cfgkey] = value
+        except ValueError:
+            logger.debug('Ignoring git config entry %s', line)
+
+    if cmdconfig:
+        superconfig = dict()
+        for entry in cmdconfig:
+            key, value = entry.split('=', 1)
+            superconfig[key] = value
+        # add/override values with those passed from cmdline
+        for pirepo in config.keys():
+            config[pirepo].update(superconfig)
 
     return config
 
 
-def add_config_from_cmdargs(cmdconfig, config):
-    for entry in cmdconfig:
-        key, value = entry.split('=', 1)
-        config[key] = value
+def get_config_from_cmdline(cmdconfig):
+    config = dict()
 
     return config
 
@@ -347,11 +406,66 @@ def get_all_new_prs(c, refname, prs, cutoffdays=30):
     return new_prs
 
 
-def send_thanks(repo, cmdconfig, dryrun):
+def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun):
+    orig = git_get_message_from_pi(pirepo, msg_commit_id)
+    msgvalues = dict()
+    msgvalues['refname'] = refname.rsplit('/', 1)[-1]
+    msgvalues['merge_id'] = merge_id
+    msgvalues['origsubject'] = orig['Subject']
+    msg = email.message.Message()
+    msg['Subject'] = config['msgsubject'] % msgvalues
+    msg['From'] = config['from']
+    # Set threading bits
+    msg['In-Reply-To'] = orig['Message-Id']
+    msg['Message-Id'] = email.utils.make_msgid('prthanker-%s' % merge_id)
+    msg['Date'] = email.utils.formatdate(localtime=True)
+    # Set to and cc
+    if 'onlyto' in config:
+        msg['To'] = config['onlyto']
+        dest = email.utils.getaddresses([config['onlyto']])
+    else:
+        msg['To'] = orig['From']
+        msg['Cc'] = orig['To'] + ', ' + orig['Cc']
+        dest = email.utils.getaddresses(orig.get_all('from', []))
+        dest.append(email.utils.getaddresses(orig.get_all('to', [])))
+        dest.append(email.utils.getaddresses(orig.get_all('cc', [])))
+    if 'alwayscc' in config:
+        if msg.get('cc', ''):
+            msg['Cc'] = msg.get('cc', '') + ', %s' % config['alwayscc']
+        else:
+            msg['Cc'] = config['alwayscc']
+        dest += email.utils.getaddresses([config['alwayscc']])
+    msg.set_payload(config['msgbody'] % msgvalues)
+
+    targets = [chunk[1] for chunk in dest]
+    logger.debug('Message follows')
+    logger.debug(msg.as_string())
+    if not dryrun:
+        logger.info('Mailing thanks for: %s', orig['Subject'])
+        smtp = smtplib.SMTP(config['mailhost'])
+        smtp.sendmail(msg['From'], targets, msg.as_string())
+        smtp.close()
+    else:
+        logger.info('Would have sent the following:')
+        logger.info('------------------------------')
+        logger.info(msg.as_string())
+        logger.info('------------------------------')
+
+    return msg['Message-Id']
+
+
+def send_thanks(repo, pitopdir, cmdconfig, dryrun):
     git_heads = git_get_repo_heads(repo)
     if not git_heads:
         logger.critical('Could not get the latest ref in %s', repo)
         sys.exit(1)
+
+    try:
+        with open(os.path.join(repo, '.prthanker.lock'), 'w') as lockfh:
+            lockf(lockfh, LOCK_EX | LOCK_NB)
+    except IOError:
+        logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
+        return
 
     # Do we have a thanks.db there yet?
     dbpath = os.path.join(repo, 'thanks.db')
@@ -364,28 +478,60 @@ def send_thanks(repo, cmdconfig, dryrun):
         db_save_repo_heads(c, git_heads)
         # Exit early
         dbconn.commit()
-        sys.exit(0)
+        return
 
-    config = get_config_from_repo(repo)
-    if len(cmdconfig):
-        config = add_config_from_cmdargs(cmdconfig, config)
-
+    config = get_config_from_repo(repo, cmdconfig)
     logger.debug('config follows')
     logger.debug(config)
+
     db_heads = db_get_repo_heads(c)
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads)
     if not newrevs:
         logger.info('No new revs since last run.')
-        sys.exit(0)
+        return
 
-    prs = get_all_prs(config['prthanker.pirepo'])
-    for refname, revs in newrevs.items():
-        srevs = set(revs)
-        for pr_commit_id, msg_commit_id in get_all_new_prs(c, refname, prs):
-            if pr_commit_id in srevs:
-                logger.debug('Found a matching PR commit: %s', pr_commit_id)
-                print('bazonga')
+    for pirepo, settings in config.items():
+        pirepo = get_pirepo_dir(pirepo, pitopdir)
+        logger.info('Grabbing PR commits from %s', pirepo)
+
+        if 'cutoffdays' in settings:
+            cutoffdays = int(settings['cutoffdays'])
+        else:
+            # Default is 1 month
+            cutoffdays = 30
+
+        prs = get_all_prs(pirepo, cutoffdays=cutoffdays)
+
+        for refname, revlines in newrevs.items():
+            revs = set([row[0] for row in revlines])
+            for pr_commit_id, msg_commit_id in get_all_new_prs(c, refname, prs):
+                if pr_commit_id in revs:
+                    logger.debug('Found a matching PR commit: %s', pr_commit_id)
+                    # Make sure we haven't thanked for it already
+                    c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=?',
+                              (pr_commit_id,))
+                    rows = c.fetchall()
+                    if rows:
+                        logger.debug('Already thanked for this PR, skipping')
+                        continue
+
+                    merge_id = git_get_merge_id(repo, pr_commit_id)
+                    sent_msgid = mail_thanks_for_pr(refname, merge_id,
+                                                    pirepo, msg_commit_id,
+                                                    settings, dryrun)
+                    if not dryrun:
+                        try:
+                            c.execute('INSERT INTO thanks VALUES(?, ?, ?, ?)',
+                                      (pr_commit_id, refname, sent_msgid,
+                                       time.strftime('%Y-%m-%dT%H:%M:%S%z', time.gmtime())))
+                            dbconn.commit()
+                        except sqlite3.IntegrityError:
+                            logger.debug('Got integrity-error for %s', pr_commit_id)
+
+    if not dryrun:
+        db_save_repo_heads(c, git_heads)
+        dbconn.commit()
 
 
 if __name__ == '__main__':
@@ -394,10 +540,12 @@ if __name__ == '__main__':
     )
     parser.add_argument('-p', '--parse-requests', dest='pirepo', default=None,
                         help='Check the Public Inbox ML repository for any new pull requests.')
-    parser.add_argument('-t', '--mail-thankyous', dest='tyrepo', default=None,
+    parser.add_argument('-m', '--mail-thankyous', dest='tyrepo', default=None,
                         help='Check the repository and thank for any matching pulled PRs.')
+    parser.add_argument('-t', '--pirepos-topdir', dest='topdir', default=None,
+                        help='Toplevel path where all public-inbox repos are (optional)')
     parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
-                        help='Use these config values instead of looking in the repo')
+                        help='Use these config values instead of looking in the repo (used with -t)')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
     parser.add_argument('-d', dest='dryrun', action='store_true', default=False,
@@ -408,9 +556,6 @@ if __name__ == '__main__':
     cmdargs = parser.parse_args()
 
     logger.setLevel(logging.DEBUG)
-
-    if cmdargs.pirepo and cmdargs.tyrepo:
-        parser.error('Cannot use both -p and -t at the same time')
 
     if cmdargs.logfile:
         ch = logging.FileHandler(cmdargs.logfile)
@@ -433,7 +578,7 @@ if __name__ == '__main__':
     logger.addHandler(ch)
 
     if cmdargs.pirepo is not None:
-        parse_pull_requests(cmdargs.pirepo, cmdargs.dryrun)
+        parse_pull_requests(cmdargs.pirepo, cmdargs.topdir, cmdargs.dryrun)
 
     if cmdargs.tyrepo is not None:
-        send_thanks(cmdargs.tyrepo, cmdargs.config, cmdargs.dryrun)
+        send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.dryrun)
