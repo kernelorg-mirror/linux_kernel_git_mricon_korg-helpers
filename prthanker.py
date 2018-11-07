@@ -424,6 +424,14 @@ def get_all_new_prs(c, refname, prs, cutoffdays=30):
     return new_prs
 
 
+def to_or_cc_contains(tocc, addrs):
+    for addr in addrs.split(','):
+        if addr.strip() in tocc:
+            return True
+
+    return False
+
+
 def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun):
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
     repo, ref = get_remote_ref_from_body(orig.get_payload(decode=True))
@@ -435,13 +443,15 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
 
     if 'onlyifto' in config:
         # Don't send anything unless the required email is in to or cc
-        found = False
-        for onlyifto in config['onlyifto'].split(','):
-            if onlyifto.strip() in targets:
-                found = True
-                break
-        if not found:
+        if not to_or_cc_contains(targets, config['onlyifto']):
             logger.debug('To or CC do not contain: %s', config['onlyifto'])
+            logger.debug('Skipping this Pull Request')
+            return None
+
+    if 'notifto' in config:
+        # Don't send anything if we find a specific address in to or cc
+        if to_or_cc_contains(targets, config['notifto']):
+            logger.debug('To or CC contains: %s', config['notifto'])
             logger.debug('Skipping this Pull Request')
             return None
 
