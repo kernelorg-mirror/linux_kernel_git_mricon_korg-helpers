@@ -455,16 +455,18 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
             logger.debug('Skipping this Pull Request')
             return None
 
-    rechdr = orig.get('Received')
-    received = time.strftime('%Y-%m-%d at %H:%M:%S',
-                             email.utils.parsedate(rechdr.split(';')[-1].strip()))
+    reqdate = orig.get('Date')
+    if not reqdate:
+        rechdr = orig.get('Received')
+        reqdate = time.strftime('%Y-%m-%d at %H:%M:%S',
+                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
 
     msgvalues = dict()
     msgvalues['refname'] = refname.rsplit('/', 1)[-1]
     msgvalues['merge_id'] = merge_id
     msgvalues['origsubject'] = orig['Subject']
     msgvalues['remoteref'] = '%s %s' % (repo, ref)
-    msgvalues['reqdate'] = received
+    msgvalues['reqdate'] = reqdate
     msgvalues['br'] = '\n'
 
     msg = email.message.Message()
