@@ -220,7 +220,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             msgdate = recvtime
             if msgdate is None:
                 # fine, use the date in the message, even if it's bogus
-                msgdate = email.utils.parsedate_tz(msg['Date'])
+                msgdate = email.utils.parsedate_tz(str(msg['Date']))
 
             mboxname = '%04d-%02d.mbx' % (msgdate[0], msgdate[1])
 
