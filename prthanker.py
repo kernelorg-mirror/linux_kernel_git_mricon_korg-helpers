@@ -180,21 +180,21 @@ def get_remote_ref_from_body(body):
 
 def record_pr_data(msg_commit_id, msg, c):
     pr_commit_id = None
-    for part in msg.walk():
-        body = str(part.get_payload(decode=True))
-        for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
-            matches = cid_re.search(body)
-            if matches:
-                (pr_commit_id,) = matches.groups(0)
-                break
+    body = msg.get_payload(decode=True)
+    if body is None:
+        return False
+
+    body = body.decode('utf-8', errors='replace')
+    for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
+        matches = cid_re.search(body)
+        if matches:
+            (pr_commit_id,) = matches.groups(0)
+            break
 
     if pr_commit_id is None:
-        # Okay, try the one we like less :(
-        for part in msg.walk():
-            body = str(part.get_payload())
-            repo, ref = get_remote_ref_from_body(body)
-            if repo is not None:
-                pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
+        repo, ref = get_remote_ref_from_body(body)
+        if repo is not None:
+            pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
 
     if pr_commit_id is None:
         return False
@@ -434,7 +434,29 @@ def to_or_cc_contains(tocc, addrs):
 
 def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun):
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
-    repo, ref = get_remote_ref_from_body(orig.get_payload(decode=True))
+    origbody = orig.get_payload(decode=True)
+    if origbody is None:
+        return None
+
+    origbody = origbody.decode('utf-8', errors='replace')
+
+    if 'notifinbody' in config:
+        # Don't send anything if we find a certain string in the body
+        # e.g. 'pr-tracker-no-ack'
+        if origbody.find(config['notifinbody']) >= 0:
+            logger.debug('Body contains notifinbody string')
+            logger.debug('Skipping this Pull Request')
+            return None
+
+    if 'onlyifinbody' in config:
+        # Only send follow-up if we find a specific string in the body
+        # e.g. 'pr-tracker-ack'
+        if origbody.find(config['onlyifinbody']) < 0:
+            logger.debug('Body does not contain onlyifinbody string')
+            logger.debug('Skipping this Pull Request')
+            return None
+
+    repo, ref = get_remote_ref_from_body(origbody)
 
     dest = email.utils.getaddresses(orig.get_all('from', []))
     dest += email.utils.getaddresses(orig.get_all('to', []))
