@@ -1,8 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# PR Thanker cronjob. Can be also run from post-update hooks with extra
-# wrappers. Better instructions to follow after a period of testing.
+# PR Tracker Bot tracks pull requests sent to a mailing list (via its
+# public-inbox v2 git repository), and notifies senders when their pull
+# requests get merged.
+#
+# It runs from a cronjob, but can be also run from post-update hooks with 
+# extra wrappers. For more details, consult:
+#
+# https://korg.wiki.kernel.org/userdoc/prtracker
 #
 from __future__ import (absolute_import,
                         division,
