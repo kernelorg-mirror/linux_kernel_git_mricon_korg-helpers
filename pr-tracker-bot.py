@@ -569,16 +569,16 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
         dbconn.commit()
         return
 
-    config = get_config_from_repo(repo, cmdconfig)
-    logger.debug('config follows')
-    logger.debug(config)
-
     db_heads = db_get_repo_heads(c)
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads)
     if not newrevs:
         logger.info('No new revs since last run.')
         return
+
+    config = get_config_from_repo(repo, cmdconfig)
+    logger.debug('config follows')
+    logger.debug(config)
 
     tycount = 0
     for pirepo, settings in config.items():
