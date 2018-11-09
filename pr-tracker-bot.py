@@ -53,7 +53,7 @@ PULL_BODY_REMOTE_REF_RE = [
     re.compile(r'^\s*((?:git|https?)://[\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
-logger = logging.getLogger('prthanker')
+logger = logging.getLogger('prtracker')
 
 
 def db_save_meta(c):
@@ -301,7 +301,7 @@ def parse_pull_requests(pirepo, topdir, dryrun):
         sys.exit(1)
 
     try:
-        with open(os.path.join(pirepo, '.prthanker.lock'), 'w') as lockfh:
+        with open(os.path.join(pirepo, '.prtracker.lock'), 'w') as lockfh:
             lockf(lockfh, LOCK_EX | LOCK_NB)
     except IOError:
         logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
@@ -352,7 +352,7 @@ def parse_pull_requests(pirepo, topdir, dryrun):
 
 def get_config_from_repo(repo, cmdconfig):
     config = dict()
-    args = ['config', '-z', '--local', '--get-regexp', 'prthanker\..*']
+    args = ['config', '-z', '--local', '--get-regexp', 'prtracker\..*']
     out = git_run_command(repo, args, splitlines=False)
     if not out:
         return config
@@ -506,7 +506,7 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
         msg['References'] = orig['References'] + ' ' + orig['Message-Id']
     else:
         msg['References'] = orig['Message-Id']
-    msg['Message-Id'] = email.utils.make_msgid('prthanker-%s' % merge_id)
+    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot-%s' % merge_id)
     msg['Date'] = email.utils.formatdate(localtime=True)
     # Set to and cc
     if 'onlyto' in config:
@@ -550,7 +550,7 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
         sys.exit(1)
 
     try:
-        with open(os.path.join(repo, '.prthanker.lock'), 'w') as lockfh:
+        with open(os.path.join(repo, '.prtracker.lock'), 'w') as lockfh:
             lockf(lockfh, LOCK_EX | LOCK_NB)
     except IOError:
         logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
