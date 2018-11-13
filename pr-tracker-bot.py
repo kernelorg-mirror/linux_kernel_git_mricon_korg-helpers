@@ -49,8 +49,8 @@ PULL_BODY_WITH_COMMIT_ID_RE = [
 
 # I don't like these
 PULL_BODY_REMOTE_REF_RE = [
-    re.compile(r'^\s*((?:git|https?)://[\w/\.-]+)\s+([\w/\._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
-    re.compile(r'^\s*((?:git|https?)://[\w/\.-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*((?:git|https?)://[\w/.-]+)\s+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*((?:git|https?)://[\w/.-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
 logger = logging.getLogger('prtracker')
@@ -276,14 +276,19 @@ def get_pirepo_dir(projpath, topdir):
     # TODO: handle roll-over between shards
     if topdir:
         projpath = os.path.join(topdir, projpath)
-    subs = os.listdir(projpath)
-    at = 0
-    while True:
-        at += 1
-        if '{0}.git'.format(at) not in subs:
-            break
 
-    pirepo = os.path.join(projpath, '{0}.git'.format(at-1))
+    # if the path does not ent with .git, find the latest shard
+    pirepo = projpath
+    if pirepo[-4:] != '.git':
+        subs = os.listdir(projpath)
+        at = 0
+        while True:
+            at += 1
+            if '{0}.git'.format(at) not in subs:
+                break
+
+        pirepo = os.path.join(projpath, '{0}.git'.format(at-1))
+
     # Is it a git repo? It should always have a
     # refs/heads/master file (all Public-Inbox repos have a master ref)
     if not os.path.isfile(os.path.join(pirepo, 'refs/heads/master')):
@@ -379,12 +384,6 @@ def get_config_from_repo(repo, cmdconfig):
         # add/override values with those passed from cmdline
         for pirepo in config.keys():
             config[pirepo].update(superconfig)
-
-    return config
-
-
-def get_config_from_cmdline(cmdconfig):
-    config = dict()
 
     return config
 
@@ -642,7 +641,7 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--pirepos-topdir', dest='topdir', default=None,
                         help='Toplevel path where all public-inbox repos are (optional)')
     parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
-                        help='Use these config values instead of looking in the repo (used with -t)')
+                        help='Use these config values instead of looking in the repo (used with -m)')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
     parser.add_argument('-d', dest='dryrun', action='store_true', default=False,
