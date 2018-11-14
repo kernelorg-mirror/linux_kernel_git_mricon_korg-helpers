@@ -51,8 +51,8 @@ PULL_BODY_WITH_COMMIT_ID_RE = [
 
 # I don't like these
 PULL_BODY_REMOTE_REF_RE = [
-    re.compile(r'^\s*((?:git|https?)://[\w/.-]+)\s+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
-    re.compile(r'^\s*((?:git|https?)://[\w/.-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*([\w+-]+://[\w/.@-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*([\w+-]+://[\w/.@-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
 logger = logging.getLogger('prtracker')
@@ -156,6 +156,11 @@ def git_get_message_from_pi(pirepo, commit_id):
 
 
 def git_get_commit_id_from_repo_ref(repo, ref):
+    # We only handle git and http/s URLs
+    if not (repo.find('git://') == 0 or repo.find('http://') == 0 or repo.find('https://') == 0):
+        logger.debug('%s uses unsupported protocol', repo)
+        return None
+
     logger.debug('getting commit-id from: %s %s', repo, ref)
     lines = git_get_command_lines('', ['ls-remote', repo, '%s^{}' % ref])
     if not lines:
@@ -510,19 +515,24 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
 
     msgvalues = dict()
-    remoterepo, remoteref = get_remote_ref_from_body(origbody)
 
     msgvalues['refname'] = refname
     msgvalues['shortrefname'] = refname.rsplit('/', 1)[-1]
     msgvalues['commit_id'] = merge_id
     msgvalues['merge_id'] = merge_id
     msgvalues['origsubject'] = orig['Subject']
-    msgvalues['remoteref'] = '%s %s' % (remoterepo, remoteref)
+
+    remoterepo, remoteref = get_remote_ref_from_body(origbody)
+    msgvalues['remoteref'] = '(unable to parse the git remote)'
+    if remoterepo is not None:
+        msgvalues['remoteref'] = '%s %s' % (remoterepo, remoteref)
+
     msgvalues['reqdate'] = reqdate
     msgvalues['treename'] = ''
     if 'treename' in config:
         msgvalues['treename'] = config['treename']
     msgvalues['br'] = '\n'
+    msgvalues['2br'] = '\n\n'
 
     msg = email.message.Message()
     msg['Subject'] = Template(config['msgsubject']).safe_substitute(msgvalues)
@@ -690,8 +700,6 @@ def show_unapplied(repo, pitopdir, cmdconfig):
     if not db_exists:
         logger.info('Looks like this repository is not used for tracking PRs')
         return
-
-    db_heads = db_get_repo_heads(c)
 
     config = get_config_from_repo(repo, pitopdir, cmdconfig)
 
