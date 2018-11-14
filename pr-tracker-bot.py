@@ -30,6 +30,7 @@ import sqlite3
 import logging
 import re
 import glob
+import json
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
 from string import Template
@@ -133,8 +134,7 @@ def git_run_command(gitdir, args):
     output = output.strip().decode('utf-8', errors='replace')
 
     if len(error.strip()):
-        logger.critical(error.decode('utf-8', errors='replace'))
-        return None
+        logger.debug('Stderr: %s', error.decode('utf-8', errors='replace'))
 
     return output
 
@@ -680,6 +680,78 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
         logger.info('No new thank-yous to send.')
 
 
+def show_unapplied(repo, pitopdir, cmdconfig):
+    # Do we have a thanks.db there yet?
+    dbpath = os.path.join(repo, 'thanks.db')
+    db_exists = os.path.isfile(dbpath)
+    dbconn = sqlite3.connect(dbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    c = dbconn.cursor()
+
+    if not db_exists:
+        logger.info('Looks like this repository is not used for tracking PRs')
+        return
+
+    db_heads = db_get_repo_heads(c)
+
+    config = get_config_from_repo(repo, pitopdir, cmdconfig)
+
+    unapplied = list()
+    for pirepodef, settings in config.items():
+        pirepo = get_pirepo_dir(pirepodef, pitopdir)
+
+        cutoffdays = 30
+        try:
+            cutoffdays = int(settings['cutoffdays'])
+        except (IndexError, ValueError):
+            pass
+
+        for pr_commit_id, msg_commit_id in get_all_prs(pirepo, cutoffdays=cutoffdays):
+            c.execute('SELECT refname, sent_msgid FROM thanks WHERE pr_commit_id=?',
+                      (pr_commit_id,))
+            rows = c.fetchall()
+            if len(rows):
+                continue
+
+            # Is this pr_commit_id in the repo?
+            lines = git_get_command_lines(repo, ['cat-file', '-t', pr_commit_id])
+            if len(lines):
+                continue
+
+            orig = git_get_message_from_pi(pirepo, msg_commit_id)
+            dest = email.utils.getaddresses(orig.get_all('to', []))
+            dest += email.utils.getaddresses(orig.get_all('cc', []))
+            targets = [chunk[1] for chunk in dest]
+
+            if 'onlyifto' in settings:
+                # Only show unapplied pull requests matching "onlyifto"
+                if not to_or_cc_contains(targets, settings['onlyifto']):
+                    continue
+
+            origbody = orig.get_payload(decode=True)
+            if origbody is None:
+                continue
+
+            origbody = origbody.decode('utf-8', errors='replace')
+            remoterepo, remoteref = get_remote_ref_from_body(origbody)
+
+            unapplied.append(
+                {
+                    'commit-id': pr_commit_id,
+                    'listid': orig.get('List-Id', '(unknown-list)'),
+                    'msgid': orig.get('Message-Id', '(no message id)'),
+                    'subject': orig.get('Subject', '(no subject)'),
+                    'date': orig.get('Date', '(no date)'),
+                    'remoteref': '%s %s' % (remoterepo, remoteref),
+                }
+            )
+
+    if unapplied:
+        jsout = json.dumps(unapplied, indent=4, sort_keys=True)
+        logger.info(jsout)
+    else:
+        logger.info('No unapplied pull requests.')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -688,15 +760,17 @@ if __name__ == '__main__':
                         help='Check the Public Inbox ML repository for any new pull requests.')
     parser.add_argument('-m', '--mail-thankyous', dest='tyrepo', default=None,
                         help='Check the repository and thank for any matching pulled PRs.')
+    parser.add_argument('-u', '--show-unapplied', dest='unapplied', default=None,
+                        help='Show pull requests that have not yet been applied to this repository.')
     parser.add_argument('-t', '--pirepos-topdir', dest='topdir', default=None,
                         help='Toplevel path where all public-inbox repos are (optional)')
     parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
                         help='Use these config values instead of looking in the repo (used with -m)')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
-    parser.add_argument('-d', dest='dryrun', action='store_true', default=False,
+    parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
                         help='Do not mail or store anything, just do a dry run.')
-    parser.add_argument('-n', dest='nomail', action='store_true', default=False,
+    parser.add_argument('-n', '--no-mail', dest='nomail', action='store_true', default=False,
                         help='Do not mail anything, but store database entries.')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
@@ -730,3 +804,6 @@ if __name__ == '__main__':
 
     if cmdargs.tyrepo is not None:
         send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
+
+    if cmdargs.unapplied is not None:
+        show_unapplied(cmdargs.unapplied, cmdargs.topdir, cmdargs.config)
