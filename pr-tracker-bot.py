@@ -29,6 +29,7 @@ import subprocess
 import sqlite3
 import logging
 import re
+import glob
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
 from string import Template
@@ -110,7 +111,19 @@ def db_init_thanks_sqlite_db(c):
         )''')
 
 
-def git_run_command(gitdir, args, splitlines=True):
+def git_get_command_lines(gitdir, args):
+    out = git_run_command(gitdir, args)
+    lines = list()
+    if out:
+        for line in out.split('\n'):
+            if line == '':
+                continue
+            lines.append(line)
+
+    return lines
+
+
+def git_run_command(gitdir, args):
     args = ['git', '--no-pager', '--git-dir', gitdir] + args
 
     logger.debug('Running %s' % ' '.join(args))
@@ -123,22 +136,12 @@ def git_run_command(gitdir, args, splitlines=True):
         logger.critical(error.decode('utf-8', errors='replace'))
         return None
 
-    if not splitlines:
-        return output
-
-    lines = list()
-    logger.debug('Processing the output...')
-    for line in output.split('\n'):
-        if line == '':
-            continue
-        lines.append(line)
-
-    return lines
+    return output
 
 
 def git_get_repo_heads(gitdir):
     refs = list()
-    lines = git_run_command(gitdir, ['show-ref', '--heads'])
+    lines = git_get_command_lines(gitdir, ['show-ref', '--heads'])
     if lines is not None:
         for line in lines:
             (commit_id, refname) = line.split()
@@ -147,17 +150,17 @@ def git_get_repo_heads(gitdir):
 
 
 def git_get_message_from_pi(pirepo, commit_id):
-    full_email = git_run_command(pirepo, ['show', '%s:m' % commit_id], splitlines=False)
+    full_email = git_run_command(pirepo, ['show', '%s:m' % commit_id])
     msg = email.message_from_string(full_email.encode('utf-8'))
     return msg
 
 
 def git_get_commit_id_from_repo_ref(repo, ref):
     logger.debug('getting commit-id from: %s %s', repo, ref)
-    lines = git_run_command('', ['ls-remote', repo, '%s^{}' % ref])
+    lines = git_get_command_lines('', ['ls-remote', repo, '%s^{}' % ref])
     if not lines:
         # Try it as a head
-        lines = git_run_command('', ['ls-remote', repo, ref])
+        lines = git_get_command_lines('', ['ls-remote', repo, ref])
         if not lines:
             # Oh well, we tried
             logger.debug('did not find commit-id, ignoring pull request')
@@ -208,9 +211,18 @@ def record_pr_data(msg_commit_id, msg, c):
     logger.debug('pr_commit_id=%s', pr_commit_id)
 
     msg_id = msg['Message-Id']
+    received = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+
     rechdr = msg.get('Received')
-    received = time.strftime('%Y-%m-%dT%H:%M:%S%z',
-                             email.utils.parsedate(rechdr.split(';')[-1].strip()))
+    if rechdr:
+        received = time.strftime('%Y-%m-%dT%H:%M:%S%z',
+                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
+    else:
+        # Do we have a date?
+        datehdr = msg.get('Date')
+        if datehdr:
+            received = time.strftime('%Y-%m-%dT%H:%M:%S%z', email.utils.parsedate(datehdr))
+
     logger.debug('received=%s', received)
     subject = msg['Subject'].replace('\n', ' ')
     logger.debug('Found a new PR: %s', subject)
@@ -249,8 +261,8 @@ def git_get_new_revs(gitdir, db_heads, git_heads):
             continue
 
         rev_range = '%s..%s' % (db_commit_id, git_commit_id)
-        lines = git_run_command(gitdir, ['rev-list', '--pretty=oneline',
-                                         '--reverse', rev_range, refname])
+        lines = git_get_command_lines(gitdir, ['rev-list', '--pretty=oneline',
+                                               '--reverse', rev_range, refname])
         if not lines:
             continue
 
@@ -267,7 +279,7 @@ def git_get_new_revs(gitdir, db_heads, git_heads):
 def git_get_merge_id(repo, commit_id):
     # get merge commit id
     args = ['rev-list', '%s..' % commit_id, '--ancestry-path']
-    lines = git_run_command(repo, args)
+    lines = git_get_command_lines(repo, args)
     return lines[-1]
 
 
@@ -288,12 +300,6 @@ def get_pirepo_dir(projpath, topdir):
                 break
 
         pirepo = os.path.join(projpath, '{0}.git'.format(at-1))
-
-    # Is it a git repo? It should always have a
-    # refs/heads/master file (all Public-Inbox repos have a master ref)
-    if not os.path.isfile(os.path.join(pirepo, 'refs/heads/master')):
-        logger.critical('Does not appear to be a public-inbox repo: %s', pirepo)
-        sys.exit(1)
 
     return pirepo
 
@@ -355,10 +361,10 @@ def parse_pull_requests(pirepo, topdir, dryrun):
         dbconn.commit()
 
 
-def get_config_from_repo(repo, cmdconfig):
+def get_config_from_repo(repo, pitopdir, cmdconfig):
     config = dict()
     args = ['config', '-z', '--local', '--get-regexp', 'prtracker\..*']
-    out = git_run_command(repo, args, splitlines=False)
+    out = git_run_command(repo, args)
     if not out:
         return config
 
@@ -369,12 +375,29 @@ def get_config_from_repo(repo, cmdconfig):
         try:
             chunks = key.split('.')
             pirepo = '.'.join(chunks[1:-1])
+            if not pirepo:
+                pirepo = '*'
             if pirepo not in config:
                 config[pirepo] = dict()
             cfgkey = chunks[-1]
             config[pirepo][cfgkey] = value
         except ValueError:
             logger.debug('Ignoring git config entry %s', line)
+
+    if '*' in config and 'pirepos' in config['*']:
+        subconfig = dict(config['*'])
+        del(subconfig['pirepos'])
+        for repoglob in config['*']['pirepos'].split(','):
+            repoglob = repoglob.strip()
+            if pitopdir:
+                # It's hurky to add it here only to remove it there, but
+                # the alternatives were hurkier.
+                repoglob = os.path.join(pitopdir, repoglob)
+            for pirepo in glob.glob(repoglob):
+                if pitopdir:
+                    pirepo = pirepo.replace(pitopdir, '').lstrip('/')
+                config[pirepo] = subconfig
+        del(config['*'])
 
     if cmdconfig:
         superconfig = dict()
@@ -437,7 +460,7 @@ def to_or_cc_contains(tocc, addrs):
     return False
 
 
-def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun):
+def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, config, nomail):
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
     origbody = orig.get_payload(decode=True)
     if origbody is None:
@@ -460,8 +483,6 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
             logger.debug('Body does not contain onlyifinbody string')
             logger.debug('Skipping this Pull Request')
             return None
-
-    repo, ref = get_remote_ref_from_body(origbody)
 
     dest = email.utils.getaddresses(orig.get_all('from', []))
     dest += email.utils.getaddresses(orig.get_all('to', []))
@@ -486,14 +507,21 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
     if not reqdate:
         rechdr = orig.get('Received')
         reqdate = time.strftime('%Y-%m-%d at %H:%M:%S',
-                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
+                                email.utils.parsedate(rechdr.split(';')[-1].strip()))
 
     msgvalues = dict()
-    msgvalues['refname'] = refname.rsplit('/', 1)[-1]
+    remoterepo, remoteref = get_remote_ref_from_body(origbody)
+
+    msgvalues['refname'] = refname
+    msgvalues['shortrefname'] = refname.rsplit('/', 1)[-1]
+    msgvalues['commit_id'] = merge_id
     msgvalues['merge_id'] = merge_id
     msgvalues['origsubject'] = orig['Subject']
-    msgvalues['remoteref'] = '%s %s' % (repo, ref)
+    msgvalues['remoteref'] = '%s %s' % (remoterepo, remoteref)
     msgvalues['reqdate'] = reqdate
+    msgvalues['treename'] = ''
+    if 'treename' in config:
+        msgvalues['treename'] = config['treename']
     msgvalues['br'] = '\n'
 
     msg = email.message.Message()
@@ -505,30 +533,49 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
         msg['References'] = orig['References'] + ' ' + orig['Message-Id']
     else:
         msg['References'] = orig['Message-Id']
-    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot-%s' % merge_id)
+
+    msg['X-PR-Tracked-List-Id'] = orig.get('List-Id', '')
+    msg['X-PR-Tracked-Message-Id'] = orig['Message-Id']
+    msg['X-PR-Tracked-Remote'] = msgvalues['remoteref']
+    msg['X-PR-Tracked-Commit-Id'] = commit_id
+    msg['X-PR-Merge-Tree'] = msgvalues['treename']
+    msg['X-PR-Merge-Refname'] = refname
+    msg['X-PR-Merge-Commit-Id'] = merge_id
+
+    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot')
     msg['Date'] = email.utils.formatdate(localtime=True)
+
     # Set to and cc
     if 'onlyto' in config:
         msg['To'] = config['onlyto']
         # Override dest/targets
-        dest = email.utils.getaddresses([config['onlyto']])
         targets = [config['onlyto']]
     else:
         msg['To'] = orig['From']
-        msg['Cc'] = orig['To'] + ', ' + orig['Cc']
+        origcc = orig.get('cc', '')
+        if origcc:
+            msg['Cc'] = orig['To'] + ', ' + orig['Cc']
+        else:
+            msg['Cc'] = orig['To']
+
     if 'alwayscc' in config:
         if msg.get('cc', ''):
             msg['Cc'] = msg.get('cc', '') + ', %s' % config['alwayscc']
         else:
             msg['Cc'] = config['alwayscc']
-        dest += email.utils.getaddresses([config['alwayscc']])
-        targets.append(config['alwayscc'])
+
+        if config['alwayscc'] not in targets:
+            targets.append(config['alwayscc'])
+
+    if 'alwaysbcc' in config:
+        if config['alwaysbcc'] not in targets:
+            targets.append(config['alwaysbcc'])
 
     msg.set_payload(Template(config['msgbody']).safe_substitute(msgvalues))
 
     logger.debug('Message follows')
     logger.debug(msg.as_string())
-    if not dryrun:
+    if not nomail:
         logger.info('Mailing thanks for: %s', orig['Subject'])
         smtp = smtplib.SMTP(config['mailhost'])
         smtp.sendmail(msg['From'], targets, msg.as_string())
@@ -542,7 +589,10 @@ def mail_thanks_for_pr(refname, merge_id, pirepo, msg_commit_id, config, dryrun)
     return msg['Message-Id']
 
 
-def send_thanks(repo, pitopdir, cmdconfig, dryrun):
+def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
+    if dryrun:
+        nomail = True
+
     git_heads = git_get_repo_heads(repo)
     if not git_heads:
         logger.critical('Could not get the latest ref in %s', repo)
@@ -575,20 +625,20 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
         logger.info('No new revs since last run.')
         return
 
-    config = get_config_from_repo(repo, cmdconfig)
-    logger.debug('config follows')
-    logger.debug(config)
+    config = get_config_from_repo(repo, pitopdir, cmdconfig)
 
     tycount = 0
     for pirepo, settings in config.items():
         pirepo = get_pirepo_dir(pirepo, pitopdir)
         logger.info('Grabbing PR commits from %s', pirepo)
+        logger.debug('config follows')
+        logger.debug(settings)
 
-        if 'cutoffdays' in settings:
+        cutoffdays = 30
+        try:
             cutoffdays = int(settings['cutoffdays'])
-        else:
-            # Default is 1 month
-            cutoffdays = 30
+        except (IndexError, ValueError):
+            pass
 
         prs = get_all_prs(pirepo, cutoffdays=cutoffdays)
 
@@ -599,17 +649,17 @@ def send_thanks(repo, pitopdir, cmdconfig, dryrun):
                 if pr_commit_id in revs:
                     logger.debug('Found a matching PR commit: %s', pr_commit_id)
                     # Make sure we haven't thanked for it already
-                    c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=?',
-                              (pr_commit_id,))
+                    c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=? AND refname=?',
+                              (pr_commit_id, refname))
                     rows = c.fetchall()
                     if rows:
                         logger.debug('Already thanked for this PR, skipping')
                         continue
 
                     merge_id = git_get_merge_id(repo, pr_commit_id)
-                    sent_msgid = mail_thanks_for_pr(refname, merge_id,
+                    sent_msgid = mail_thanks_for_pr(refname, pr_commit_id, merge_id,
                                                     pirepo, msg_commit_id,
-                                                    settings, dryrun)
+                                                    settings, nomail)
                     if sent_msgid and not dryrun:
                         tycount += 1
                         try:
@@ -646,6 +696,8 @@ if __name__ == '__main__':
                         help='Log file for messages during quiet operation')
     parser.add_argument('-d', dest='dryrun', action='store_true', default=False,
                         help='Do not mail or store anything, just do a dry run.')
+    parser.add_argument('-n', dest='nomail', action='store_true', default=False,
+                        help='Do not mail anything, but store database entries.')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
 
@@ -677,4 +729,4 @@ if __name__ == '__main__':
         parse_pull_requests(cmdargs.pirepo, cmdargs.topdir, cmdargs.dryrun)
 
     if cmdargs.tyrepo is not None:
-        send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.dryrun)
+        send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
