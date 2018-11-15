@@ -51,8 +51,8 @@ PULL_BODY_WITH_COMMIT_ID_RE = [
 
 # I don't like these
 PULL_BODY_REMOTE_REF_RE = [
-    re.compile(r'^\s*([\w+-]+://[\w/.@-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
-    re.compile(r'^\s*([\w+-]+://[\w/.@-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*([\w+-]+://[\w/.@~-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*([\w+-]+://[\w/.@~-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
 logger = logging.getLogger('prtracker')
@@ -532,7 +532,7 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
     if 'treename' in config:
         msgvalues['treename'] = config['treename']
     msgvalues['br'] = '\n'
-    msgvalues['2br'] = '\n\n'
+    msgvalues['brbr'] = '\n\n'
 
     msg = email.message.Message()
     msg['Subject'] = Template(config['msgsubject']).safe_substitute(msgvalues)
@@ -690,7 +690,7 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
         logger.info('No new thank-yous to send.')
 
 
-def show_unapplied(repo, pitopdir, cmdconfig):
+def show_unapplied(repo, pitopdir, cmdconfig, use_json):
     # Do we have a thanks.db there yet?
     dbpath = os.path.join(repo, 'thanks.db')
     db_exists = os.path.isfile(dbpath)
@@ -704,16 +704,22 @@ def show_unapplied(repo, pitopdir, cmdconfig):
     config = get_config_from_repo(repo, pitopdir, cmdconfig)
 
     unapplied = list()
+    cutoffdays = 30
+    seen_commit_ids = list()
+
     for pirepodef, settings in config.items():
         pirepo = get_pirepo_dir(pirepodef, pitopdir)
 
-        cutoffdays = 30
         try:
             cutoffdays = int(settings['cutoffdays'])
         except (IndexError, ValueError):
             pass
 
         for pr_commit_id, msg_commit_id in get_all_prs(pirepo, cutoffdays=cutoffdays):
+            if pr_commit_id in seen_commit_ids:
+                # skip if we've already seen this commit-id on some other list
+                continue
+
             c.execute('SELECT refname, sent_msgid FROM thanks WHERE pr_commit_id=?',
                       (pr_commit_id,))
             rows = c.fetchall()
@@ -742,22 +748,39 @@ def show_unapplied(repo, pitopdir, cmdconfig):
             origbody = origbody.decode('utf-8', errors='replace')
             remoterepo, remoteref = get_remote_ref_from_body(origbody)
 
-            unapplied.append(
-                {
-                    'commit-id': pr_commit_id,
-                    'listid': orig.get('List-Id', '(unknown-list)'),
-                    'msgid': orig.get('Message-Id', '(no message id)'),
-                    'subject': orig.get('Subject', '(no subject)'),
-                    'date': orig.get('Date', '(no date)'),
-                    'remoteref': '%s %s' % (remoterepo, remoteref),
-                }
-            )
+            values = {
+                'commit-id': pr_commit_id,
+                'listid': orig.get('List-Id', '(unknown-list)'),
+                'msgid': orig.get('Message-Id', '(no message id)'),
+                'from': orig.get('From', '(no from)'),
+                'subject': orig.get('Subject', '(no subject)'),
+                'date': orig.get('Date', '(no date)'),
+                'remoteref': '%s %s' % (remoterepo, remoteref),
+            }
 
-    if unapplied:
+            unapplied.append(values)
+            seen_commit_ids.append(pr_commit_id)
+
+            if not use_json:
+                print()
+                print('Subject: %s' % values['subject'])
+                print('   From: %s' % values['from'])
+                print('   Date: %s' % values['date'])
+                print('   List: %s' % values['listid'])
+                print('  MsgId: %s' % values['msgid'])
+                print(' Remote: %s' % values['remoteref'])
+                print(' Commit: %s' % values['commit-id'])
+
+    if use_json:
         jsout = json.dumps(unapplied, indent=4, sort_keys=True)
-        logger.info(jsout)
+        print(jsout)
     else:
-        logger.info('No unapplied pull requests.')
+        if len(unapplied):
+            print()
+            print('%s unapplied pull requests from the past %d days.'
+                  % (len(unapplied), cutoffdays))
+        else:
+            print('No unapplied pull requests from the past %d days.' % cutoffdays)
 
 
 if __name__ == '__main__':
@@ -770,6 +793,8 @@ if __name__ == '__main__':
                         help='Check the repository and thank for any matching pulled PRs.')
     parser.add_argument('-u', '--show-unapplied', dest='unapplied', default=None,
                         help='Show pull requests that have not yet been applied to this repository.')
+    parser.add_argument('-j', '--json-formatted', dest='json', action='store_true', default=False,
+                        help='Show unapplied PRs in a json format (use with -u).')
     parser.add_argument('-t', '--pirepos-topdir', dest='topdir', default=None,
                         help='Toplevel path where all public-inbox repos are (optional)')
     parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
@@ -814,4 +839,4 @@ if __name__ == '__main__':
         send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
 
     if cmdargs.unapplied is not None:
-        show_unapplied(cmdargs.unapplied, cmdargs.topdir, cmdargs.config)
+        show_unapplied(cmdargs.unapplied, cmdargs.topdir, cmdargs.config, cmdargs.json)
