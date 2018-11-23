@@ -1,6 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
+# This bot automatically recognizes when patchwork-tracked patches
+# are applied to git repositories and marks them as "Accepted." It can
+# additionally send mail notifications to the maintainers and to the
+# patch submitters.
+#
+# It runs from a cronjob, but can be also run from post-update hooks with 
+# extra wrappers. For more details, consult:
+#
+# https://korg.wiki.kernel.org/userdoc/pwbot
+#
+#
 from __future__ import (absolute_import,
                         division,
                         print_function,
