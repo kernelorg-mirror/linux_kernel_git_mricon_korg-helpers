@@ -125,24 +125,34 @@ def state_id_by_name(rpc, name):
 
 # Lifted from pwclient with changes
 def patchwork_update_patch(rpc, patch_id, state=None, archived=None, commit=None, dryrun=False):
-    params = dict()
+    ret = dict()
 
+    patch = rpc.patch_get(patch_id)
+    if not patch:
+        logger.info('  Could not get patch data')
+        return None
+
+    ret['msgid'] = patch['msgid']
+    ret['project'] = patch['project'].data
+    ret['submitter'] = patch['submitter'].data
+    ret['date'] = patch['date'].data
+    ret['name'] = patch['name']
+    ret['state'] = state
+    ret['commit'] = commit
+    ret['patch_id'] = patch_id
+
+    params = dict()
     if state:
         state_id = state_id_by_name(rpc, state)
         if not state_id:
             logger.debug('Error: No State found matching %s*', state)
-            return False
+            return None
 
         params['state'] = state_id
 
-        patch = rpc.patch_get(patch_id)
-        if not patch or 'state_id' not in patch:
-            logger.info('  Could not get patch data')
-            return False
-
         if patch['state_id'] == state_id:
             logger.info('  This patch is already marked as %s', state)
-            return False
+            return None
 
     if commit:
         params['commit_ref'] = commit
@@ -160,7 +170,10 @@ def patchwork_update_patch(rpc, patch_id, state=None, archived=None, commit=None
         logger.info('Dry run, not updating patch state')
         success = True
 
-    return success
+    if success:
+        return ret
+
+    return None
 
 
 def db_save_meta(c):
@@ -363,136 +376,71 @@ def get_config_from_repo(repo, regexp, cmdconfig):
     return config
 
 
-def to_or_cc_contains(tocc, addrs):
-    for addr in addrs.split(','):
-        if addr.strip() in tocc:
-            return True
+def summarize_patches(summarydata, server, config, submitter=None):
+    references = list()
+    body = ''
+    count = 0
+    for pdata in summarydata:
+        if submitter is not None and submitter != pdata['submitter']:
+            # skip this submitter
+            continue
 
-    return False
+        count += 1
+
+        references.append(pdata['msgid'])
+        body += '\n'
+        body += '%s\n' % pdata['name']
+        body += '    Status   : %s\n' % pdata['state']
+        if submitter is None:
+            body += '    Submitter: %s\n' % pdata['submitter']
+        body += '    Patchwork: %s/patch/%s\n' % (server, pdata['patch_id'])
+
+        if 'commitlink' in config:
+            body += '    Webview  : %s/%s\n' % (config['commitlink'], pdata['commit'])
+
+    body += '\nTotal patches: %d\n' % count
+
+    return body, references
 
 
-def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, config, nomail):
-    orig = git_get_message_from_pi(pirepo, msg_commit_id)
-    origbody = orig.get_payload(decode=True)
-    if origbody is None:
-        return None
-
-    origbody = origbody.decode('utf-8', errors='replace')
-
-    if 'notifinbody' in config:
-        # Don't send anything if we find a certain string in the body
-        # e.g. 'pr-tracker-no-ack'
-        if origbody.find(config['notifinbody']) >= 0:
-            logger.debug('Body contains notifinbody string')
-            logger.debug('Skipping this Pull Request')
-            return None
-
-    if 'onlyifinbody' in config:
-        # Only send follow-up if we find a specific string in the body
-        # e.g. 'pr-tracker-ack'
-        if origbody.find(config['onlyifinbody']) < 0:
-            logger.debug('Body does not contain onlyifinbody string')
-            logger.debug('Skipping this Pull Request')
-            return None
-
-    dest = email.utils.getaddresses(orig.get_all('from', []))
-    dest += email.utils.getaddresses(orig.get_all('to', []))
-    dest += email.utils.getaddresses(orig.get_all('cc', []))
-    targets = [chunk[1] for chunk in dest]
-
-    if 'onlyifto' in config:
-        # Don't send anything unless the required email is in to or cc
-        if not to_or_cc_contains(targets, config['onlyifto']):
-            logger.debug('To or CC do not contain: %s', config['onlyifto'])
-            logger.debug('Skipping this Pull Request')
-            return None
-
-    if 'notifto' in config:
-        # Don't send anything if we find a specific address in to or cc
-        if to_or_cc_contains(targets, config['notifto']):
-            logger.debug('To or CC contains: %s', config['notifto'])
-            logger.debug('Skipping this Pull Request')
-            return None
-
-    reqdate = orig.get('Date')
-    if not reqdate:
-        rechdr = orig.get('Received')
-        reqdate = time.strftime('%Y-%m-%d at %H:%M:%S',
-                                email.utils.parsedate(rechdr.split(';')[-1].strip()))
-
-    msgvalues = dict()
-
-    msgvalues['refname'] = refname
-    msgvalues['shortrefname'] = refname.rsplit('/', 1)[-1]
-    msgvalues['commit_id'] = merge_id
-    msgvalues['merge_id'] = merge_id
-    msgvalues['origsubject'] = orig['Subject']
-
-    remoterepo, remoteref = get_remote_ref_from_body(origbody)
-    msgvalues['remoteref'] = '(unable to parse the git remote)'
-    if remoterepo is not None:
-        msgvalues['remoteref'] = '%s %s' % (remoterepo, remoteref)
-
-    msgvalues['reqdate'] = reqdate
-    msgvalues['treename'] = ''
-    if 'treename' in config:
-        msgvalues['treename'] = config['treename']
-    msgvalues['br'] = '\n'
-    msgvalues['brbr'] = '\n\n'
-
+def send_summary(summarydata, server, refname, config, nomail):
+    logger.info('Preparing summary')
+    # we send summaries by project, so the project name is going to be all the same
+    project = summarydata[0]['project']
     msg = email.message.Message()
-    msg['Subject'] = Template(config['msgsubject']).safe_substitute(msgvalues)
+    msg['Subject'] = 'Patchwork summary for: %s' % project
     msg['From'] = config['from']
-    # Set threading bits
-    msg['In-Reply-To'] = orig['Message-Id']
-    if orig.get('References', ''):
-        msg['References'] = orig['References'] + ' ' + orig['Message-Id']
-    else:
-        msg['References'] = orig['Message-Id']
-
-    msg['X-PR-Tracked-List-Id'] = orig.get('List-Id', '')
-    msg['X-PR-Tracked-Message-Id'] = orig['Message-Id']
-    msg['X-PR-Tracked-Remote'] = msgvalues['remoteref']
-    msg['X-PR-Tracked-Commit-Id'] = commit_id
-    msg['X-PR-Merge-Tree'] = msgvalues['treename']
-    msg['X-PR-Merge-Refname'] = refname
-    msg['X-PR-Merge-Commit-Id'] = merge_id
-
-    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot')
+    msg['Message-Id'] = email.utils.make_msgid('git-patchwork-summary')
     msg['Date'] = email.utils.formatdate(localtime=True)
 
-    # Set to and cc
-    if 'onlyto' in config:
-        msg['To'] = config['onlyto']
-        # Override dest/targets
-        targets = [config['onlyto']]
-    else:
-        msg['To'] = orig['From']
-        origcc = orig.get('cc', '')
-        if origcc:
-            msg['Cc'] = orig['To'] + ', ' + orig['Cc']
-        else:
-            msg['Cc'] = orig['To']
-
+    targets = config['summaryto'].split(',')
+    msg['To'] = ', '.join(targets)
     if 'alwayscc' in config:
-        if msg.get('cc', ''):
-            msg['Cc'] = msg.get('cc', '') + ', %s' % config['alwayscc']
-        else:
-            msg['Cc'] = config['alwayscc']
-
-        if config['alwayscc'] not in targets:
-            targets.append(config['alwayscc'])
-
+        msg['Cc'] = config['alwayscc']
+        targets.append(config['alwayscc'])
     if 'alwaysbcc' in config:
-        if config['alwaysbcc'] not in targets:
-            targets.append(config['alwaysbcc'])
+        targets.append(config['alwaysbcc'])
 
-    msg.set_payload(Template(config['msgbody']).safe_substitute(msgvalues))
+    body = (
+               'Hello:\n\n'
+               'The following patches were automatically processed, because they were applied to\n'
+               '%s:%s:\n'
+           ) % (config['treename'], refname)
+
+    pbody, references = summarize_patches(summarydata, server, config)
+
+    msg['References'] = ', '.join(references)
+
+    body += pbody
+
+    body += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
+
+    msg.set_payload(body)
 
     logger.debug('Message follows')
     logger.debug(msg.as_string())
     if not nomail:
-        logger.info('Mailing thanks for: %s', orig['Subject'])
+        logger.info('Sending summary to: %s', msg['To'])
         smtp = smtplib.SMTP(config['mailhost'])
         smtp.sendmail(msg['From'], targets, msg.as_string())
         smtp.close()
@@ -503,6 +451,71 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
         logger.info('------------------------------')
 
     return msg['Message-Id']
+
+
+def notify_submitters(summarydata, server, refname, config, nomail):
+    logger.info('Sending submitter notifications')
+    # we send a message per submitter, so first find all unique submitters
+    submitters = list()
+    for pdata in summarydata:
+        if pdata['submitter'] not in submitters:
+            submitters.append(pdata['submitter'])
+
+    logger.debug('submitters=%s', submitters)
+    for submitter in submitters:
+        logger.debug('Preparing a notification for %s', submitter)
+        msg = email.message.Message()
+        msg['Subject'] = 'Your patches were applied to %s' % config['treename']
+        msg['From'] = config['from']
+        msg['Message-Id'] = email.utils.make_msgid('git-patchwork-notify')
+        msg['Date'] = email.utils.formatdate(localtime=True)
+
+        if 'onlyto' in config:
+            targets = config['onlyto']
+            msg['To'] = config['onlyto']
+        else:
+            dest = email.utils.getaddresses(submitter)
+            targets = [chunk[1] for chunk in dest]
+
+            msg['To'] = submitter
+
+            if 'alwayscc' in config:
+                msg['Cc'] = config['alwayscc']
+                targets.append(config['alwayscc'])
+            if 'alwaysbcc' in config:
+                targets.append(config['alwaysbcc'])
+
+        body = (
+                   'Hello:\n\n'
+                   'The following patches you sent were recently pushed to\n'
+                   '%s (%s):\n'
+               ) % (config['treename'], refname)
+
+        pbody, references = summarize_patches(summarydata, server, config, submitter=submitter)
+
+        msg['References'] = ', '.join(references)
+
+        body += pbody
+
+        body += ('\nYou are awesome, thank you!\n\n'
+                 '-- \nDeet-doot-dot, I am a bot.\n'
+                 'https://korg.wiki.kernel.org/userdoc/pwbot\n'
+                 )
+
+        msg.set_payload(body)
+
+        logger.debug('Message follows')
+        logger.debug(msg.as_string())
+        if not nomail:
+            logger.info('Notifying %s', submitter)
+            smtp = smtplib.SMTP(config['mailhost'])
+            smtp.sendmail(msg['From'], targets, msg.as_string())
+            smtp.close()
+        else:
+            logger.info('Would have sent the following:')
+            logger.info('------------------------------')
+            logger.info(msg.as_string())
+            logger.info('------------------------------')
 
 
 def pwrun(repo, cmdconfig, nomail, dryrun):
@@ -541,16 +554,6 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         logger.info('No new revs since last run.')
         return
 
-    rpwhashes = {}
-    for refname, revlines in newrevs.items():
-        rpwhashes[refname] = list()
-        logger.debug('Looking at %s', refname)
-        for rev, logline in revlines:
-            diff = git_get_rev_diff(repo, rev)
-            pwhash = get_patchwork_hash(diff)
-            if pwhash:
-                rpwhashes[refname].append((rev, logline, pwhash))
-
     config = get_config_from_repo(repo, 'patchwork\..*', cmdconfig)
 
     for server, settings in config.items():
@@ -572,23 +575,38 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         statemap = dict()
         for pair in settings['statemap'].split(','):
             try:
-                refname, state = pair.split(':')
-                if refname in rpwhashes.keys():
-                    statemap[refname] = state
-
+                refname, params = pair.split(':')
+                statemap[refname] = params.split('/')
             except ValueError:
                 logger.info('Invalid statemap entry: %s', pair)
 
-        if not len(statemap):
-            logger.info('No matching refnames in statemap for %s', server)
-            continue
+        logger.debug('statemap: %s', statemap)
+
+        rpwhashes = {}
+        for refname, revlines in newrevs.items():
+            if refname not in statemap:
+                # We don't care about this ref
+                continue
+
+            rpwhashes[refname] = list()
+            logger.debug('Looking at %s', refname)
+            for rev, logline in revlines:
+                diff = git_get_rev_diff(repo, rev)
+                pwhash = get_patchwork_hash(diff)
+                if pwhash:
+                    rpwhashes[refname].append((rev, logline, pwhash))
 
         for project in settings['projects'].split(','):
             count = 0
             project = project.strip()
             logger.info('Processing "%s/%s"', server, project)
             for refname, hashpairs in rpwhashes.items():
-                state = statemap[refname]
+                logger.info('Analyzing %d revisions', len(hashpairs))
+                summary = list()
+                state = statemap[refname][0]
+                archive = False
+                if 'archive' in statemap[refname]:
+                    archive = True
                 for rev, logline, hash in hashpairs:
                     # Do we have a matching hash on the server?
                     logger.debug('Querying %s (%s)', rev, logline)
@@ -598,16 +616,22 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
                     logger.info('  %s: updating "%s" to "%s"', project, logline, state)
                     logger.debug('%s/patch/%d', server, patch_id)
-                    success = patchwork_update_patch(rpc, patch_id, state=state,
-                                                     archived=False, commit=rev, dryrun=dryrun)
-                    if success:
+                    pdata = patchwork_update_patch(rpc, patch_id, state=state,
+                                                     archived=archive, commit=rev, dryrun=dryrun)
+                    if pdata is not None:
+                        summary.append(pdata)
                         logger.debug('Successfully updated patch_id=%s', patch_id)
                         count += 1
+
+                if len(summary) and 'send_summary' in statemap[refname]:
+                    send_summary(summary, server, refname, settings, nomail)
+                if len(summary) and 'notify_submitter' in statemap[refname]:
+                    notify_submitters(summary, server, refname, settings, nomail)
 
             if count:
                 logger.info('Updated %d patches on %s', count, server)
             else:
-                logger.info('No patches matched on %s', server)
+                logger.info('No patches updated on %s', server)
 
     if not dryrun:
         db_save_repo_heads(c, git_heads)
