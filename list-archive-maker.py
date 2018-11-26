@@ -48,7 +48,7 @@ WANTHDRS = {'return-path',
             'references',
             'mime-*',
             'list-*',
-            'content-type',
+            'content-*',
             'errors-to',
             'x-mailing-list',
             }
