@@ -26,13 +26,11 @@ import email
 import email.message
 import email.utils
 import smtplib
-import time
 import subprocess
 import sqlite3
 import logging
 import hashlib
 import re
-import glob
 
 try:
     import xmlrpclib
@@ -41,13 +39,13 @@ except ImportError:
     import xmlrpc.client as xmlrpclib
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
-from string import Template
 
 DB_VERSION = 1
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 
 _state_cache = None
+_project_cache = None
 
 logger = logging.getLogger('gitpwcron')
 
@@ -94,27 +92,19 @@ class Transport(xmlrpclib.SafeTransport):
                                                     request_body, debug)
 
 
-# Lifted from pwclient with minor changes
-def get_patchwork_patch_id_from_hash(rpc, project, hash):
-    logger.debug('Looking up %s/%s', project, hash)
+def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
+    logger.debug('Looking up %s', pwhash)
     try:
-        patch = rpc.patch_get_by_project_hash(project, hash)
+        patches = rpc.patch_list({'project_id': project_id, 'hash': pwhash, 'archived': False})
     except xmlrpclib.Fault as ex:
         logger.debug('Got a Fault: %s', ex.faultString)
         return None
 
-    if patch == {}:
-        logger.debug('No match for %s/%s', project, hash)
+    if not patches:
+        logger.debug('No match for hash=%s', pwhash)
         return None
 
-    patch_id = patch['id']
-    # be super paranoid
-    try:
-        patch_id = int(patch_id)
-    except ValueError:
-        logger.debug('Invalid patch ID obtained from server')
-        return None
-    return patch_id
+    return patches
 
 
 # Lifted from patchwork with minor changes
@@ -125,7 +115,8 @@ def state_id_by_name(rpc, name):
     global _state_cache
 
     if _state_cache is None:
-        _state_cache = rpc.state_list(name, 0)
+        _state_cache = rpc.state_list('', 0)
+        logger.debug('_state_cache=%s', _state_cache)
 
     for state in _state_cache:
         if state['name'].lower().startswith(name.lower()):
@@ -134,15 +125,29 @@ def state_id_by_name(rpc, name):
     return 0
 
 
+def project_id_by_name(rpc, name):
+    if not name:
+        return 0
+
+    global _project_cache
+
+    if _project_cache is None:
+        _project_cache = rpc.project_list('', 0)
+        logger.debug('_project_cache=%s', _project_cache)
+
+    for project in _project_cache:
+        if project['linkname'].lower().startswith(name.lower()):
+            logger.debug('project lookup: linkname=%s, id=%d', name, project['id'])
+            return project['id']
+
+    return 0
+
+
 # Lifted from pwclient with changes
-def patchwork_update_patch(rpc, patch_id, state=None, archived=None, commit=None, dryrun=False):
+def patchwork_update_patch(rpc, patch, state=None, archived=None, commit=None, dryrun=False):
     ret = dict()
 
-    patch = rpc.patch_get(patch_id)
-    if not patch:
-        logger.info('  Could not get patch data')
-        return None
-
+    ret['patch_id'] = patch['id']
     ret['msgid'] = patch['msgid']
     ret['project'] = patch['project'].data
     ret['submitter'] = patch['submitter'].data
@@ -150,7 +155,6 @@ def patchwork_update_patch(rpc, patch_id, state=None, archived=None, commit=None
     ret['name'] = patch['name']
     ret['state'] = state
     ret['commit'] = commit
-    ret['patch_id'] = patch_id
 
     params = dict()
     if state:
@@ -174,7 +178,7 @@ def patchwork_update_patch(rpc, patch_id, state=None, archived=None, commit=None
     success = False
     if not dryrun:
         try:
-            success = rpc.patch_set(patch_id, params)
+            success = rpc.patch_set(patch['id'], params)
         except xmlrpclib.Fault as ex:
             logger.info('Error updating patch: %s', ex.faultString)
     else:
@@ -567,7 +571,13 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
     config = get_config_from_repo(repo, 'patchwork\..*', cmdconfig)
 
+    global _state_cache
+    global _project_cache
+
     for server, settings in config.items():
+        # state is server-specific, so blank out _state_cache
+        _state_cache = None
+        _project_cache = None
         logger.debug('Working on server %s', server)
         logger.debug('Settings follow')
         logger.debug(settings)
@@ -593,7 +603,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
         logger.debug('statemap: %s', statemap)
 
-        rpwhashes = {}
+        rpwhashes = dict()
         for refname, revlines in newrevs.items():
             if refname not in statemap:
                 # We don't care about this ref
@@ -611,6 +621,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
             count = 0
             project = project.strip()
             logger.info('Processing "%s/%s"', server, project)
+            project_id = project_id_by_name(rpc, project)
             for refname, hashpairs in rpwhashes.items():
                 logger.info('Analyzing %d revisions', len(hashpairs))
                 summary = list()
@@ -618,21 +629,22 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                 archive = False
                 if 'archive' in statemap[refname]:
                     archive = True
-                for rev, logline, hash in hashpairs:
+                for rev, logline, pwhash in hashpairs:
                     # Do we have a matching hash on the server?
                     logger.debug('Querying %s (%s)', rev, logline)
-                    patch_id = get_patchwork_patch_id_from_hash(rpc, project, hash)
-                    if patch_id is None:
+                    patches = get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash)
+                    if not patches:
                         continue
 
-                    logger.info('  %s: updating "%s" to "%s"', project, logline, state)
-                    logger.debug('%s/patch/%d', server, patch_id)
-                    pdata = patchwork_update_patch(rpc, patch_id, state=state,
-                                                     archived=archive, commit=rev, dryrun=dryrun)
-                    if pdata is not None:
-                        summary.append(pdata)
-                        logger.debug('Successfully updated patch_id=%s', patch_id)
-                        count += 1
+                    for patch in patches:
+                        logger.info('  %s: updating "%s" to "%s"', project, logline, state)
+                        logger.debug('%s/patch/%d', server, patch['id'])
+                        pdata = patchwork_update_patch(rpc, patch, state=state,
+                                                       archived=archive, commit=rev, dryrun=dryrun)
+                        if pdata is not None:
+                            summary.append(pdata)
+                            logger.debug('Successfully updated patch_id=%s', patch['id'])
+                            count += 1
 
                 if len(summary) and 'send_summary' in statemap[refname]:
                     send_summary(summary, server, refname, settings, nomail)
@@ -656,7 +668,7 @@ if __name__ == '__main__':
     parser.add_argument('-r', '--repository', dest='repo', required=True,
                         help='Check the repository and auto-accept any applied patches.')
     parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
-                        help='Use these config values instead of looking in the repo (used with -m)')
+                        help='Use these config values instead of those in the repo config')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
     parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
@@ -691,4 +703,3 @@ if __name__ == '__main__':
     logger.addHandler(ch)
 
     pwrun(cmdargs.repo, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
-
