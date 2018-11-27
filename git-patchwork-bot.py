@@ -685,10 +685,9 @@ def housekeeping(server, settings, nomail, dryrun):
                     patch_detail = get_rest_patch_detail(patches_url, patch_id, auth, headers)
                     state = patch_detail.get('state')
                     if state != 'superseded':
-                        report += 'Superseded with v%d: [v%d] %s (%s)\n' % (
-                            max_version, i, name, datetime.datetime.strftime(items[i]['date'], '%Y-%m-%d'))
                         logger.info('Marking series as superseded: [v%s] %s', i, name)
                         # Yes, we need to supersede these patches
+                        sreport = ''
                         for patch_id in items[i]['patches']:
                             logger.info('  Superseding patch: %d', patch_id)
                             patch_detail = get_rest_patch_detail(patches_url, patch_id, auth, headers)
@@ -697,11 +696,16 @@ def housekeeping(server, settings, nomail, dryrun):
                             if current_state == 'superseded':
                                 logger.info('  Patch already set to superseded, skipping')
                                 continue
-                            report += '  %s\n' % patch_title
+                            sreport += '  %s\n' % patch_title
                             if not dryrun:
                                 set_rest_patch_state(patches_url, patch_id, 'superseded', auth, headers)
                             else:
                                 logger.info('  Dryrun: Not actually setting state')
+
+                        if sreport:
+                            report += 'Superseded with v%d: [v%d] %s (%s)\n' % (
+                                max_version, i, name, datetime.datetime.strftime(items[i]['date'], '%Y-%m-%d'))
+                            report += sreport
 
                     if report:
                         report += '\n'
