@@ -31,6 +31,8 @@ import sqlite3
 import logging
 import hashlib
 import re
+import requests
+import datetime
 
 try:
     import xmlrpclib
@@ -41,6 +43,7 @@ except ImportError:
 from fcntl import lockf, LOCK_EX, LOCK_NB
 
 DB_VERSION = 1
+REST_API_VERSION = '1.1'
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 
@@ -148,11 +151,11 @@ def patchwork_update_patch(rpc, patch, state=None, archived=None, commit=None, d
     ret = dict()
 
     ret['patch_id'] = patch['id']
-    ret['msgid'] = patch['msgid']
-    ret['project'] = patch['project'].data
-    ret['submitter'] = patch['submitter'].data
+    ret['msgid'] = patch['msgid'].decode('utf-8', errors='ignore')
+    ret['project'] = patch['project'].data.decode('utf-8', errors='ignore')
+    ret['submitter'] = patch['submitter'].data.decode('utf-8', errors='ignore')
     ret['date'] = patch['date'].data
-    ret['name'] = patch['name']
+    ret['name'] = patch['name'].decode('utf-8', errors='ignore')
     ret['state'] = state
     ret['commit'] = commit
 
@@ -533,6 +536,266 @@ def notify_submitters(summarydata, server, refname, config, nomail):
             logger.info('------------------------------')
 
 
+def get_rest_patch_detail(patches_url, patch_id, auth, headers):
+    try:
+        logger.debug('Grabbing patch %s', patch_id)
+        url = '/'.join((patches_url, str(patch_id), ''))
+        logger.debug('url=%s', url)
+        rsp = requests.get(url, auth=auth, headers=headers,
+                           params=list(), stream=False)
+        rsp.raise_for_status()
+    except requests.exceptions.RequestException as ex:
+        logger.info('REST error: %s', ex)
+        return None
+
+    return rsp.json()
+
+
+def set_rest_patch_state(patches_url, patch_id, state, auth, headers, archive=False):
+    try:
+        logger.debug('Setting state for patch %s to %s', patch_id, state)
+        url = '/'.join((patches_url, str(patch_id), ''))
+        logger.debug('url=%s', url)
+        data = [
+            ('state', state),
+        ]
+        if archive:
+            data.append(('archived', True))
+
+        rsp = requests.patch(url, auth=auth, headers=headers,
+                             data=data, stream=False)
+        rsp.raise_for_status()
+    except requests.exceptions.RequestException as ex:
+        logger.info('REST error: %s', ex)
+        return None
+
+    return rsp.json()
+
+
+def housekeeping(server, settings, nomail, dryrun):
+    logger.info('Running housekeeping in %s', server)
+    # We use the REST API for this, because we need series support
+    url = '/'.join((server.rstrip('/'), 'api', REST_API_VERSION))
+    headers = {
+        'User-Agent': 'git-patchwork-bot',
+    }
+    auth = requests.auth.HTTPBasicAuth(settings['user'], settings['pass'])
+
+    series_url = '/'.join((url, 'series'))
+    patches_url = '/'.join((url, 'patches'))
+
+    hconfig = dict()
+    cutoffdays = 90
+
+    for chunk in settings['housekeeping'].split(','):
+        try:
+            key, val = chunk.split('=')
+        except ValueError:
+            logger.debug('Invalid housekeeping setting: %s', chunk)
+            continue
+        hconfig[key] = val
+
+    report = ''
+    for project in settings['projects'].split(','):
+        project = project.strip()
+        if 'autosupersede' in hconfig:
+            logger.info('Getting series from %s/%s', server, project)
+            try:
+                cutoffdays = int(hconfig['autosupersede'])
+            except ValueError:
+                pass
+
+            cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
+            logger.debug('cutoffdate=%s', cutoffdate)
+            series = dict()
+            page = 0
+            pagedata = list()
+            while True:
+                if not pagedata:
+                    page += 1
+                    try:
+                        logger.info('  grabbing page %d', page)
+                        params = [
+                            ('project', project),
+                            ('order', '-date'),
+                            ('page', page),
+                        ]
+                        rsp = requests.get(series_url,  auth=auth, headers=headers,
+                                           params=params, stream=False)
+                        rsp.raise_for_status()
+                        pagedata = rsp.json()
+                    except requests.exceptions.RequestException as ex:
+                        logger.info('REST error: %s', ex)
+                        break
+
+                if not pagedata:
+                    # Got them all?
+                    logger.debug('Finished processing all series')
+                    break
+
+                entry = pagedata.pop()
+                # Did we go too far back?
+                series_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
+                if series_date < cutoffdate:
+                    logger.debug('Went too far back, stopping at %s', series_date)
+                    break
+
+                id = entry.get('id')
+                name = entry.get('name')
+                if name is None:
+                    # Ignoring this one, because we must have a name
+                    continue
+                ver = entry.get('version')
+                subm_id = entry.get('submitter').get('id')
+                patches = list()
+                for patch in entry.get('patches'):
+                    patches.append(patch.get('id'))
+
+                if not patches:
+                    # Not sure how we can have a series without patches, but ok
+                    continue
+
+                received_all = entry.get('received_all')
+                if (subm_id, name) not in series:
+                    series[(subm_id, name)] = dict()
+                series[(subm_id, name)][ver] = {
+                    'id': id,
+                    'patches': patches,
+                    'complete': received_all,
+                    'date': series_date,
+                }
+                logger.debug('Processed id=%s (%s)', id, name)
+
+            for key, items in series.items():
+                if len(items) < 2:
+                    # Not a redundant series
+                    continue
+                subm_id, name = key
+                max_version = max(items.keys())
+                logger.debug('%s: max version: %d', name, max_version)
+                if not items[max_version]['complete']:
+                    logger.debug('Skipping this series, because it is not complete')
+                    continue
+
+                for i in range(1, max_version):
+                    if i not in items:
+                        continue
+                    logger.info('Checking [v%d] %s', i, name)
+                    patch_id = items[i]['patches'][0]
+                    patch_detail = get_rest_patch_detail(patches_url, patch_id, auth, headers)
+                    state = patch_detail.get('state')
+                    if state != 'superseded':
+                        report += 'Superseded with v%d: [v%d] %s (%s)\n' % (
+                            max_version, i, name, datetime.datetime.strftime(items[i]['date'], '%Y-%m-%d'))
+                        logger.info('Marking series as superseded: [v%s] %s', i, name)
+                        # Yes, we need to supersede these patches
+                        for patch_id in items[i]['patches']:
+                            logger.info('  Superseding patch: %d', patch_id)
+                            patch_detail = get_rest_patch_detail(patches_url, patch_id, auth, headers)
+                            patch_title = patch_detail.get('name')
+                            current_state = patch_detail.get('state')
+                            if current_state == 'superseded':
+                                logger.info('  Patch already set to superseded, skipping')
+                                continue
+                            report += '  %s\n' % patch_title
+                            if not dryrun:
+                                set_rest_patch_state(patches_url, patch_id, 'superseded', auth, headers)
+                            else:
+                                logger.info('  Dryrun: Not actually setting state')
+
+                    if report:
+                        report += '\n'
+
+        if 'autoarchive' in hconfig:
+            logger.info('Auto-archiving old patches in %s/%s', server, project)
+            try:
+                cutoffdays = int(hconfig['autoarchive'])
+            except ValueError:
+                pass
+
+            cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
+            logger.debug('cutoffdate=%s', cutoffdate)
+
+            page = 0
+            pagedata = list()
+            while True:
+                if not pagedata:
+                    if dryrun:
+                        # We don't need pagination if we're not in dryrun, because
+                        # once we archive the patches, they don't show up in this
+                        # query any more.
+                        page += 1
+
+                    try:
+                        params = [
+                            ('project', project),
+                            ('archived', 'false'),
+                            ('order', 'date'),
+                            ('page', page),
+                        ]
+                        rsp = requests.get(patches_url,  auth=auth, headers=headers,
+                                           params=params, stream=False)
+                        rsp.raise_for_status()
+                        pagedata = rsp.json()
+                    except requests.exceptions.RequestException as ex:
+                        logger.info('REST error: %s', ex)
+                        break
+
+                if not pagedata:
+                    logger.debug('Finished processing all patches')
+                    break
+
+                entry = pagedata.pop()
+                # Did we go too far forward?
+                patch_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
+                if patch_date >= cutoffdate:
+                    logger.debug('Reached the cutoff date, stopping at %s', patch_date)
+                    break
+
+                patch_id = entry.get('id')
+                patch_state = entry.get('state')
+                patch_title = entry.get('name')
+                logger.info('Archiving: %s', patch_title)
+                if not dryrun:
+                    set_rest_patch_state(patches_url, patch_id, patch_state, auth, headers, archive=True)
+                else:
+                    logger.info('  Dryrun: Not actually archiving')
+
+        if not report:
+            continue
+
+        msg = email.message.Message()
+        msg['Subject'] = 'Patchwork housekeeping for: %s' % project
+        msg['From'] = settings['from']
+        msg['Message-Id'] = email.utils.make_msgid('git-patchwork-housekeeping')
+        msg['Date'] = email.utils.formatdate(localtime=True)
+
+        targets = settings['summaryto'].split(',')
+        msg['To'] = ', '.join(targets)
+        if 'alwayscc' in settings:
+            msg['Cc'] = settings['alwayscc']
+            targets.append(settings['alwayscc'])
+        if 'alwaysbcc' in settings:
+            targets.append(settings['alwaysbcc'])
+
+        report += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
+
+        msg.set_payload(report)
+
+        logger.debug('Message follows')
+        logger.debug(msg.as_string())
+        if not nomail:
+            logger.info('Sending housekeeping summary to: %s', msg['To'])
+            smtp = smtplib.SMTP(settings['mailhost'])
+            smtp.sendmail(msg['From'], targets, msg.as_string())
+            smtp.close()
+        else:
+            logger.info('Would have sent the following:')
+            logger.info('------------------------------')
+            logger.info(msg.as_string())
+            logger.info('------------------------------')
+
+
 def pwrun(repo, cmdconfig, nomail, dryrun):
     if dryrun:
         nomail = True
@@ -565,10 +828,6 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
     db_heads = db_get_repo_heads(c)
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads)
-    if not newrevs:
-        logger.info('No new revs since last run.')
-        return
-
     config = get_config_from_repo(repo, 'patchwork\..*', cmdconfig)
 
     global _state_cache
@@ -581,6 +840,10 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         logger.debug('Working on server %s', server)
         logger.debug('Settings follow')
         logger.debug(settings)
+        if not newrevs and 'housekeeping' in settings:
+            housekeeping(server, settings, nomail, dryrun)
+            return
+
         url = '%s/xmlrpc/' % server
 
         transport = Transport(url)
