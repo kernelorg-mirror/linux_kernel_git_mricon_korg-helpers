@@ -728,6 +728,7 @@ def housekeeping(server, settings, nomail, dryrun):
                     params = [
                         ('project', project),
                         ('archived', 'false'),
+                        ('state', 'new'),
                         ('order', 'date'),
                     ]
 
