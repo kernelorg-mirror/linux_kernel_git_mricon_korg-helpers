@@ -815,7 +815,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
     git_heads = git_get_repo_heads(repo)
     if not git_heads:
-        logger.critical('Could not get the latest ref in %s', repo)
+        logger.info('Could not get the latest ref in %s', repo)
         sys.exit(1)
 
     try:
