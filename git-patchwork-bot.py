@@ -677,6 +677,7 @@ def housekeeping(server, settings, nomail, dryrun):
                     logger.debug('Skipping this series, because it is not complete')
                     continue
 
+                sreport = list()
                 for i in range(1, max_version):
                     if i not in items:
                         continue
@@ -687,7 +688,6 @@ def housekeeping(server, settings, nomail, dryrun):
                     if state != 'superseded':
                         logger.info('Marking series as superseded: [v%s] %s', i, name)
                         # Yes, we need to supersede these patches
-                        sreport = ''
                         for patch_id in items[i]['patches']:
                             logger.info('  Superseding patch: %d', patch_id)
                             patch_detail = get_rest_patch_detail(patches_url, patch_id, auth, headers)
@@ -696,19 +696,17 @@ def housekeeping(server, settings, nomail, dryrun):
                             if current_state == 'superseded':
                                 logger.info('  Patch already set to superseded, skipping')
                                 continue
-                            sreport += '  %s\n' % patch_title
+                            sreport.append('    %s' % patch_title)
                             if not dryrun:
                                 set_rest_patch_state(patches_url, patch_id, 'superseded', auth, headers)
                             else:
                                 logger.info('  Dryrun: Not actually setting state')
 
-                        if sreport:
-                            report += 'Superseded with v%d: [v%d] %s (%s)\n' % (
-                                max_version, i, name, datetime.datetime.strftime(items[i]['date'], '%Y-%m-%d'))
-                            report += sreport
-
-                    if report:
-                        report += '\n'
+                if sreport:
+                    report += 'Latest series: [v%d] %s\n' % (max_version, name)
+                    report += '  Marked the following patches as superseded:\n'
+                    report += '\n'.join(sreport)
+                    report += '\n\n'
 
         if 'autoarchive' in hconfig:
             logger.info('Auto-archiving old patches in %s/%s', server, project)
