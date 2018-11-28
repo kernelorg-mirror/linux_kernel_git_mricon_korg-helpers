@@ -556,9 +556,9 @@ def set_rest_patch_state(patches_url, patch_id, state, auth, headers, archive=Fa
         logger.debug('Setting state for patch %s to %s', patch_id, state)
         url = '/'.join((patches_url, str(patch_id), ''))
         logger.debug('url=%s', url)
-        data = [
-            ('state', state),
-        ]
+        data = list()
+        if state is not None:
+            data.append(('state', state))
         if archive:
             data.append(('archived', True))
 
@@ -721,6 +721,7 @@ def housekeeping(server, settings, nomail, dryrun):
             logger.debug('cutoffdate=%s', cutoffdate)
 
             page = 0
+            seen = set()
             pagedata = list()
             while True:
                 if not pagedata:
@@ -758,11 +759,19 @@ def housekeeping(server, settings, nomail, dryrun):
                     break
 
                 patch_id = entry.get('id')
+                if patch_id in seen:
+                    # If the archived setting isn't actually sticking on the server for
+                    # some reason, then we are in for an infinite loop. Recognize this
+                    # and quit when that happens.
+                    logger.info('Setting to archived is not working, exiting loop.')
+                    break
+
+                seen.update([patch_id])
                 patch_state = entry.get('state')
                 patch_title = entry.get('name')
                 logger.info('Archiving: %s', patch_title)
                 if not dryrun:
-                    set_rest_patch_state(patches_url, patch_id, patch_state, auth, headers, archive=True)
+                    set_rest_patch_state(patches_url, patch_id, None, auth, headers, archive=True)
                 else:
                     logger.info('  Dryrun: Not actually archiving')
 
