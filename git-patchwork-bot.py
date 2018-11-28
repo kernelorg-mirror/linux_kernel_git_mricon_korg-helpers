@@ -724,19 +724,20 @@ def housekeeping(server, settings, nomail, dryrun):
             pagedata = list()
             while True:
                 if not pagedata:
+                    params = [
+                        ('project', project),
+                        ('archived', 'false'),
+                        ('order', 'date'),
+                    ]
+
                     if dryrun:
                         # We don't need pagination if we're not in dryrun, because
                         # once we archive the patches, they don't show up in this
                         # query any more.
                         page += 1
+                        params.append(('page', page))
 
                     try:
-                        params = [
-                            ('project', project),
-                            ('archived', 'false'),
-                            ('order', 'date'),
-                            ('page', page),
-                        ]
                         rsp = requests.get(patches_url,  auth=auth, headers=headers,
                                            params=params, stream=False)
                         rsp.raise_for_status()
@@ -810,8 +811,8 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         sys.exit(1)
 
     try:
-        with open(os.path.join(repo, '.pwrun.lock'), 'w') as lockfh:
-            lockf(lockfh, LOCK_EX | LOCK_NB)
+        lockfh = open(os.path.join(repo, '.pwrun.lock'), 'w')
+        lockf(lockfh, LOCK_EX | LOCK_NB)
     except IOError:
         logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
         return
