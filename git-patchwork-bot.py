@@ -595,8 +595,8 @@ def housekeeping(server, settings, nomail, dryrun):
             continue
         hconfig[key] = val
 
-    report = ''
     for project in settings['projects'].split(','):
+        report = ''
         project = project.strip()
         if 'autosupersede' in hconfig:
             logger.info('Getting series from %s/%s', server, project)
