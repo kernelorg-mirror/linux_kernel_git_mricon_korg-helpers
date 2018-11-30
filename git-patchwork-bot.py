@@ -22,10 +22,6 @@ __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 import os
 import sys
 import argparse
-import email
-import email.message
-import email.utils
-import email.mime.text
 import smtplib
 import subprocess
 import sqlite3
@@ -34,6 +30,14 @@ import hashlib
 import re
 import requests
 import datetime
+
+from email.mime.text import MIMEText
+from email.header import Header
+from email.utils import make_msgid, formatdate, getaddresses
+
+# Send all email 8-bit, this is not 1999
+from email import charset
+charset.add_charset('utf-8', charset.SHORTEST, '8bit')
 
 try:
     import xmlrpclib
@@ -399,11 +403,10 @@ def summarize_patches(summarydata, server, config, submitter=None):
     references = list()
     body = ''
     count = 0
-    for pdata in summarydata:
+    for pdata in sorted(summarydata, key=lambda i: (i['submitter'], i['patch_id'])):
         if submitter is not None and submitter != pdata['submitter']:
             # skip this submitter
             continue
-
         count += 1
 
         references.append(pdata['msgid'])
@@ -438,33 +441,35 @@ def send_summary(summarydata, server, refname, config, nomail):
 
     body += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
 
-    msg = email.mime.text.MIMEText(body, _charset='utf-8')
+    msg = MIMEText(body.encode('utf-8'), _charset='utf-8')
+    msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-    msg['Subject'] = 'Patchwork summary for: %s' % project
-    msg['From'] = config['from']
-    msg['Message-Id'] = email.utils.make_msgid('git-patchwork-summary')
-    msg['Date'] = email.utils.formatdate(localtime=True)
-    msg['References'] = ', '.join(references)
+    msg['Subject'] = Header('Patchwork summary for: %s' % project, 'utf-8')
+    msg['From'] = Header(config['from'], 'utf-8')
+    msg['Message-Id'] = make_msgid('git-patchwork-summary')
+    msg['Date'] = formatdate(localtime=True)
+    msg['References'] = Header(', '.join(references), 'utf-8')
 
     targets = config['summaryto'].split(',')
-    msg['To'] = ', '.join(targets)
+    msg['To'] = Header(', '.join(targets), 'utf-8')
     if 'alwayscc' in config:
         msg['Cc'] = config['alwayscc']
         targets.append(config['alwayscc'])
     if 'alwaysbcc' in config:
         targets.append(config['alwaysbcc'])
 
-    logger.debug('Message follows')
-    logger.debug(msg.as_string())
     if not nomail:
+        logger.debug('Message follows')
+        logger.debug(msg.as_string().decode('utf-8'))
         logger.info('Sending summary to: %s', msg['To'])
+
         smtp = smtplib.SMTP(config['mailhost'])
         smtp.sendmail(msg['From'], targets, msg.as_string())
         smtp.close()
     else:
         logger.info('Would have sent the following:')
         logger.info('------------------------------')
-        logger.info(msg.as_string())
+        logger.info(msg.as_string().decode('utf-8'))
         logger.info('------------------------------')
 
     return msg['Message-Id']
@@ -483,7 +488,7 @@ def notify_submitters(summarydata, server, refname, config, nomail):
         logger.debug('Preparing a notification for %s', submitter)
         body = (
                    'Hello:\n\n'
-                   'The following patches you sent were recently pushed to\n'
+                   'The following patches you had submitted were recently pushed to\n'
                    '%s (%s):\n'
                ) % (config['treename'], refname)
 
@@ -496,22 +501,23 @@ def notify_submitters(summarydata, server, refname, config, nomail):
                  'https://korg.wiki.kernel.org/userdoc/pwbot\n'
                  )
 
-        msg = email.mime.text.MIMEText(body, _charset='utf-8')
+        msg = MIMEText(body, _charset='utf-8')
+        msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-        msg['Subject'] = 'Your patches were applied to %s' % config['treename']
-        msg['From'] = config['from']
-        msg['Message-Id'] = email.utils.make_msgid('git-patchwork-notify')
-        msg['Date'] = email.utils.formatdate(localtime=True)
-        msg['References'] = ', '.join(references)
+        msg['Subject'] = Header('Your patches were applied to %s' % config['treename'], 'utf-8')
+        msg['From'] = Header(config['from'], 'utf-8')
+        msg['Message-Id'] = make_msgid('git-patchwork-notify')
+        msg['Date'] = formatdate(localtime=True)
+        msg['References'] = Header(', '.join(references), 'utf-8')
 
         if 'onlyto' in config:
             targets = config['onlyto']
             msg['To'] = config['onlyto']
         else:
-            dest = email.utils.getaddresses(submitter)
+            dest = getaddresses(submitter)
             targets = [chunk[1] for chunk in dest]
 
-            msg['To'] = submitter
+            msg['To'] = Header(submitter, 'utf-8')
 
             if 'alwayscc' in config:
                 msg['Cc'] = config['alwayscc']
@@ -519,17 +525,18 @@ def notify_submitters(summarydata, server, refname, config, nomail):
             if 'alwaysbcc' in config:
                 targets.append(config['alwaysbcc'])
 
-        logger.debug('Message follows')
-        logger.debug(msg.as_string())
         if not nomail:
+            logger.debug('Message follows')
+            logger.debug(msg.as_string().decode('utf-8'))
             logger.info('Notifying %s', submitter)
+
             smtp = smtplib.SMTP(config['mailhost'])
             smtp.sendmail(msg['From'], targets, msg.as_string())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
             logger.info('------------------------------')
-            logger.info(msg.as_string())
+            logger.info(msg.as_string().decode('utf-8'))
             logger.info('------------------------------')
 
 
@@ -774,11 +781,15 @@ def housekeeping(server, settings, nomail, dryrun):
         if not report:
             continue
 
-        msg = email.message.Message()
+        report += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
+
+        msg = MIMEText(report, _charset='utf-8')
+        msg.replace_header('Content-Transfer-Encoding', '8bit')
+
         msg['Subject'] = 'Patchwork housekeeping for: %s' % project
         msg['From'] = settings['from']
-        msg['Message-Id'] = email.utils.make_msgid('git-patchwork-housekeeping')
-        msg['Date'] = email.utils.formatdate(localtime=True)
+        msg['Message-Id'] = make_msgid('git-patchwork-housekeeping')
+        msg['Date'] = formatdate(localtime=True)
 
         targets = settings['summaryto'].split(',')
         msg['To'] = ', '.join(targets)
@@ -788,21 +799,18 @@ def housekeeping(server, settings, nomail, dryrun):
         if 'alwaysbcc' in settings:
             targets.append(settings['alwaysbcc'])
 
-        report += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
-
-        msg.set_payload(report)
-
-        logger.debug('Message follows')
-        logger.debug(msg.as_string())
         if not nomail:
+            logger.debug('Message follows')
+            logger.debug(msg.as_string().decode('utf-8'))
             logger.info('Sending housekeeping summary to: %s', msg['To'])
+
             smtp = smtplib.SMTP(settings['mailhost'])
             smtp.sendmail(msg['From'], targets, msg.as_string())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
             logger.info('------------------------------')
-            logger.info(msg.as_string())
+            logger.info(msg.as_string().decode('utf-8'))
             logger.info('------------------------------')
 
 
