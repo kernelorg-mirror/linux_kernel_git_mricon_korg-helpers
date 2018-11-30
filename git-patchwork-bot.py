@@ -403,7 +403,7 @@ def summarize_patches(summarydata, server, config, submitter=None):
     references = list()
     body = ''
     count = 0
-    for pdata in sorted(summarydata, key=lambda i: (i['submitter'], i['patch_id'])):
+    for pdata in sorted(summarydata, key=lambda i: (i['submitter'], i['name'])):
         if submitter is not None and submitter != pdata['submitter']:
             # skip this submitter
             continue
