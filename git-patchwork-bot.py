@@ -25,6 +25,7 @@ import argparse
 import email
 import email.message
 import email.utils
+import email.mime.text
 import smtplib
 import subprocess
 import sqlite3
@@ -425,20 +426,6 @@ def send_summary(summarydata, server, refname, config, nomail):
     logger.info('Preparing summary')
     # we send summaries by project, so the project name is going to be all the same
     project = summarydata[0]['project']
-    msg = email.message.Message()
-    msg['Subject'] = 'Patchwork summary for: %s' % project
-    msg['From'] = config['from']
-    msg['Message-Id'] = email.utils.make_msgid('git-patchwork-summary')
-    msg['Date'] = email.utils.formatdate(localtime=True)
-
-    targets = config['summaryto'].split(',')
-    msg['To'] = ', '.join(targets)
-    if 'alwayscc' in config:
-        msg['Cc'] = config['alwayscc']
-        targets.append(config['alwayscc'])
-    if 'alwaysbcc' in config:
-        targets.append(config['alwaysbcc'])
-
     body = (
                'Hello:\n\n'
                'The following patches were automatically processed, because they were applied to\n'
@@ -447,13 +434,25 @@ def send_summary(summarydata, server, refname, config, nomail):
 
     pbody, references = summarize_patches(summarydata, server, config)
 
-    msg['References'] = ', '.join(references)
-
     body += pbody
 
     body += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
 
-    msg.set_payload(body)
+    msg = email.mime.text.MIMEText(body, _charset='utf-8')
+
+    msg['Subject'] = 'Patchwork summary for: %s' % project
+    msg['From'] = config['from']
+    msg['Message-Id'] = email.utils.make_msgid('git-patchwork-summary')
+    msg['Date'] = email.utils.formatdate(localtime=True)
+    msg['References'] = ', '.join(references)
+
+    targets = config['summaryto'].split(',')
+    msg['To'] = ', '.join(targets)
+    if 'alwayscc' in config:
+        msg['Cc'] = config['alwayscc']
+        targets.append(config['alwayscc'])
+    if 'alwaysbcc' in config:
+        targets.append(config['alwaysbcc'])
 
     logger.debug('Message follows')
     logger.debug(msg.as_string())
@@ -482,11 +481,28 @@ def notify_submitters(summarydata, server, refname, config, nomail):
     logger.debug('submitters=%s', submitters)
     for submitter in submitters:
         logger.debug('Preparing a notification for %s', submitter)
-        msg = email.message.Message()
+        body = (
+                   'Hello:\n\n'
+                   'The following patches you sent were recently pushed to\n'
+                   '%s (%s):\n'
+               ) % (config['treename'], refname)
+
+        pbody, references = summarize_patches(summarydata, server, config, submitter=submitter)
+
+        body += pbody
+
+        body += ('\nYou are awesome, thank you!\n\n'
+                 '-- \nDeet-doot-dot, I am a bot.\n'
+                 'https://korg.wiki.kernel.org/userdoc/pwbot\n'
+                 )
+
+        msg = email.mime.text.MIMEText(body, _charset='utf-8')
+
         msg['Subject'] = 'Your patches were applied to %s' % config['treename']
         msg['From'] = config['from']
         msg['Message-Id'] = email.utils.make_msgid('git-patchwork-notify')
         msg['Date'] = email.utils.formatdate(localtime=True)
+        msg['References'] = ', '.join(references)
 
         if 'onlyto' in config:
             targets = config['onlyto']
@@ -502,25 +518,6 @@ def notify_submitters(summarydata, server, refname, config, nomail):
                 targets.append(config['alwayscc'])
             if 'alwaysbcc' in config:
                 targets.append(config['alwaysbcc'])
-
-        body = (
-                   'Hello:\n\n'
-                   'The following patches you sent were recently pushed to\n'
-                   '%s (%s):\n'
-               ) % (config['treename'], refname)
-
-        pbody, references = summarize_patches(summarydata, server, config, submitter=submitter)
-
-        msg['References'] = ', '.join(references)
-
-        body += pbody
-
-        body += ('\nYou are awesome, thank you!\n\n'
-                 '-- \nDeet-doot-dot, I am a bot.\n'
-                 'https://korg.wiki.kernel.org/userdoc/pwbot\n'
-                 )
-
-        msg.set_payload(body)
 
         logger.debug('Message follows')
         logger.debug(msg.as_string())
