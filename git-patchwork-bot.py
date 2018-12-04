@@ -33,7 +33,7 @@ import datetime
 
 from email.mime.text import MIMEText
 from email.header import Header
-from email.utils import make_msgid, formatdate, getaddresses
+from email.utils import make_msgid, formatdate
 
 # Send all email 8-bit, this is not 1999
 from email import charset
@@ -55,6 +55,7 @@ FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 _project_cache = None
 
 logger = logging.getLogger('gitpwcron')
+
 
 # Lifted from patchwork pwclient
 class Transport(xmlrpclib.SafeTransport):

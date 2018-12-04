@@ -193,12 +193,11 @@ def get_remote_ref_from_body(body):
 
 
 def record_pr_data(msg_commit_id, msg, c):
-    pr_commit_id = None
-    body = msg.get_payload(decode=True)
+    body = get_plain_part(msg)
     if body is None:
         return False
 
-    body = body.decode('utf-8', errors='replace')
+    pr_commit_id = None
     for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
         matches = cid_re.search(body)
         if matches:
@@ -214,7 +213,6 @@ def record_pr_data(msg_commit_id, msg, c):
         return False
 
     logger.debug('pr_commit_id=%s', pr_commit_id)
-
     msg_id = msg['Message-Id']
     received = time.strftime('%Y-%m-%dT%H:%M:%S%z')
 
@@ -448,6 +446,21 @@ def get_all_prs(pirepo, cutoffdays=30):
     return rows
 
 
+def get_plain_part(msg):
+    # walk until we find the first text/plain part
+    body = None
+    for part in msg.walk():
+        if part.get_content_type().find('text/plain') < 0:
+            continue
+        body = part.get_payload(decode=True)
+        if body is None:
+            continue
+
+        body = body.decode('utf-8', errors='replace')
+
+    return body
+
+
 def get_all_new_prs(c, refname, prs, cutoffdays=30):
     sent_prs = get_all_thanked_prs(c, refname, cutoffdays)
     new_prs = list()
@@ -467,11 +480,9 @@ def to_or_cc_contains(tocc, addrs):
 
 def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, config, nomail):
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
-    origbody = orig.get_payload(decode=True)
+    origbody = get_plain_part(orig)
     if origbody is None:
         return None
-
-    origbody = origbody.decode('utf-8', errors='replace')
 
     if 'notifinbody' in config:
         # Don't send anything if we find a certain string in the body
@@ -741,11 +752,10 @@ def show_unapplied(repo, pitopdir, cmdconfig, use_json):
                 if not to_or_cc_contains(targets, settings['onlyifto']):
                     continue
 
-            origbody = orig.get_payload(decode=True)
+            origbody = get_plain_part(orig)
             if origbody is None:
                 continue
 
-            origbody = origbody.decode('utf-8', errors='replace')
             remoterepo, remoteref = get_remote_ref_from_body(origbody)
 
             values = {
