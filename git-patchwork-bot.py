@@ -187,7 +187,9 @@ class Restmaker:
 
     def update_patch(self, patch_id, state=None, archived=False, commit_ref=None):
         # Clear it out of the cache
-        del self._patches[patch_id]
+        if patch_id in self._patches:
+            del self._patches[patch_id]
+
         try:
             logger.debug('Updating patch %d:', patch_id)
             url = '/'.join((self.patches_url, str(patch_id), ''))
