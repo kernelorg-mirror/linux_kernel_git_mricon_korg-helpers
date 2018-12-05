@@ -30,10 +30,12 @@ import hashlib
 import re
 import requests
 import datetime
+import time
+import random
 
 from email.mime.text import MIMEText
 from email.header import Header
-from email.utils import make_msgid, formatdate
+from email.utils import formatdate, getaddresses
 
 # Send all email 8-bit, this is not 1999
 from email import charset
@@ -214,6 +216,19 @@ class Restmaker:
             return None
 
         return rsp.json()
+
+
+# Python-2.7 doesn't have a domain= keyword argument, so steal make_msgid from python-3.2+
+def make_msgid(idstring=None, domain='kernel.org'):
+    timeval = int(time.time()*100)
+    pid = os.getpid()
+    randint = random.getrandbits(64)
+    if idstring is None:
+        idstring = ''
+    else:
+        idstring = '.' + idstring
+
+    return '<%d.%d.%d%s@%s>' % (timeval, pid, randint, idstring, domain)
 
 
 def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
@@ -565,31 +580,46 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
 
+        ccs = [chunk[1] for chunk in getaddresses([headers.get('Cc')])]
         if 'onlyifcc' in config:
-            onlyifcc = config['onlyifcc']
-            cc = headers.get('Cc').lower()
-            if not cc.find(onlyifcc) >= 0:
-                logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), onlyifcc)
+            match = None
+            for chunk in config['onlyifcc'].split(','):
+                if chunk.strip() in ccs:
+                    match = chunk
+                    break
+            if match is None:
+                logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), config['onlyifcc'])
                 continue
 
         if 'neverifcc' in config:
-            neverifcc = config['neverifcc']
-            cc = headers.get('Cc').lower()
-            if cc.find(neverifcc) >= 0:
-                logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), neverifcc)
+            match = None
+            for chunk in config['neverifcc'].split(','):
+                if chunk.strip() in ccs:
+                    match = chunk
+                    break
+            if match is not None:
+                logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), config['neverifcc'])
                 continue
 
         logger.debug('Preparing a notification for %s', submitter.get('email'))
         body = (
-                   'On %s you wrote:\n'
-               ) % headers.get('Date')
+            'Hello:\n\n'
+            'This %s was applied to %s (%s).\n\n'
+        ) % ('series' if len(sdata.get('patches')) > 1 else 'patch', config['treename'], refname)
+        body += 'On %s you wrote:\n' % headers.get('Date')
 
         if content:
+            qcount = 0
             for cline in content.split('\n'):
+                # Quote the first paragraph only and then [snip] if we quoted more than 5 lines
+                if qcount > 5 and (not len(cline.strip()) or cline.strip().find('---') == 0):
+                    body += '> \n> [...]\n'
+                    break
                 body += '> %s\n' % cline.rstrip()
+                qcount += 1
             body += '\n'
 
-        body += '\nThese patches were applied to %s (%s):\n' % (config['treename'], refname)
+        body += '\nHere is a summary with links:\n'
 
         for patch in sdata.get('patches'):
             body += '  - %s\n' % patch.get('name')
