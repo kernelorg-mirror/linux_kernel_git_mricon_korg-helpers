@@ -580,8 +580,12 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
 
-        ccs = [chunk[1] for chunk in getaddresses([headers.get('Cc')])]
-        if 'onlyifcc' in config:
+        ccs = []
+        cchdr = headers.get('Cc')
+        if cchdr:
+            ccs = [chunk[1] for chunk in getaddresses([cchdr])]
+
+        if ccs and 'onlyifcc' in config:
             match = None
             for chunk in config['onlyifcc'].split(','):
                 if chunk.strip() in ccs:
@@ -591,7 +595,7 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), config['onlyifcc'])
                 continue
 
-        if 'neverifcc' in config:
+        if ccs and 'neverifcc' in config:
             match = None
             for chunk in config['neverifcc'].split(','):
                 if chunk.strip() in ccs:
