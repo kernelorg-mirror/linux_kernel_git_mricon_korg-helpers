@@ -582,10 +582,12 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
 
         ccs = []
         cchdr = headers.get('Cc')
+        if not cchdr:
+            cchdr = headers.get('cc')
         if cchdr:
             ccs = [chunk[1] for chunk in getaddresses([cchdr])]
 
-        if ccs and 'onlyifcc' in config:
+        if 'onlyifcc' in config:
             match = None
             for chunk in config['onlyifcc'].split(','):
                 if chunk.strip() in ccs:
