@@ -859,6 +859,14 @@ def housekeeping(rm, settings, nomail, dryrun):
         if not report:
             continue
 
+        if 'summaryto' not in settings:
+            logger.info('Report follows')
+            logger.info('------------------------------')
+            logger.info(report)
+            logger.info('------------------------------')
+            logger.debug('summaryto not set, not sending report')
+            continue
+
         report += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
 
         msg = MIMEText(report, _charset='utf-8')
