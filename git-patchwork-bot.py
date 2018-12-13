@@ -37,9 +37,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formatdate, getaddresses
 
-# Send all email 8-bit, this is not 1999
-from email import charset
-charset.add_charset('utf-8', charset.SHORTEST, '8bit')
+from fcntl import lockf, LOCK_EX, LOCK_NB
 
 try:
     import xmlrpclib
@@ -47,7 +45,9 @@ except ImportError:
     # Python 3 has merged/renamed things.
     import xmlrpc.client as xmlrpclib
 
-from fcntl import lockf, LOCK_EX, LOCK_NB
+# Send all email 8-bit, this is not 1999
+from email import charset
+charset.add_charset('utf-8', charset.SHORTEST, '8bit')
 
 DB_VERSION = 1
 REST_API_VERSION = '1.1'
@@ -580,32 +580,37 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
 
-        ccs = []
-        cchdr = headers.get('Cc')
-        if not cchdr:
-            cchdr = headers.get('cc')
-        if cchdr:
-            ccs = [chunk[1] for chunk in getaddresses([cchdr])]
+        xpb = headers.get('X-Patchwork-Bot')
+        logger.debug('X-Patchwork-Bot=%s', xpb)
+        # If X-Patchwork-Bot header is set to "notify" we always notify
+        if xpb != 'notify':
+            # Use cc-based notification logic
+            ccs = []
+            cchdr = headers.get('Cc')
+            if not cchdr:
+                cchdr = headers.get('cc')
+            if cchdr:
+                ccs = [chunk[1] for chunk in getaddresses([cchdr])]
 
-        if 'onlyifcc' in config:
-            match = None
-            for chunk in config['onlyifcc'].split(','):
-                if chunk.strip() in ccs:
-                    match = chunk
-                    break
-            if match is None:
-                logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), config['onlyifcc'])
-                continue
+            if 'onlyifcc' in config:
+                match = None
+                for chunk in config['onlyifcc'].split(','):
+                    if chunk.strip() in ccs:
+                        match = chunk
+                        break
+                if match is None:
+                    logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), config['onlyifcc'])
+                    continue
 
-        if ccs and 'neverifcc' in config:
-            match = None
-            for chunk in config['neverifcc'].split(','):
-                if chunk.strip() in ccs:
-                    match = chunk
-                    break
-            if match is not None:
-                logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), config['neverifcc'])
-                continue
+            if ccs and 'neverifcc' in config:
+                match = None
+                for chunk in config['neverifcc'].split(','):
+                    if chunk.strip() in ccs:
+                        match = chunk
+                        break
+                if match is not None:
+                    logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), config['neverifcc'])
+                    continue
 
         logger.debug('Preparing a notification for %s', submitter.get('email'))
         body = (
