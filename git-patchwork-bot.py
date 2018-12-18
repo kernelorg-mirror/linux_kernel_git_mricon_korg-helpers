@@ -590,7 +590,10 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
             if not cchdr:
                 cchdr = headers.get('cc')
             if cchdr:
-                ccs = [chunk[1] for chunk in getaddresses([cchdr])]
+                # Sometimes there are multiple cc headers returned
+                if not isinstance(cchdr, list):
+                    cchdr = [cchdr]
+                ccs = [chunk[1] for chunk in getaddresses(cchdr)]
 
             if 'onlyifcc' in config:
                 match = None
