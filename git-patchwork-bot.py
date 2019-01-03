@@ -728,7 +728,8 @@ def housekeeping(rm, settings, nomail, dryrun):
 
                 entry = pagedata.pop()
                 # Did we go too far back?
-                series_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
+                s_date = entry.get('date')
+                series_date = datetime.datetime.strptime(s_date, "%Y-%m-%dT%H:%M:%S")
                 if series_date < cutoffdate:
                     logger.debug('Went too far back, stopping at %s', series_date)
                     break
@@ -751,11 +752,13 @@ def housekeeping(rm, settings, nomail, dryrun):
                 received_all = entry.get('received_all')
                 if (subm_id, s_name) not in series:
                     series[(subm_id, s_name)] = dict()
-                series[(subm_id, s_name)][ver] = {
+
+                series[(subm_id, s_name)][series_date] = {
                     'id': id,
                     'patches': patches,
                     'complete': received_all,
-                    'date': series_date,
+                    'date': s_date,
+                    'rev': ver,
                 }
                 logger.debug('Processed id=%s (%s)', s_id, s_name)
 
@@ -763,41 +766,46 @@ def housekeeping(rm, settings, nomail, dryrun):
                 if len(items) < 2:
                     # Not a redundant series
                     continue
+
                 subm_id, name = key
-                max_version = max(items.keys())
-                logger.debug('%s: max version: %d', name, max_version)
-                if not items[max_version]['complete']:
+                versions = list(items.keys())
+                versions.sort()
+                latest_version = versions.pop()
+                logger.debug('%s: latest_version: %d', name, latest_version)
+                if not items[latest_version]['complete']:
                     logger.debug('Skipping this series, because it is not complete')
                     continue
 
                 sreport = list()
-                for i in range(1, max_version):
-                    if i not in items:
-                        continue
-                    logger.info('Checking [v%d] %s', i, name)
-                    patch_id = items[i]['patches'][0]
+                logger.info('Checking: [v%s] %s (%s)', items[latest_version]['rev'], name,
+                            items[latest_version]['date'])
+                for v in versions:
+                    rev = items[v]['rev']
+                    s_date = items[v]['date']
+                    patch_id = items[v]['patches'][0]
                     patch = rm.get_patch(patch_id)
                     state = patch.get('state')
                     if state != 'superseded':
-                        logger.info('Marking series as superseded: [v%s] %s', i, name)
+                        logger.info('  Marking series as superseded: [v%s] %s (%s)', rev, name, s_date)
+                        sreport.append('  Superseding: [v%s] %s (%s):' % (rev, name, s_date))
                         # Yes, we need to supersede these patches
-                        for patch_id in items[i]['patches']:
-                            logger.info('  Superseding patch: %d', patch_id)
+                        for patch_id in items[v]['patches']:
+                            logger.info('    Superseding patch: %d', patch_id)
                             patch = rm.get_patch(patch_id)
                             patch_title = patch.get('name')
                             current_state = patch.get('state')
                             if current_state == 'superseded':
-                                logger.info('  Patch already set to superseded, skipping')
+                                logger.info('    Patch already set to superseded, skipping')
                                 continue
                             sreport.append('    %s' % patch_title)
                             if not dryrun:
                                 rm.update_patch(patch_id, state='superseded')
                             else:
-                                logger.info('  Dryrun: Not actually setting state')
+                                logger.info('    Dryrun: Not actually setting state')
 
                 if sreport:
-                    report += 'Latest series: [v%d] %s\n' % (max_version, name)
-                    report += '  Marked the following patches as superseded:\n'
+                    report += 'Latest series: [v%s] %s (%s)\n' % (items[latest_version]['rev'], name,
+                                                                items[latest_version]['date'])
                     report += '\n'.join(sreport)
                     report += '\n\n'
 
