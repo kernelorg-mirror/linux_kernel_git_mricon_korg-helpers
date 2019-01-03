@@ -771,7 +771,7 @@ def housekeeping(rm, settings, nomail, dryrun):
                 versions = list(items.keys())
                 versions.sort()
                 latest_version = versions.pop()
-                logger.debug('%s: latest_version: %d', name, latest_version)
+                logger.debug('%s: latest_version: %s', name, items[latest_version]['date'])
                 if not items[latest_version]['complete']:
                     logger.debug('Skipping this series, because it is not complete')
                     continue
