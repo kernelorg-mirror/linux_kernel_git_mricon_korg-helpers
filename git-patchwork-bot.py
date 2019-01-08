@@ -996,6 +996,13 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                 if pwhash:
                     rpwhashes[refname].append((rev, logline, pwhash))
 
+        if 'fromstate' in settings:
+            fromstate = settings['fromstate'].split(',')
+        else:
+            fromstate = ['new', 'under review']
+
+        logger.debug('fromstate=%s', fromstate)
+
         for project in settings['projects'].split(','):
             count = 0
             project = project.strip()
@@ -1019,8 +1026,8 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
                     for patch_id in patch_ids:
                         pdata = rm.get_patch(patch_id)
-                        if pdata.get('state') in ('superseded', to_state):
-                            logger.debug('Ignoring patch_id=%d (%s)', patch_id, pdata.get('state'))
+                        if pdata.get('state') not in fromstate:
+                            logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
                             continue
                         revs[patch_id] = rev
 
@@ -1071,7 +1078,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                             update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
 
                         if update_queue:
-                            logger.info('Accepting series: %s', sdata.get('name'))
+                            logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
                             updated_series.append(sdata)
                             for name, spatch_id, to_state, rev in update_queue:
                                 count += 1
