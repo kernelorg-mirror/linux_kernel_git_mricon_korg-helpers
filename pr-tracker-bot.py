@@ -23,6 +23,7 @@ import argparse
 import email
 import email.message
 import email.utils
+import random
 import smtplib
 import time
 import subprocess
@@ -56,6 +57,19 @@ PULL_BODY_REMOTE_REF_RE = [
 ]
 
 logger = logging.getLogger('prtracker')
+
+
+# Python-2.7 doesn't have a domain= keyword argument, so steal make_msgid from python-3.2+
+def make_msgid(idstring=None, domain='kernel.org'):
+    timeval = int(time.time()*100)
+    pid = os.getpid()
+    randint = random.getrandbits(64)
+    if idstring is None:
+        idstring = ''
+    else:
+        idstring = '.' + idstring
+
+    return '<%d.%d.%d%s@%s>' % (timeval, pid, randint, idstring, domain)
 
 
 def db_save_meta(c):
@@ -366,7 +380,7 @@ def parse_pull_requests(pirepo, topdir, dryrun):
 
 def get_config_from_repo(repo, pitopdir, cmdconfig):
     config = dict()
-    args = ['config', '-z', '--local', '--get-regexp', 'prtracker\..*']
+    args = ['config', '-z', '--local', '--get-regexp', r'prtracker\..*']
     out = git_run_command(repo, args)
     if not out:
         return config
@@ -563,7 +577,7 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
     msg['X-PR-Merge-Refname'] = refname
     msg['X-PR-Merge-Commit-Id'] = merge_id
 
-    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot')
+    msg['Message-Id'] = make_msgid('pr-tracker-bot')
     msg['Date'] = email.utils.formatdate(localtime=True)
 
     # Set to and cc
