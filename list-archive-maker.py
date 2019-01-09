@@ -53,6 +53,7 @@ WANTHDRS = {'return-path',
             'x-mailing-list',
             }
 
+
 def main(sources, outdir, msgids, listids, rejectsfile):
     outboxes = {}
     writecount = {}
@@ -69,6 +70,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
         else:
             eaddrs.append(listid)
 
+    rejectsbox = None
     if rejectsfile:
         rejectsbox = mailbox.mbox(rejectsfile)
 
@@ -119,6 +121,8 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 skipped += 1
                 nomsgid += 1
                 continue
+
+            msgid = msgid.strip()
             if msgid in knownset:
                 # Duplicate Message-ID, either because we already have it in the known-ids,
                 # or because the inbox has messages with same IDs. There is no fix for the
