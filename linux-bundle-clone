@@ -4,22 +4,22 @@
 # Use this script to clone a Linux repository using a CDN-hosted bundle.
 # This is the recommended way to clone Linux in a CI environment where
 # the full repository needs to be cloned every time.
-REMOTE=$1
-if [ -z "${REMOTE}" ]; then
+REMOTE=${1}
+if [[ -z ${REMOTE} ]]; then
     echo "Please specify the remote to clone"
-    echo "Example: $0 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
+    echo "Example: ${0} https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
     exit 1
 fi
 
-TARGET=$2
-if [ -z "${TARGET}" ]; then
+TARGET=${2}
+if [[ -z ${TARGET} ]]; then
     echo "Please specify the target directory"
-    echo "Example: $0 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
+    echo "Example: ${0} https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux master"
     exit 1
 fi
 
-CHECKOUT=$3
-if [ -z "${CHECKOUT}" ]; then
+CHECKOUT=${3}
+if [[ -z ${CHECKOUT} ]]; then
     CHECKOUT=master
 fi
 
@@ -40,27 +40,27 @@ CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/torv
 BUNDLELOCAL=$(mktemp /tmp/linux.XXXXXXXXXX.bundle)
 
 echo "Getting the bundle file"
-if ! curl -L $CDNBUNDLE -o $BUNDLELOCAL; then
+if ! curl -L ${CDNBUNDLE} -o ${BUNDLELOCAL}; then
     echo "Getting the clone bundle failed."
     # clean up to not litter huge files around
-    rm -f $BUNDLELOCAL
+    rm -f ${BUNDLELOCAL}
     exit 1
 fi
 
 echo "Cloning from the bundle file"
-if ! git clone $BUNDLELOCAL $TARGET; then
+if ! git clone ${BUNDLELOCAL} ${TARGET}; then
     echo "Cloning from bundle failed."
     echo "The bundle is in ${BUNDLELOCAL}"
     exit 1
 fi
 
 # We're done with the bundle now
-rm -f $BUNDLELOCAL
+rm -f ${BUNDLELOCAL}
 
-cd $TARGET
+cd ${TARGET}
 echo "Fetching latest objects"
 git remote remove origin
-git remote add origin $REMOTE
+git remote add origin ${REMOTE}
 git remote update origin
 
-git checkout $CHECKOUT
+git checkout ${CHECKOUT}

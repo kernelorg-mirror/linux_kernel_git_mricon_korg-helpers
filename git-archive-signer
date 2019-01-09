@@ -11,8 +11,8 @@ NOTEREF="refs/notes/signatures/tar"
 # Pass the tag as the only parameter, otherwise we grab the latest
 # annotated tag we find. You may also pass "list" to list all tags that
 # already carry corresponding signature notes.
-if [ "$1" == "list" ]; then
-    git notes --ref $NOTEREF list | cut -d' ' -f2 | xargs git describe
+if [[ $1 == "list" ]]; then
+    git notes --ref ${NOTEREF} list | cut -d' ' -f2 | xargs git describe
     exit 0
 fi
 
@@ -21,7 +21,7 @@ TAG=$1
 # Set this to your gitolite.kernel.org remote
 # We'll also use git config --get archive-signer.remote if we find it
 REMOTE="$(git config --get archive-signer.remote)"
-if [ -z "${REMOTE}" ]; then
+if [[ -z ${REMOTE} ]]; then
     REMOTE="origin"
 fi
 
@@ -39,16 +39,16 @@ USEKEY="$(git config --get archive-signer.usekey)"
 # Set it here if guessing basename is wrong.
 # We'll also use git config archive-signer.tarname value if we find it
 TARNAME="$(git config --get archive-signer.tarname)"
-if [ -z "${TARNAME}" ]; then
+if [[ -z ${TARNAME} ]]; then
     TARNAME="$(basename $(pwd))"
 fi
 
 # You shouldn't need to change anything below
 
-if [ -z "${TAG}" ]; then
+if [[ -z ${TAG} ]]; then
     # Assume you want the latest tag
     TAG="$(git describe --abbrev=0)"
-    if [ -z "${TAG}" ]; then
+    if [[ -z ${TAG} ]]; then
         echo "Could not figure out which tag you want"
         exit 1
     fi
@@ -62,8 +62,8 @@ PREFIX="${TARNAME}-${TAG#v}"
 # Do we already have a signature note for this tag?
 # Start by fetching the origin notes
 echo "Updating notes from remote"
-git fetch $REMOTE "refs/notes/*:refs/notes/*"
-if git notes --ref=$NOTEREF list $TAG >/dev/null 2>&1; then
+git fetch ${REMOTE} "refs/notes/*:refs/notes/*"
+if git notes --ref=${NOTEREF} list ${TAG} >/dev/null 2>&1; then
     echo "Signature note for ${TAG} already exists!"
     echo "To make a new one, delete it first:"
     echo "    git notes --ref=${NOTEREF} remove ${TAG}"
@@ -73,10 +73,8 @@ fi
 echo -n "Generate signature note for ${PREFIX}.tar? [Y/n] "
 read YN
 
-[[ -z "${YN}" ]] && YN=y
-if [ "${YN}" != "y" ]; then
-    exit 1
-fi
+[[ -z ${YN} ]] && YN=y
+[[ ${YN} != "y" ]] && exit 1
 
 # We add the exact archive line to sig comments,
 # so put it together here
@@ -84,32 +82,32 @@ GIT_ARCHIVE_CMD="git archive --format tar --prefix=${PREFIX}/ ${TAG}"
 # Record the version of git that created this archive
 GIT_VERSION=$(git --version)
 
-if [ ! -z "${USEKEY}" ]; then
+if [[ ! -z ${USEKEY} ]]; then
     GPGBIN="${GPGBIN} -u ${USEKEY}"
 fi
 
-git notes --ref=$NOTEREF add -C "$(
-    $GIT_ARCHIVE_CMD | $GPGBIN -a -b -o - \
+git notes --ref=${NOTEREF} add -C "$(
+    ${GIT_ARCHIVE_CMD} | ${GPGBIN} -a -b -o - \
         --comment "This signature is for the .tar version of the archive" \
-        --comment "$GIT_ARCHIVE_CMD" \
-        --comment "$GIT_VERSION" |
+        --comment "${GIT_ARCHIVE_CMD}" \
+        --comment "${GIT_VERSION}" |
         git hash-object -w --stdin)" "${TAG}"
 
-if [ "$?" != "0" ]; then
+if [[ $? != 0 ]]; then
     echo "git notes exited with error"
     exit 1
 fi
 
 echo
-git --no-pager notes --ref=$NOTEREF show ${TAG}
+git --no-pager notes --ref=${NOTEREF} show ${TAG}
 echo
 
 echo -n "Push to ${REMOTE}? [Y/n] "
 read YN
 echo
 
-[[ -z "${YN}" ]] && YN=y
-if [ "${YN}" != "y" ]; then
+[[ -z ${YN} ]] && YN=y
+if [[ ${YN} != "y" ]]; then
     echo "Remember to push it using:"
     echo "    git push ${REMOTE} refs/notes/*"
     exit 0

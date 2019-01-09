@@ -24,7 +24,7 @@ import sys
 import argparse
 import json
 
-from fcntl import lockf, LOCK_EX, LOCK_UN, LOCK_NB
+from fcntl import lockf, LOCK_EX, LOCK_NB
 
 # You need the latest dev version that supports excludeMergeRevisions
 import git_multimail as gm
@@ -82,8 +82,8 @@ def main(args):
         sys.exit(1)
 
     try:
-        with open('%s.lock' % args.statefile, 'w') as lockfh:
-            lockf(lockfh, LOCK_EX | LOCK_NB)
+        lockfh = open('%s.lock' % args.statefile, 'w')
+        lockf(lockfh, LOCK_EX | LOCK_NB)
     except IOError:
         print('Could not obtain an exclusive lock, assuming another process is running.')
         sys.exit(0)
