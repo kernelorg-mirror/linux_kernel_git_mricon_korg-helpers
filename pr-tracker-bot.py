@@ -51,8 +51,8 @@ PULL_BODY_WITH_COMMIT_ID_RE = [
 
 # I don't like these
 PULL_BODY_REMOTE_REF_RE = [
-    re.compile(r'^\s*([\w+-]+://[\w/.@~-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
-    re.compile(r'^\s*([\w+-]+://[\w/.@~-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*((?:[\w+-]+://)?[\w/.@:~-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*((?:[\w+-]+://)?[\w/.@:~-]+)\s*$', re.MULTILINE | re.IGNORECASE),
 ]
 
 logger = logging.getLogger('prtracker')
