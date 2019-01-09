@@ -638,7 +638,7 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
         for patch in sdata.get('patches'):
             body += '  - %s\n' % patch.get('name')
             if 'commitlink' in config:
-                body += '    %s/%s\n' % (config['commitlink'], revs[patch.get('id')])
+                body += '    %s%s\n' % (config['commitlink'], revs[patch.get('id')])
 
         body += ('\nYou are awesome, thank you!\n\n'
                  '-- \nDeet-doot-dot, I am a bot.\n'
@@ -805,7 +805,7 @@ def housekeeping(rm, settings, nomail, dryrun):
 
                 if sreport:
                     report += 'Latest series: [v%s] %s (%s)\n' % (items[latest_version]['rev'], name,
-                                                                items[latest_version]['date'])
+                                                                  items[latest_version]['date'])
                     report += '\n'.join(sreport)
                     report += '\n\n'
 
@@ -943,7 +943,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
     db_heads = db_get_repo_heads(c)
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads)
-    config = get_config_from_repo(repo, 'patchwork\..*', cmdconfig)
+    config = get_config_from_repo(repo, r'patchwork\..*', cmdconfig)
 
     global _project_cache
 
