@@ -739,6 +739,11 @@ def housekeeping(rm, settings, nomail, dryrun):
                 if s_name is None:
                     # Ignoring this one, because we must have a name
                     continue
+
+                # Remove any [foo] from the front, for best matching.
+                # Usually, patchwork strips these, but not always.
+                s_name = re.sub(r'^\[\w+\]\s*', '', s_name)
+
                 ver = entry.get('version')
                 subm_id = entry.get('submitter').get('id')
                 patches = list()
