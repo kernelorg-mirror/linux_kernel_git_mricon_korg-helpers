@@ -1011,7 +1011,8 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
             for refname, hashpairs in rpwhashes.items():
                 logger.info('Analyzing %d revisions', len(hashpairs))
-                to_state = statemap[refname][0].lower()
+                # Patchwork lowercases state name and replaces spaces with dashes
+                to_state = statemap[refname][0].lower().replace(' ', '-')
 
                 # We create patch_id->rev mapping first
                 revs = dict()
