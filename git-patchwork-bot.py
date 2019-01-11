@@ -999,7 +999,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         if 'fromstate' in settings:
             fromstate = settings['fromstate'].split(',')
         else:
-            fromstate = ['new', 'under review']
+            fromstate = ['new', 'under-review']
 
         logger.debug('fromstate=%s', fromstate)
 
