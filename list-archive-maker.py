@@ -25,6 +25,7 @@ import os
 import sys
 import mailbox
 import email.utils
+import time
 import re
 import fnmatch
 
@@ -76,23 +77,58 @@ def main(sources, outdir, msgids, listids, rejectsfile):
 
     for sourcefile in sources:
         is_pipermail = False
+        is_nntp = False
+
         # do you have a '://' in you?
         if sourcefile.find('://') > 0:
-            is_pipermail = True
-            sourcefile = grab_pipermail_archive(sourcefile, outdir)
-            sys.stdout.write('parsing...')
-            sys.stdout.flush()
-        else:
-            sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
-            sys.stdout.flush()
+            if sourcefile.find('nntp://') == 0:
+                is_nntp = True
+            else:
+                is_pipermail = True
 
-        # If the filename ends with /, we treat as maildir
-        if sourcefile[-1] == '/':
-            inbox = mailbox.Maildir(sourcefile)
-        else:
-            inbox = mailbox.mbox(sourcefile)
+        if is_nntp:
+            # Expect in format nntp://news.gmane.org/gmane.linux.network
+            sys.stdout.write('Connecting to %s...' % sourcefile)
+            chunks = sourcefile.split('/')
+            server, group = chunks[-2:]
+            import nntplib
+            nntplib._MAXLINE = 1 << 20
+            server = nntplib.NNTP(server)
+            resp, count, first, last, name = server.group(group)
+            total = int(last)
+            def nntp_msg_gen(last):
+                aid = 1
+                while aid <= last:
+                    try:
+                        resp, ainfo = server.article(aid)
+                        lines = ainfo[2]
+                        message = email.message_from_bytes(b'\n'.join(ainfo[2]))
+                        yield message
+                    except nntplib.NNTPTemporaryError as ex:
+                        # Ignore one-off article failures -- probably deletes
+                        pass
+                    finally:
+                        aid += 1
 
-        total = len(inbox)
+            inbox = nntp_msg_gen(total)
+
+        else:
+            if is_pipermail:
+                sourcefile = grab_pipermail_archive(sourcefile, outdir)
+                sys.stdout.write('parsing...')
+                sys.stdout.flush()
+                inbox = mailbox.mbox(sourcefile)
+            else:
+                sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
+                sys.stdout.flush()
+                # If the filename ends with /, we treat as maildir
+                if sourcefile[-1] == '/':
+                    inbox = mailbox.Maildir(sourcefile)
+                else:
+                    inbox = mailbox.mbox(sourcefile)
+
+            total = len(inbox)
+
         sys.stdout.write('%s messages\n' % total)
         sys.stdout.flush()
 
@@ -142,6 +178,10 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             is_our_list = False
             for hdrname, hdrval in msg._headers:
                 lhdrname = hdrname.lower()
+                if is_nntp and lhdrname.find('original-') == 0:
+                    lhdrname = lhdrname.replace('original-', '')
+                    hdrname = hdrname.replace('Original-', '')
+
                 wanthdr = False
                 for hdrmatch in WANTHDRS:
                     if fnmatch.fnmatch(lhdrname, hdrmatch):
@@ -200,6 +240,10 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                     newhdrs.append(('To', eaddrs[0]))
                     newhdrs.append(('List-Id', listids[0]))
                     is_our_list = True
+                elif is_nntp:
+                    # We assume everything in the newsgroup matches our first list-id
+                    newhdrs.append(('List-Id', listids[0]))
+                    is_our_list = True
                 else:
                     for eaddr in eaddrs:
                         if (str(msg.get('to', '')).find(eaddr) >= 0 or
@@ -227,6 +271,8 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 msgdate = email.utils.parsedate_tz(str(msg['Date']))
 
             mboxname = '%04d-%02d.mbx' % (msgdate[0], msgdate[1])
+            if is_nntp:
+                msg.set_unixfrom('From nntp@import %s' % time.strftime('%c', msgdate[:9]))
 
             # do we have this mbox open already?
             if mboxname in outboxes:
