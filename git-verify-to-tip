@@ -1,0 +1,90 @@
+#!/bin/bash
+# git-verify-to-tip
+# -----------------
+#
+# Verify PGP signatures on all (merge) commits from the last signed tag
+# or another arbitrary object in the repository history.
+#
+# Configurable parameters
+# -----------------------
+# We always ensure the signing key is both GOOD and VALID, which means
+# that the keys you are checking against should be imported into your
+# gnupghome and signed by a trusted key (e.g. your own). If you want to
+# use a different GNUPG directory other than the one in your home, you
+# can "export GNUPGHOME=some/path" before running this script. You may
+# further limit the number of accepted keys by listing them below.
+# Pipe-separate multiple keys, e.g.:
+# ONLYKEYS="ABAF11C65A2970B130ABE3C479BE3E4300411886|647F28654894E3BD457199BE38DBBDC86092693E"
+ONLYKEYS=
+#
+# When set to "" we start from the latest annotated tag we find.
+# You can also list an arbitrary commit object here.
+STARTFROM=
+#
+# By default, we check signatures on every commit, but if you set this to
+# --merges, we will only check signatures on merges. You can also add any
+# other flags accepted by git-rev-list.
+REVFLAGS=
+#
+# We can also get these parameters from the git config. E.g.:
+# [verify-to-tip]
+#   onlykeys = ABAF11C65A2970B130ABE3C479BE3E4300411886|647F28654894E3BD457199BE38DBBDC86092693E
+#   startfrom = abcdef123456
+#   revflags = --merges
+#
+if [[ -z ${ONLYKEYS} ]]; then
+    ONLYKEYS=$(git config --get verify-to-tip.onlykeys)
+fi
+if [[ -z ${STARTFROM} ]]; then
+    STARTFROM=$(git config --get verify-to-tip.startfrom)
+fi
+if [[ -z ${REVFLAGS} ]]; then
+    REVFLAGS=$(git config --get verify-to-tip.revflags)
+fi
+
+# End configuration
+
+function _verify_raw {
+    # We are looking for [GNUPG:] GOODSIG and [GNUPG:] VALIDSIG
+    # They must be both present, or this is not a valid sig
+    COUNT=$(echo "${1}" | grep -c -E '^\[GNUPG:\] (GOODSIG|VALIDSIG)')
+    if [[ ${COUNT} -lt 2 ]]; then
+        return 1
+    fi
+    if [[ -z ${ONLYKEYS} ]]; then
+        return 0
+    fi
+    if $(echo "${1}" | grep -q -E "^\[GNUPG:\] VALIDSIG .* (${ONLYKEYS})\$"); then
+        return 0
+    fi
+    return 1
+}
+
+if [[ -z ${STARTFROM} ]]; then
+    # verify the last annotated tag
+    STARTFROM=$(git describe --abbrev=0)
+    echo "Verifying tag ${STARTFROM}"
+    RAWOUT=$(git verify-tag --raw ${STARTFROM} 2>&1)
+else
+    # verify the arbitrary commit provided
+    echo "Verifying commit ${STARTFROM}"
+    RAWOUT=$(git verify-commit --raw ${STARTFROM} 2>&1)
+fi
+
+if ! _verify_raw "${RAWOUT}"; then
+    echo "CRITICAL: Starting object did NOT verify."
+    exit 1
+fi
+
+# Grab revisions from the starting object
+for REV in $(git rev-list ${STARTFROM}..HEAD ${REVFLAGS}); do
+    echo "Verifying $REV"
+    RAWOUT=$(git verify-commit --raw ${REV} 2>&1)
+    if ! _verify_raw "${RAWOUT}"; then
+        echo "CRITICAL: Object ${REV} did NOT verify."
+        exit 1
+    fi
+done
+
+echo "Verified successfully."
+exit 0
