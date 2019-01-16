@@ -2,8 +2,8 @@
 # git-verify-to-tip
 # -----------------
 #
-# Verify PGP signatures on all (merge) commits from the last signed tag
-# or another arbitrary object in the repository history.
+# Verify PGP signatures on all commits from the last signed tag
+# or any arbitrary object in the repository history.
 #
 # This script can be installed as hooks/pre-push.
 #
@@ -13,9 +13,10 @@
 # that the keys you are checking against should be imported into your
 # gnupghome and signed by a trusted key (e.g. your own). If you want to
 # use a different GNUPG directory other than the one in your home, you
-# can "export GNUPGHOME=some/path" before running this script. You may
-# further limit the number of accepted keys by listing them below.
-# Pipe-separate multiple keys, e.g.:
+# can "export GNUPGHOME=some/path" before running this script. In addition,
+# you may explicitly specify the keys to trust in the ONLYKEYS parameter below,
+# e.g. if you want to make sure the signatures came from a very small subset
+# of developers. Pipe-separate multiple keys, e.g.:
 # ONLYKEYS="ABAF11C65A2970B130ABE3C479BE3E4300411886|647F28654894E3BD457199BE38DBBDC86092693E"
 ONLYKEYS=
 #
@@ -27,7 +28,7 @@ REVFLAGS=
 # When set to "" we start from the latest annotated tag we find.
 # You can also list an arbitrary commit object here.
 # When running as hooks/pre-push, we ignore this entirely and use the
-# information provided by git.
+# commit information provided by git on stdin.
 STARTFROM=
 #
 # We can also get these parameters from the git config. E.g.:
@@ -48,7 +49,7 @@ fi
 
 # End configuration
 
-function _verify_raw {
+function verify_raw_gpg {
     # We are looking for [GNUPG:] GOODSIG and [GNUPG:] VALIDSIG
     # They must be both present, or this is not a valid sig
     COUNT=$(echo "${1}" | grep -c -E '^\[GNUPG:\] (GOODSIG|VALIDSIG)')
@@ -64,40 +65,41 @@ function _verify_raw {
     return 1
 }
 
-function _verify_rev_range {
+function verify_rev_range {
     REVRANGE=${1}
     REVFLAGS=${2}
     for REV in $(git rev-list ${REVRANGE} ${REVFLAGS}); do
         echo "Verifying $REV"
         RAWOUT=$(git verify-commit --raw ${REV} 2>&1)
-        if ! _verify_raw "${RAWOUT}"; then
-            echo "CRITICAL: Object ${REV} did NOT verify."
+        if ! verify_raw_gpg "${RAWOUT}"; then
+            echo "CRITICAL: ${REV} signature did NOT verify:"
+            echo "${RAWOUT}"
             return 1
         fi
     done
     return 0
 }
 
-# Are we running from hooks/pre-push? $1 and $2 should be set, then.
+# Are we running from hooks/pre-push? If so, $1 and $2 should be set.
 if [[ -z "${1}${2}" ]]; then
     # Not running as a pre-push hook.
     if [[ -z ${STARTFROM} ]]; then
         # verify the last annotated tag
         STARTFROM=$(git describe --abbrev=0)
-        echo "Verifying tag ${STARTFROM}"
         RAWOUT=$(git verify-tag --raw ${STARTFROM} 2>&1)
     else
         # verify the arbitrary commit provided
-        echo "Verifying commit ${STARTFROM}"
         RAWOUT=$(git verify-commit --raw ${STARTFROM} 2>&1)
     fi
 
-    if ! _verify_raw "${RAWOUT}"; then
-        echo "CRITICAL: Starting object did NOT verify."
+    echo "Verifying ${STARTFROM}"
+    if ! verify_raw_gpg "${RAWOUT}"; then
+        echo "CRITICAL: ${STARTFROM} signature did NOT verify:"
+        echo "${RAWOUT}"
         exit 1
     fi
-    REVRANGE="${STARTFROM}..HEAD"
-    if ! _verify_rev_range "${REVRANGE}" "${REVFLAGS}"; then
+    REVRANGE="${STARTFROM}.."
+    if ! verify_rev_range "${REVRANGE}" "${REVFLAGS}"; then
         exit 1
     fi
 else
@@ -117,14 +119,12 @@ else
            REVRANGE="${REMOTE_SHA}..${LOCAL_SHA}"
         fi
 
-        if ! _verify_rev_range "${REVRANGE}" "${REVFLAGS}"; then
+        if ! verify_rev_range "${REVRANGE}" "${REVFLAGS}"; then
             exit 1
         fi
 
     done
 fi
-
-# Grab revisions from the starting object
 
 echo "Verified successfully."
 exit 0
