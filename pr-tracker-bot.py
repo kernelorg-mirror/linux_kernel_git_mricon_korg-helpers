@@ -138,16 +138,19 @@ def git_get_command_lines(gitdir, args):
     return lines
 
 
-def git_run_command(gitdir, args):
-    args = ['git', '--no-pager', '--git-dir', gitdir] + args
+def git_run_command(gitdir, args, logstderr=False):
+    cmdargs = ['git', '--no-pager']
+    if gitdir:
+        cmdargs += ['--git-dir', gitdir]
+    cmdargs += args
 
-    logger.debug('Running %s' % ' '.join(args))
+    logger.debug('Running %s' % ' '.join(cmdargs))
 
-    (output, error) = subprocess.Popen(args, stdout=subprocess.PIPE,
+    (output, error) = subprocess.Popen(cmdargs, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE).communicate()
     output = output.strip().decode('utf-8', errors='replace')
 
-    if len(error.strip()):
+    if logstderr and len(error.strip()):
         logger.debug('Stderr: %s', error.decode('utf-8', errors='replace'))
 
     return output
@@ -176,10 +179,10 @@ def git_get_commit_id_from_repo_ref(repo, ref):
         return None
 
     logger.debug('getting commit-id from: %s %s', repo, ref)
-    lines = git_get_command_lines('', ['ls-remote', repo, '%s^{}' % ref])
+    lines = git_get_command_lines(None, ['ls-remote', repo, '%s^{}' % ref])
     if not lines:
         # Try it as a head
-        lines = git_get_command_lines('', ['ls-remote', repo, ref])
+        lines = git_get_command_lines(None, ['ls-remote', repo, ref])
         if not lines:
             # Oh well, we tried
             logger.debug('did not find commit-id, ignoring pull request')
@@ -428,16 +431,15 @@ def get_config_from_repo(repo, pitopdir, cmdconfig):
     return config
 
 
-def get_all_thanked_prs(c, refname, cutoffdays=30):
+def get_all_thanked_prs(c, cutoffdays=30):
     rows = c.execute('''
                      SELECT pr_commit_id
                        FROM thanks
-                      WHERE refname = ?
-                        AND sent > datetime('now', ?)
-                     ''', (refname, '-%d day' % cutoffdays,)).fetchall()
+                      WHERE sent > datetime('now', ?)
+                     ''', ('-%d day' % cutoffdays,)).fetchall()
     sent_prs = set()
     for row in rows:
-        sent_prs.update(row[0])
+        sent_prs.update((row[0],))
 
     return sent_prs
 
@@ -475,8 +477,8 @@ def get_plain_part(msg):
     return body
 
 
-def get_all_new_prs(c, refname, prs, cutoffdays=30):
-    sent_prs = get_all_thanked_prs(c, refname, cutoffdays)
+def get_unprocessed_prs(c, prs, cutoffdays=30):
+    sent_prs = get_all_thanked_prs(c, cutoffdays)
     new_prs = list()
     for row in prs:
         if row[0] not in sent_prs:
@@ -492,7 +494,15 @@ def to_or_cc_contains(tocc, addrs):
     return False
 
 
-def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, config, nomail):
+def thank_for_pr(c, repo, refname, commit_id, pirepo, msg_commit_id, config, dryrun, nomail):
+    # Make sure we haven't thanked for it already
+    c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=? AND refname=?',
+              (commit_id, refname))
+    rows = c.fetchall()
+    if rows:
+        logger.debug('Already thanked for this PR, skipping')
+        return None
+
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
     origbody = get_plain_part(orig)
     if origbody is None:
@@ -540,6 +550,8 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
 
     msgvalues = dict()
+
+    merge_id = git_get_merge_id(repo, commit_id)
 
     msgvalues['refname'] = refname
     msgvalues['shortrefname'] = refname.rsplit('/', 1)[-1]
@@ -621,6 +633,14 @@ def mail_thanks_for_pr(refname, commit_id, merge_id, pirepo, msg_commit_id, conf
         logger.info(msg.as_string())
         logger.info('------------------------------')
 
+    if not dryrun:
+        try:
+            c.execute('INSERT INTO thanks VALUES(?, ?, ?, ?)',
+                      (commit_id, refname, msg['Message-Id'],
+                       time.strftime('%Y-%m-%dT%H:%M:%S%z', time.gmtime())))
+        except sqlite3.IntegrityError:
+            logger.debug('Got integrity-error for %s/%s', refname, commit_id)
+
     return msg['Message-Id']
 
 
@@ -653,13 +673,6 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
         dbconn.commit()
         return
 
-    db_heads = db_get_repo_heads(c)
-
-    newrevs = git_get_new_revs(repo, db_heads, git_heads)
-    if not newrevs:
-        logger.info('No new revs since last run.')
-        return
-
     config = get_config_from_repo(repo, pitopdir, cmdconfig)
 
     tycount = 0
@@ -676,34 +689,21 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
             pass
 
         prs = get_all_prs(pirepo, cutoffdays=cutoffdays)
-
-        for refname, revlines in newrevs.items():
-            logger.debug('Looking at %s', refname)
-            revs = set([row[0] for row in revlines])
-            for pr_commit_id, msg_commit_id in get_all_new_prs(c, refname, prs):
-                if pr_commit_id in revs:
-                    logger.debug('Found a matching PR commit: %s', pr_commit_id)
-                    # Make sure we haven't thanked for it already
-                    c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=? AND refname=?',
-                              (pr_commit_id, refname))
-                    rows = c.fetchall()
-                    if rows:
-                        logger.debug('Already thanked for this PR, skipping')
-                        continue
-
-                    merge_id = git_get_merge_id(repo, pr_commit_id)
-                    sent_msgid = mail_thanks_for_pr(refname, pr_commit_id, merge_id,
-                                                    pirepo, msg_commit_id,
-                                                    settings, nomail)
-                    if sent_msgid and not dryrun:
-                        tycount += 1
-                        try:
-                            c.execute('INSERT INTO thanks VALUES(?, ?, ?, ?)',
-                                      (pr_commit_id, refname, sent_msgid,
-                                       time.strftime('%Y-%m-%dT%H:%M:%S%z', time.gmtime())))
-                            dbconn.commit()
-                        except sqlite3.IntegrityError:
-                            logger.debug('Got integrity-error for %s', pr_commit_id)
+        logger.debug('Found %s PRs in %s', len(prs), pirepo)
+        un_prs = get_unprocessed_prs(c, prs, cutoffdays=cutoffdays)
+        logger.debug('Of them, %s not already thanked for', len(un_prs))
+        for pr_commit_id, msg_commit_id in un_prs:
+            logger.debug('Checking %s', pr_commit_id)
+            # Is this pr_commit_id in the repo?
+            lines = git_get_command_lines(repo, ['branch', '--contains', pr_commit_id])
+            if len(lines):
+                refname = 'refs/heads/%s' % lines[0].split()[-1]
+                logger.debug('Found %s in %s', pr_commit_id, refname)
+                sent_msgid = thank_for_pr(c, repo, refname, pr_commit_id, pirepo,
+                                          msg_commit_id, settings, dryrun, nomail)
+                if sent_msgid and not dryrun:
+                    tycount += 1
+                    dbconn.commit()
 
     if not dryrun:
         db_save_repo_heads(c, git_heads)
@@ -713,6 +713,13 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
         logger.info('Sent %s thank-you notes.', tycount)
     else:
         logger.info('No new thank-yous to send.')
+
+
+def check_if_in_repo(repo, commit_id):
+    lines = git_get_command_lines(repo, ['cat-file', '-t', commit_id])
+    if len(lines):
+        return True
+    return False
 
 
 def show_unapplied(repo, pitopdir, cmdconfig, use_json):
@@ -752,8 +759,7 @@ def show_unapplied(repo, pitopdir, cmdconfig, use_json):
                 continue
 
             # Is this pr_commit_id in the repo?
-            lines = git_get_command_lines(repo, ['cat-file', '-t', pr_commit_id])
-            if len(lines):
+            if check_if_in_repo(repo, pr_commit_id):
                 continue
 
             orig = git_get_message_from_pi(pirepo, msg_commit_id)
