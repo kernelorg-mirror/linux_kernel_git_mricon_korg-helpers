@@ -175,10 +175,8 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
             newhdrs = []
-            to_list = []
-            to_header_idx = None
-            cc_list = []
-            cc_header_idx = None
+            to = ''
+            cc = ''
             recvtime = None
             is_our_list = False
             for hdrname, hdrval in list(msg._headers):
@@ -237,29 +235,33 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 # than strangely at the end.
 
                 elif lhdrname == 'to':
-                        to_list.extend(hdrval.split(','))
-                        msg._headers.remove((hdrname, hdrval))
-                        if to_header_idx is None:
-                            to_header_idx = len(newhdrs)
+                    for pair in email.utils.getaddresses([hdrval]):
+                        if cc.find(pair[1]) >= 0:
+                            # already in Cc, so no need to add it to To
+                            continue
+                        if len(to) and to.find(pair[1]) < 0:
+                            to += ', %s' % email.utils.formataddr(pair)
+                        else:
+                            to += email.utils.formataddr(pair)
 
                 elif lhdrname == 'cc':
-                        cc_list.extend(hdrval.split(','))
-                        msg._headers.remove((hdrname, hdrval))
-                        if cc_header_idx is None:
-                            cc_header_idx = len(newhdrs)
+                    for pair in email.utils.getaddresses([hdrval]):
+                        if to.find(pair[1]) >= 0:
+                            # already in To, so no need to add it to CCs
+                            continue
+                        if len(cc) and cc.find(pair[1]) < 0:
+                            cc += ', %s' % email.utils.formataddr(pair)
+                        else:
+                            cc += email.utils.formataddr(pair)
 
                 else:
                     newhdrs.append((hdrname, hdrval))
 
-            if len(to_list) > 0:
-                to_header = ('To', ', '.join(to_list))
-                msg._headers.append(to_header)
-                newhdrs.insert(to_header_idx, to_header)
+            if len(to):
+                newhdrs.append(('To', to))
 
-            if len(cc_list) > 0:
-                cc_header = ('Cc', ', '.join(cc_list))
-                msg._headers.append(cc_header)
-                newhdrs.insert(cc_header_idx, cc_header)
+            if len(cc):
+                newhdrs.append(('Cc', cc))
 
             if not is_our_list:
                 # Sometimes a message is cc'd to multiple mailing lists and the
@@ -419,10 +421,13 @@ if __name__ == '__main__':
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('-source', nargs='+',
-                        help=('Source mailbox with your archives in it, can be multiple. '
-                              'Paths with trailing / will be treated as maildirs'))
+                        help=('Mbox file with archives, can be multiple. '
+                              'Paths with trailing "/" will be treated as maildirs.'))
     parser.add_argument('-pipermail',
-                        help='Alternatively, get mailman pipermail archives from this URL')
+                        help='Download mailman pipermail archives from this URL')
+    parser.add_argument('-nntp',
+                        help=('Download full archives from a NNTP server, '
+                              'e.g. -n nntp://news.gmane.com/gmane.linux.kernel'))
     parser.add_argument('-exportdir', required=True, default='list-archives',
                         help='Export dir where to put sanitized archives')
     parser.add_argument('-knownids',
@@ -457,11 +462,14 @@ if __name__ == '__main__':
             print('Could not find any .txt.gz files listed at %s' % args.pipermail)
             sys.exit(1)
 
+    if args.nntp:
+        mboxes.append(args.nntp)
+
     if args.source:
         mboxes += args.source
 
     if not mboxes:
-        print('You have to specify a pipermail URL or a list of mbox files (or both)')
+        print('You have to specify at least one source (-s, -p, or -n)')
         sys.exit(1)
 
     # Make list ID matching case insensitive to match more mail
