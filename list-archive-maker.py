@@ -187,6 +187,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                     lhdrname = lhdrname.replace('original-', '')
                     hdrname = hdrname.replace('Original-', '')
 
+                lhdrval = hdrval.lower()
                 wanthdr = False
                 for hdrmatch in WANTHDRS:
                     if fnmatch.fnmatch(lhdrname, hdrmatch):
@@ -205,7 +206,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                             recvtime = email.utils.parsedate_tz(hdrval.split(';')[-1].strip())
                         # does hdrval contain one of our email addresses?
                         for eaddr in eaddrs:
-                            if hdrval.find(eaddr) >= 0:
+                            if lhdrval.find(eaddr) >= 0:
                                 newhdrs.append((hdrname, hdrval))
                                 break
                     except:
@@ -214,14 +215,14 @@ def main(sources, outdir, msgids, listids, rejectsfile):
 
                 elif lhdrname == 'list-id':
                         for listid in listids:
-                            if hdrval.lower().find(listid) >= 0:
+                            if lhdrval.find(listid) >= 0:
                                 newhdrs.append((hdrname, hdrval))
                                 is_our_list = True
                                 break
 
                 elif lhdrname == 'x-mailing-list':
                         for listid in listids:
-                            if hdrval.lower().find(listid) >= 0:
+                            if lhdrval.find(listid) >= 0:
                                 # Stick the list-id that's first in our collection,
                                 # since we assume that it's the canonical one
                                 newhdrs.append(('List-Id', listids[0]))
@@ -280,9 +281,9 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                     is_our_list = True
                 else:
                     for eaddr in eaddrs:
-                        if (str(msg.get('to', '')).find(eaddr) >= 0 or
-                                str(msg.get('cc', '')).find(eaddr) >= 0 or
-                                str(msg.get('resent-to', '')).find(eaddr) >= 0):
+                        if (str(msg.get('to', '')).lower().find(eaddr) >= 0 or
+                                str(msg.get('cc', '')).lower().find(eaddr) >= 0 or
+                                str(msg.get('resent-to', '')).lower().find(eaddr) >= 0):
                             # insert the list-id header
                             # (assuming the first one in the list to be the canonical one)
                             newhdrs.append(('List-ID', '<%s>' % listids[0]))
@@ -463,7 +464,10 @@ if __name__ == '__main__':
         print('You have to specify a pipermail URL or a list of mbox files (or both)')
         sys.exit(1)
 
-    newids = main(mboxes, args.exportdir, knownids, args.listids, args.rejected)
+    # Make list ID matching case insensitive to match more mail
+    listids = [listid.lower() for listid in args.listids]
+
+    newids = main(mboxes, args.exportdir, knownids, listids, args.rejected)
 
     if newids is None or not args.knownids:
         sys.exit(0)
