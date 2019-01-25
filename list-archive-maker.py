@@ -97,15 +97,15 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             server = nntplib.NNTP(server)
             resp, count, first, last, name = server.group(group)
             total = int(last)
+
             def nntp_msg_gen(last):
                 aid = 1
                 while aid <= last:
                     try:
                         resp, ainfo = server.article(aid)
-                        lines = ainfo[2]
                         message = email.message_from_bytes(b'\n'.join(ainfo[2]))
                         yield message
-                    except nntplib.NNTPTemporaryError as ex:
+                    except nntplib.NNTPTemporaryError:
                         # Ignore one-off article failures -- probably deletes
                         pass
                     finally:
