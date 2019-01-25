@@ -52,6 +52,7 @@ WANTHDRS = {'return-path',
             'content-*',
             'errors-to',
             'x-mailing-list',
+            'resent-to',
             }
 
 
@@ -247,7 +248,8 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 else:
                     for eaddr in eaddrs:
                         if (str(msg.get('to', '')).find(eaddr) >= 0 or
-                                str(msg.get('cc', '')).find(eaddr) >= 0):
+                                str(msg.get('cc', '')).find(eaddr) >= 0 or
+                                str(msg.get('resent-to', '')).find(eaddr) >= 0):
                             # insert the list-id header
                             # (assuming the first one in the list to be the canonical one)
                             newhdrs.append(('List-ID', '<%s>' % listids[0]))
