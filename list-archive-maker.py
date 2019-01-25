@@ -175,9 +175,13 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
             newhdrs = []
+            to_list = []
+            to_header_idx = None
+            cc_list = []
+            cc_header_idx = None
             recvtime = None
             is_our_list = False
-            for hdrname, hdrval in msg._headers:
+            for hdrname, hdrval in list(msg._headers):
                 lhdrname = hdrname.lower()
                 if is_nntp and lhdrname.find('original-') == 0:
                     lhdrname = lhdrname.replace('original-', '')
@@ -224,8 +228,37 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                                 is_our_list = True
                                 break
 
+                # Malformed emails can have multiple to: and cc: fields.  Merge
+                # so there's one field for each header type.
+                #
+                # Save the place in newhdrs where the first to or cc list would
+                # have appeared so we can insert the merged list there rather
+                # than strangely at the end.
+
+                elif lhdrname == 'to':
+                        to_list.extend(hdrval.split(','))
+                        msg._headers.remove((hdrname, hdrval))
+                        if to_header_idx is None:
+                            to_header_idx = len(newhdrs)
+
+                elif lhdrname == 'cc':
+                        cc_list.extend(hdrval.split(','))
+                        msg._headers.remove((hdrname, hdrval))
+                        if cc_header_idx is None:
+                            cc_header_idx = len(newhdrs)
+
                 else:
                     newhdrs.append((hdrname, hdrval))
+
+            if len(to_list) > 0:
+                to_header = ('To', ', '.join(to_list))
+                msg._headers.append(to_header)
+                newhdrs.insert(to_header_idx, to_header)
+
+            if len(cc_list) > 0:
+                cc_header = ('Cc', ', '.join(cc_list))
+                msg._headers.append(cc_header)
+                newhdrs.insert(cc_header_idx, cc_header)
 
             if not is_our_list:
                 # Sometimes a message is cc'd to multiple mailing lists and the
