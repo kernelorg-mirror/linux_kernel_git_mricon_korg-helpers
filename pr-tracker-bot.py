@@ -168,6 +168,23 @@ def git_get_repo_heads(gitdir):
 
 def git_get_message_from_pi(pirepo, commit_id):
     full_email = git_run_command(pirepo, ['show', '%s:m' % commit_id])
+    if not len(full_email):
+        logger.debug('%s not found in %s, attempting to find in the previous shard',
+                     commit_id, pirepo)
+        shardrepo = os.path.basename(pirepo)
+        shard = int(shardrepo.split('.')[0])
+        if shard <= 0:
+            # Well, we tried
+            return None
+        prevpirepo = os.path.join(os.path.dirname(pirepo),
+                                  '{0}.git'.format(shard-1))
+        logger.debug('previous shard is in %s', prevpirepo)
+        full_email = git_run_command(prevpirepo, ['show', '%s:m' % commit_id])
+        if not len(full_email):
+            # it's *not* going to be in the shard before that, so just
+            # give up at this point -- we assume it got deleted
+            return None
+
     msg = email.message_from_string(full_email.encode('utf-8'))
     return msg
 
@@ -309,7 +326,7 @@ def get_pirepo_dir(projpath, topdir):
     if topdir:
         projpath = os.path.join(topdir, projpath)
 
-    # if the path does not ent with .git, find the latest shard
+    # if the path does not end with .git, find the latest shard
     pirepo = projpath
     if pirepo[-4:] != '.git':
         subs = os.listdir(projpath)
@@ -368,7 +385,7 @@ def parse_pull_requests(pirepo, topdir, dryrun):
             if subject_re.match(subject):
                 logger.debug('potential match: "%s"', subject)
                 msg = git_get_message_from_pi(pirepo, commit_id)
-                if record_pr_data(commit_id, msg, c):
+                if msg is not None and record_pr_data(commit_id, msg, c):
                     new_prs += 1
                     logger.info('Started tracking: %s', subject)
 
@@ -504,6 +521,9 @@ def thank_for_pr(c, repo, refname, commit_id, pirepo, msg_commit_id, config, dry
         return None
 
     orig = git_get_message_from_pi(pirepo, msg_commit_id)
+    if orig is None:
+        return None
+
     origbody = get_plain_part(orig)
     if origbody is None:
         return None
@@ -763,6 +783,9 @@ def show_unapplied(repo, pitopdir, cmdconfig, use_json):
                 continue
 
             orig = git_get_message_from_pi(pirepo, msg_commit_id)
+            if orig is None:
+                continue
+
             dest = email.utils.getaddresses(orig.get_all('to', []))
             dest += email.utils.getaddresses(orig.get_all('cc', []))
             targets = [chunk[1] for chunk in dest]
