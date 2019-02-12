@@ -196,20 +196,22 @@ def git_get_commit_id_from_repo_ref(repo, ref):
         return None
 
     logger.debug('getting commit-id from: %s %s', repo, ref)
+    # Drop the leading "refs/", if any
+    ref = re.sub(r'^refs/', '', ref)
     # Is it a full ref name or a shortname?
-    if ref.find('refs/heads/') < 0 and ref.find('refs/tags/') < 0:
+    if ref.find('heads/') < 0 and ref.find('tags/') < 0:
         # Try grabbing it as a head first
         lines = git_get_command_lines(None, ['ls-remote', repo, 'refs/heads/%s' % ref])
         if not lines:
             # try it as a tag, then
             lines = git_get_command_lines(None, ['ls-remote', repo, 'refs/tags/%s^{}' % ref])
 
-    elif ref.find('refs/tags/') == 0:
-        lines = git_get_command_lines(None, ['ls-remote', repo, '%s^{}' % ref])
+    elif ref.find('tags/') == 0:
+        lines = git_get_command_lines(None, ['ls-remote', repo, 'refs/%s^{}' % ref])
 
     else:
         # Grab it as a head and hope for the best
-        lines = git_get_command_lines(None, ['ls-remote', repo, ref])
+        lines = git_get_command_lines(None, ['ls-remote', repo, 'refs/%s' % ref])
 
     if not lines:
         # Oh well, we tried
@@ -232,7 +234,7 @@ def get_remote_ref_from_body(body):
                 (repo, ref) = chunks
             else:
                 repo = chunks[0]
-                ref = 'master'
+                ref = 'refs/heads/master'
             break
     return repo, ref
 
