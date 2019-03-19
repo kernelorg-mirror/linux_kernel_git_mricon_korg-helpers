@@ -568,7 +568,7 @@ def get_unprocessed_prs(c, prs, cutoffdays=30):
     sent_prs = get_all_thanked_prs(c, cutoffdays)
     new_prs = list()
     for row in prs:
-        if row[0] not in sent_prs:
+        if row[1] not in sent_prs:
             new_prs.append(row)
     return new_prs
 
