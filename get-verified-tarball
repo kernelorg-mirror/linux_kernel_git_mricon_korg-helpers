@@ -61,7 +61,7 @@ VER=${1}
 if [[ -z ${VER} ]]; then
     # Assume you want the latest stable
     VER=$(${CURLBIN} -sL https://www.kernel.org/finger_banner \
-          | grep 'latest stable' \
+          | grep 'latest stable version' \
           | awk -F: '{gsub(/ /,"", $0); print $2}')
 fi
 if [[ -z ${VER} ]]; then
