@@ -838,7 +838,10 @@ if __name__ == '__main__':
             '[%(asctime)s] %(message)s')
         ch.setFormatter(formatter)
 
-        ch.setLevel(logging.DEBUG)
+        if cmdargs.verbose:
+            ch.setLevel(logging.DEBUG)
+        else:
+            ch.setLevel(logging.INFO)
         logger.addHandler(ch)
 
     ch = logging.StreamHandler()
