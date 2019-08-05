@@ -39,9 +39,9 @@ DB_VERSION = 2
 
 # Case doesn't matter
 PULL_SUBJECT_RE = [
-    re.compile(r'^\[GIT', re.IGNORECASE),
-    re.compile(r'^\[PULL', re.IGNORECASE),
-    re.compile(r'^\[PLEASE PULL', re.IGNORECASE),
+    re.compile(r'^\S*:?\s*\[GIT', re.IGNORECASE),
+    re.compile(r'^\S*:?\s*\[PULL', re.IGNORECASE),
+    re.compile(r'^\S*:?\s*\[PLEASE PULL', re.IGNORECASE),
 ]
 
 # I like these
