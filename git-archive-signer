@@ -7,6 +7,7 @@
 
 # Don't change this if you want this to actually work
 NOTEREF="refs/notes/signatures/tar"
+NOTEREF_MINISIG="refs/notes/minisig/tar"
 
 # Pass the tag as the only parameter, otherwise we grab the latest
 # annotated tag we find. You may also pass "list" to list all tags that
@@ -27,6 +28,8 @@ fi
 
 # Change this if your gpg2 is elsewhere
 GPGBIN="/usr/bin/gpg2"
+# Change this if your minisign is elsewhere
+MINISIGNBIN="/usr/bin/minisign"
 
 # If you want to use a specific key (or subkey) instead of the default,
 # then edit and uncomment this line. If you have multiple valid signing
@@ -86,8 +89,13 @@ if [[ ! -z ${USEKEY} ]]; then
     GPGBIN="${GPGBIN} -u ${USEKEY}"
 fi
 
+# We put the tarball into a temp file, in case we need to minisign it, too
+TMP_ARCHIVE=$(mktemp)
+echo -n "Running ${GIT_ARCHIVE_CMD}..."
+${GIT_ARCHIVE_CMD} > ${TMP_ARCHIVE}
+echo "done"
 git notes --ref=${NOTEREF} add -C "$(
-    ${GIT_ARCHIVE_CMD} | ${GPGBIN} -a -b -o - \
+    cat ${TMP_ARCHIVE} | ${GPGBIN} -a -b -o - \
         --comment "This signature is for the .tar version of the archive" \
         --comment "${GIT_ARCHIVE_CMD}" \
         --comment "${GIT_VERSION}" |
@@ -95,12 +103,72 @@ git notes --ref=${NOTEREF} add -C "$(
 
 if [[ $? != 0 ]]; then
     echo "git notes exited with error"
+    rm -f ${TMP_ARCHIVE}
     exit 1
 fi
 
 echo
 git --no-pager notes --ref=${NOTEREF} show ${TAG}
 echo
+
+USE_MINISIGN="$(git config --get archive-signer.use-minisign)"
+if [[ ${USE_MINISIGN} == "yes" ]]; then
+    if git notes --ref=${NOTEREF_MINISIG} list ${TAG} >/dev/null 2>&1; then
+        echo "Minisign note for ${TAG} already exists!"
+        echo "To make a new one, delete it first:"
+        echo "    git notes --ref=${NOTEREF_MINISIG} remove ${TAG}"
+        exit 1
+    fi
+    MINISIGN_CMD="${MINISIGNBIN}"
+    MINISIGN_COMMENT="This minisign signature is for the .tar version of the archive"
+    MINISIGN_TRUSTED="Generated with ${GIT_VERSION} using: ${GIT_ARCHIVE_CMD}"
+    # If minisign-keyfile is set, we'll use that key instead of the default
+    MINISIGN_KEY="$(git config --get archive-signer.minisign-key)"
+    if [[ ! -z ${MINISIGN_KEY} ]]; then
+        MINISIGN_CMD="${MINISIGN_CMD} -s $(eval echo ${MINISIGN_KEY})"
+    fi
+    # If you don't want to type in the minisign passphrase, you can
+    # store it gpg-encrypted and set archive.signer.minisign-gpg-passphrase to
+    # point at the file containing the encrypted passphrase.
+    # To generate, use:
+    #     echo passphrase | gpg -r YOURKEYID -e > minisign-passphrase.gpg
+    MINISIGN_PASSPHRASE="$(git config --get archive-signer.minisign-gpg-passphrase)"
+    MINISIGN_OUT=$(mktemp)
+    echo "Generating minisign signature"
+    if [[ -z ${MINISIGN_PASSPHRASE} ]]; then
+        ${MINISIGN_CMD} -S \
+            -c "${MINISIGN_COMMENT}" -t "${MINISIGN_TRUSTED}" \
+            -x ${MINISIGN_OUT} -m ${TMP_ARCHIVE}
+    else
+        echo "Using the gpg-encrypted passphrase from ${MINISIGN_PASSPHRASE}"
+        ${GPGBIN} -q -d $(eval echo ${MINISIGN_PASSPHRASE}) \
+            | ${MINISIGN_CMD} -S \
+                -c "${MINISIGN_COMMENT}" -t "${MINISIGN_TRUSTED}" \
+                -x ${MINISIGN_OUT} -m ${TMP_ARCHIVE}
+    fi
+    if [[ ! -s ${MINISIGN_OUT} ]]; then
+        # Assume minisign process went wrong
+        echo "Minisign signature is missing, aborting!"
+        rm -f ${TMP_ARCHIVE}
+        exit 1
+    fi
+    git notes --ref=${NOTEREF_MINISIG} add \
+        -C "$(cat ${MINISIGN_OUT} | git hash-object -w --stdin)" "${TAG}"
+
+    if [[ $? != 0 ]]; then
+        echo "git notes exited with error"
+        rm -f ${TMP_ARCHIVE} ${MINISIGN_OUT}
+        exit 1
+    fi
+
+    echo "-----"
+    git --no-pager notes --ref=${NOTEREF_MINISIG} show ${TAG}
+    echo "-----"
+
+    rm -f ${MINISIGN_OUT}
+fi
+
+rm -f ${TMP_ARCHIVE}
 
 echo -n "Push to ${REMOTE}? [Y/n] "
 read YN
