@@ -121,7 +121,7 @@ if [[ ${USE_MINISIGN} == "yes" ]]; then
     fi
     MINISIGN_CMD="${MINISIGNBIN}"
     MINISIGN_COMMENT="This minisign signature is for the .tar version of the archive"
-    MINISIGN_TRUSTED="Generated with ${GIT_VERSION} using: ${GIT_ARCHIVE_CMD}"
+    MINISIGN_TRUSTED="$(date -u), ${GIT_VERSION}, using: ${GIT_ARCHIVE_CMD}"
     # If minisign-keyfile is set, we'll use that key instead of the default
     MINISIGN_KEY="$(git config --get archive-signer.minisign-key)"
     if [[ ! -z ${MINISIGN_KEY} ]]; then
@@ -164,6 +164,7 @@ if [[ ${USE_MINISIGN} == "yes" ]]; then
     echo "-----"
     git --no-pager notes --ref=${NOTEREF_MINISIG} show ${TAG}
     echo "-----"
+    echo
 
     rm -f ${MINISIGN_OUT}
 fi
