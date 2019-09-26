@@ -581,6 +581,10 @@ def to_or_cc_contains(tocc, addrs):
     return False
 
 
+def format_addrs(pairs):
+    return ', '.join([email.utils.formataddr(pair) for pair in pairs])
+
+
 def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id, config, dryrun, nomail):
     # Make sure we haven't thanked for it already
     c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=? AND refname=?',
@@ -614,10 +618,11 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
             logger.debug('Skipping this Pull Request')
             return None
 
-    dest = email.utils.getaddresses(orig.get_all('from', []))
-    dest += email.utils.getaddresses(orig.get_all('to', []))
-    dest += email.utils.getaddresses(orig.get_all('cc', []))
-    targets = [chunk[1] for chunk in dest]
+    allfrom = email.utils.getaddresses(orig.get_all('from', []))
+    allto = email.utils.getaddresses(orig.get_all('to', []))
+    allcc = email.utils.getaddresses(orig.get_all('cc', []))
+
+    targets = [chunk[1] for chunk in allfrom+allto+allcc]
 
     if 'onlyifto' in config:
         # Don't send anything unless the required email is in to or cc
@@ -685,15 +690,11 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     # Set to and cc
     if 'onlyto' in config:
         msg['To'] = config['onlyto']
-        # Override dest/targets
+        # Override targets
         targets = [config['onlyto']]
     else:
-        msg['To'] = orig['From']
-        origcc = orig.get('cc', '')
-        if origcc:
-            msg['Cc'] = orig['To'] + ', ' + orig['Cc']
-        else:
-            msg['Cc'] = orig['To']
+        msg['To'] = format_addrs(allfrom)
+        msg['Cc'] = format_addrs(allto+allcc)
 
     if 'alwayscc' in config:
         if msg.get('cc', ''):
