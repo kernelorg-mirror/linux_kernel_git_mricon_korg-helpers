@@ -53,6 +53,7 @@ DB_VERSION = 1
 REST_API_VERSION = '1.1'
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
+REST_PER_PAGE = 50
 
 _project_cache = None
 
@@ -91,11 +92,14 @@ class Transport(xmlrpclib.SafeTransport):
             return xmlrpclib.Transport.make_connection(self, host)
 
     if sys.version_info[0] == 2:
+        # Python 2
+        # noinspection PyArgumentList,PyMethodOverriding
         def send_request(self, connection, handler, request_body):
             handler = '%s://%s%s' % (self.scheme, self.host, handler)
             xmlrpclib.Transport.send_request(self, connection, handler,
                                              request_body)
-    else:  # Python 3
+    else:
+        # Python 3
         def send_request(self, host, handler, request_body, debug):
             handler = '%s://%s%s' % (self.scheme, host, handler)
             return xmlrpclib.Transport.send_request(self, host, handler,
@@ -244,6 +248,50 @@ def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
         return None
 
     return [patch['id'] for patch in patches]
+
+
+def get_patchwork_pull_requests_by_project(rm, project, fromstate):
+    page = 0
+    pagedata = list()
+    prs = list()
+    more = True
+    while True:
+        if not pagedata and more:
+            page += 1
+            params = [
+                ('project', project),
+                ('archived', 'false'),
+                ('state', fromstate),
+                ('order', '-date'),
+                ('page', page),
+                ('q', '[GIT,PULL]'),
+                ('per_page', REST_PER_PAGE),
+            ]
+            logger.debug('Processing page %s', page)
+
+            pagedata = rm.get_patch_list(params)
+            if len(pagedata) < REST_PER_PAGE:
+                more = False
+
+        if not pagedata:
+            logger.debug('Finished processing all patches')
+            break
+
+        entry = pagedata.pop()
+        pull_url = entry.get('pull_url')
+        if pull_url:
+            patch_id = entry.get('id')
+            logger.debug('Found pull request: %s (%s)', pull_url, patch_id)
+            chunks = pull_url.split()
+            pull_host = chunks[0]
+            if len(chunks) > 1:
+                pull_refname = chunks[1]
+            else:
+                pull_refname = 'master'
+
+            prs.append((pull_host, pull_refname, patch_id))
+
+    return prs
 
 
 def project_id_by_name(rpc, name):
@@ -562,6 +610,7 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
         # If we have a cover letter, then the reference is the msgid of the cover letter,
         # else the reference is the msgid of the first patch
         patches = sdata.get('patches')
+        is_pull_request = False
         if sdata.get('cover_letter'):
             reference = sdata.get('cover_letter').get('msgid')
             fullcover = rm.get_cover(sdata.get('cover_letter').get('id'))
@@ -572,6 +621,8 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
             fullpatch = rm.get_patch(patches[0].get('id'))
             headers = fullpatch.get('headers')
             content = fullpatch.get('content')
+            if fullpatch.get('pull_url'):
+                is_pull_request = True
 
         submitter = sdata.get('submitter')
         if 'neverto' in config:
@@ -616,10 +667,17 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                     continue
 
         logger.debug('Preparing a notification for %s', submitter.get('email'))
+        if is_pull_request:
+            reqtype = 'pull request'
+        elif len(sdata.get('patches')) > 1:
+            reqtype = 'series'
+        else:
+            reqtype = 'patch'
+
         body = (
             'Hello:\n\n'
             'This %s was applied to %s (%s).\n\n'
-        ) % ('series' if len(sdata.get('patches')) > 1 else 'patch', config['treename'], refname)
+        ) % (reqtype, config['treename'], refname)
         body += 'On %s you wrote:\n' % headers.get('Date')
 
         if content:
@@ -713,11 +771,12 @@ def housekeeping(rm, settings, nomail, dryrun):
             while True:
                 if not pagedata:
                     page += 1
-                    logger.info('  grabbing page %d', page)
+                    logger.debug('  grabbing page %d', page)
                     params = [
                         ('project', project),
                         ('order', '-date'),
                         ('page', page),
+                        ('per_page', REST_PER_PAGE)
                     ]
                     pagedata = rm.get_series_list(params)
 
@@ -834,6 +893,7 @@ def housekeeping(rm, settings, nomail, dryrun):
                         ('archived', 'false'),
                         ('state', 'new'),
                         ('order', 'date'),
+                        ('per_page', REST_PER_PAGE)
                     ]
 
                     if dryrun:
@@ -947,7 +1007,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
     db_heads = db_get_repo_heads(c)
 
-    newrevs = git_get_new_revs(repo, db_heads, git_heads)
+    newrevs = git_get_new_revs(repo, db_heads, git_heads, merges=True)
     config = get_config_from_repo(repo, r'patchwork\..*', cmdconfig)
 
     global _project_cache
@@ -986,6 +1046,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
         rpwhashes = dict()
         rgithashes = dict()
+        have_merges = False
         for refname, revlines in newrevs.items():
             if refname not in statemap:
                 # We don't care about this ref
@@ -994,6 +1055,10 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
             rpwhashes[refname] = list()
             logger.debug('Looking at %s', refname)
             for rev, logline in revlines:
+                if logline.find('Merge') == 0:
+                    have_merges = True
+                    rpwhashes[refname].append((rev, logline, None))
+                    continue
                 diff = git_get_rev_diff(repo, rev)
                 pwhash = get_patchwork_hash(diff)
                 git_patch_id = git_get_patch_id(diff)
@@ -1014,6 +1079,12 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
             logger.info('Processing "%s/%s"', server, project)
             project_id = project_id_by_name(rpc, project)
 
+            if have_merges:
+                logger.info('Merge commit found, loading up pull requests')
+                prs = get_patchwork_pull_requests_by_project(rm, project, fromstate)
+            else:
+                prs = list()
+
             for refname, hashpairs in rpwhashes.items():
                 logger.info('Analyzing %d revisions', len(hashpairs))
                 # Patchwork lowercases state name and replaces spaces with dashes
@@ -1022,6 +1093,27 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                 # We create patch_id->rev mapping first
                 revs = dict()
                 for rev, logline, pwhash in hashpairs:
+                    if pwhash is None:
+                        # This is a merge.
+                        if logline.find('://') < 0:
+                            # not a pull request merge, ignore
+                            continue
+                        matches = re.search(r'Merge\s(\S+)\s[\'"](\S+)[\'"]\sof\s(.*)$', logline)
+                        if not matches:
+                            continue
+                        m_obj = matches.group(1)
+                        m_refname = matches.group(2)
+                        m_host = matches.group(3)
+
+                        logger.debug('Looking for %s %s %s', m_obj, m_refname, m_host)
+
+                        for pull_host, pull_refname, patch_id in prs:
+                            if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
+                                logger.debug('Found matching pull request in %s (id: %s)', logline, patch_id)
+                                revs[patch_id] = rev
+                                break
+                        continue
+
                     # Do we have a matching hash on the server?
                     logger.info('Matching: %s', logline)
                     # Theoretically, should only return one, but we play it safe and
@@ -1126,6 +1218,8 @@ if __name__ == '__main__':
                         help='Do not mail anything, but store database entries.')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                        help='Be more verbose in logging output')
 
     cmdargs = parser.parse_args()
 
@@ -1137,7 +1231,10 @@ if __name__ == '__main__':
             '[%(asctime)s] %(message)s')
         ch.setFormatter(formatter)
 
-        ch.setLevel(logging.DEBUG)
+        if cmdargs.verbose:
+            ch.setLevel(logging.DEBUG)
+        else:
+            ch.setLevel(logging.INFO)
         logger.addHandler(ch)
 
     ch = logging.StreamHandler()
