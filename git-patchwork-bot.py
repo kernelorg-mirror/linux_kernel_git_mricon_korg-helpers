@@ -728,10 +728,7 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 targets += config['alwaysbcc'].split(',')
             if 'cclist' in config and config['cclist'] == 'true':
                 targets.append(project.get('list_email'))
-                if 'Cc' in msg:
-                    msg['Cc'] = '%s,%s' % (msg['Cc'], project.get('list_email'))
-                else:
-                    msg['Cc'] = project.get('list_email')
+                msg['Cc'] = project.get('list_email')
 
         if not nomail:
             logger.debug('Message follows')
@@ -1054,7 +1051,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
 
         rpwhashes = dict()
         rgithashes = dict()
-        have_merges = False
+        have_prs = False
         for refname, revlines in newrevs.items():
             if refname not in statemap:
                 # We don't care about this ref
@@ -1063,8 +1060,8 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
             rpwhashes[refname] = list()
             logger.debug('Looking at %s', refname)
             for rev, logline in revlines:
-                if logline.find('Merge') == 0:
-                    have_merges = True
+                if logline.find('Merge') == 0 and logline.find('://') > 0:
+                    have_prs = True
                     rpwhashes[refname].append((rev, logline, None))
                     continue
                 diff = git_get_rev_diff(repo, rev)
@@ -1087,8 +1084,8 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
             logger.info('Processing "%s/%s"', server, project)
             project_id = project_id_by_name(rpc, project)
 
-            if have_merges:
-                logger.info('Merge commit found, loading up pull requests')
+            if have_prs:
+                logger.info('PR merge commit found, loading up pull requests')
                 prs = get_patchwork_pull_requests_by_project(rm, project, fromstate)
             else:
                 prs = list()
@@ -1101,11 +1098,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                 # We create patch_id->rev mapping first
                 revs = dict()
                 for rev, logline, pwhash in hashpairs:
-                    if pwhash is None:
-                        # This is a merge.
-                        if logline.find('://') < 0:
-                            # not a pull request merge, ignore
-                            continue
+                    if have_prs and pwhash is None:
                         matches = re.search(r'Merge\s(\S+)\s[\'"](\S+)[\'"]\sof\s(.*)$', logline)
                         if not matches:
                             continue
