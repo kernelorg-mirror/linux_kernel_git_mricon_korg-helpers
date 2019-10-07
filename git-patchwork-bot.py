@@ -264,7 +264,7 @@ def get_patchwork_pull_requests_by_project(rm, project, fromstate):
                 ('state', fromstate),
                 ('order', '-date'),
                 ('page', page),
-                ('q', '[GIT,PULL]'),
+                ('q', 'GIT,PULL'),
                 ('per_page', REST_PER_PAGE),
             ]
             logger.debug('Processing page %s', page)
@@ -625,6 +625,8 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                 is_pull_request = True
 
         submitter = sdata.get('submitter')
+        project = sdata.get('project')
+
         if 'neverto' in config:
             neverto = config['neverto'].split(',')
             if submitter.get('email') in neverto:
@@ -721,9 +723,15 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
 
             if 'alwayscc' in config:
                 msg['Cc'] = config['alwayscc']
-                targets.append(config['alwayscc'].split(','))
+                targets += config['alwayscc'].split(',')
             if 'alwaysbcc' in config:
-                targets.append(config['alwaysbcc'].split(','))
+                targets += config['alwaysbcc'].split(',')
+            if 'cclist' in config and config['cclist'] == 'true':
+                targets.append(project.get('list_email'))
+                if 'Cc' in msg:
+                    msg['Cc'] = '%s,%s' % (msg['Cc'], project.get('list_email'))
+                else:
+                    msg['Cc'] = project.get('list_email')
 
         if not nomail:
             logger.debug('Message follows')
