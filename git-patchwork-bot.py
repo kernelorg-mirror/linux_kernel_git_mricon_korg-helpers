@@ -270,7 +270,7 @@ def get_patchwork_pull_requests_by_project(rm, project, fromstate):
             logger.debug('Processing page %s', page)
 
             pagedata = rm.get_patch_list(params)
-            if len(pagedata) < REST_PER_PAGE:
+            if not pagedata or len(pagedata) < REST_PER_PAGE:
                 more = False
 
         if not pagedata:
@@ -1099,7 +1099,7 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
                 revs = dict()
                 for rev, logline, pwhash in hashpairs:
                     if have_prs and pwhash is None:
-                        matches = re.search(r'Merge\s(\S+)\s[\'"](\S+)[\'"]\sof\s(.*)$', logline)
+                        matches = re.search(r'Merge\s(\S+)\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
                         if not matches:
                             continue
                         m_obj = matches.group(1)
