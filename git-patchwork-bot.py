@@ -264,7 +264,7 @@ def get_patchwork_pull_requests_by_project(rm, project, fromstate):
                 ('state', fromstate),
                 ('order', '-date'),
                 ('page', page),
-                ('q', 'GIT,PULL'),
+                ('q', 'PULL'),
                 ('per_page', REST_PER_PAGE),
             ]
             logger.debug('Processing page %s', page)
