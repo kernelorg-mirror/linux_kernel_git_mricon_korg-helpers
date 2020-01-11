@@ -433,6 +433,8 @@ def parse_pull_requests(pirepo, topdir, dryrun):
         # that returns the revs from the beginning of history
         logger.info('Preparing for shard roll-over to %s.git', maxshard)
         db_save_repo_heads(c, (('refs/heads/master', ''),), maxshard)
+        if not dryrun:
+            dbconn.commit()
         # Now let's finish with the previous shard
         maxshard -= 1
         # Refresh these
