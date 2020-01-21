@@ -5,8 +5,8 @@
 # like mutt.
 #
 # Simplest configuration is to set the following in your git config file,
-# either in a single repository, or globally in ~/.gitconfig if you want
-# a single developer feed for all your work.
+# either per repository, or globally in ~/.gitconfig if you want a single
+# developer feed for all your work.
 #
 # [sendemail]
 #   smtpserver = /path/to/bin/sendmail-pi-feed
@@ -22,10 +22,18 @@
 #   # to the public-inbox feed; leave undefined otherwise
 #   sendmail = /usr/sbin/sendmail
 #
-# Once this is done, run "sendmail-pi-feed --init" to create the feed.
+# Once this is done, run "sendmail-pi-feed --init" to initialize the feed.
 # During the init process, you will be asked whether you would like to
 # PGP-sign the commits, which is strongly recommended if you already
 # have PGP-signing set up on your system.
+#
+# After the --init is complete, you can use "git send-email" as you
+# normally would and all patches will be automatically added to the
+# feed. You can then publish the feed on any git hosting service by
+# setting a remote and performing a git push.
+#
+# If you would like to auto-push the feed, you can add an appropriate
+# post-commit hook.
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
