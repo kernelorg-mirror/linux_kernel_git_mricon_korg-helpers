@@ -1,0 +1,95 @@
+#!/bin/bash
+# Simplest possible way to generate a personal public-inbox feed
+# using just bash and git. It is intended for use with git-send-email,
+# but can be used with any tool that accepts custom sendmail command paths,
+# like mutt.
+#
+# Simplest configuration is to set the following in your git config file,
+# either in a single repository, or globally in ~/.gitconfig if you want
+# a single developer feed for all your work.
+#
+# [sendemail]
+#   smtpserver = /path/to/bin/sendmail-pi-feed
+#
+# [sendemail "sendmail-pi-feed"]
+#   # the directory where to put the feed (will be created with --init)
+#   inboxdir = /path/to/toplevel/public-inbox-dir
+#   # if not set, the epoch will be 0, which is strongly suggested;
+#   # if you increment it for some reason, make sure you don't skip numbers
+#   epoch = 0
+#   # if defined, will pipe the stdin to this command as well, in case
+#   # you want to actually send out the patches in addition to writing them
+#   # to the public-inbox feed; leave undefined otherwise
+#   sendmail = /usr/sbin/sendmail
+#
+# Once this is done, run "sendmail-pi-feed --init" to create the feed.
+# During the init process, you will be asked whether you would like to
+# PGP-sign the commits, which is strongly recommended if you already
+# have PGP-signing set up on your system.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+#
+# Do we have some basic configuration?
+INBOXDIR="$(git config --get sendemail.sendmail-pi-feed.inboxdir)"
+if [[ -z "$INBOXDIR" ]]; then
+    echo "You need to add config entries to git-config first"
+    exit 1
+fi
+
+SENDMAIL="$(git config --get sendemail.sendmail-pi-feed.sendmail)"
+EPOCH="$(git config --get sendemail.sendmail-pi-feed.epoch)"
+
+if [[ -z $EPOCH ]]; then
+    EPOCH=0
+fi
+
+PIGITDIR="$INBOXDIR/$EPOCH"
+PIGITDIR="${PIGITDIR/#\~/$HOME}"
+
+if [[ $1 == '--init' ]]; then
+    if ! mkdir -p "$PIGITDIR"; then
+        echo "Could not mkdir $PIGITDIR"
+        exit 1
+    fi
+    cd "$PIGITDIR" || exit 1
+    git init
+    read -r -p "GPG-sign your feed? [Y/n] " YN
+    if [[ $YN != "n" ]]; then
+        git config commit.gpgSign true
+    fi
+    exit 0
+fi
+
+if [[ ! -d $PIGITDIR/.git ]]; then
+    echo "ERROR: $PIGITDIR/.git does not exist."
+    echo "       Run this first: $0 --init"
+    exit 1
+fi
+
+cd "$PIGITDIR" || exit 1
+cat > m
+
+# Grab the subject line and other commit info
+LOGLINE=$(grep "^Subject: " m | head -n 1 | sed 's/^Subject: //')
+AUTHOR=$(grep "^From: " m | head -n 1 | sed 's/^From: //')
+DATE=$(grep "^Date: " m | head -n 1 | sed 's/^Date: //')
+if [[ -z $LOGLINE ]] || [[ -z $AUTHOR ]] || [[ -z $DATE ]]; then
+    echo "Could not find Subject/From/Date lines in stdin. Bailing out."
+    git reset --hard
+    git clean -f -d -x
+    exit 1
+fi
+
+git add m
+if ! git commit --author "$AUTHOR" --date "$DATE" -m "$LOGLINE"; then
+    echo "ERROR: git-commit failed. Check the messages above"
+    exit $?
+fi
+
+if [[ -n $SENDMAIL ]]; then
+    echo "Invoking: $SENDMAIL"
+    $SENDMAIL "$@" < m
+fi
+
+echo "Remember to push $PIGITDIR"
