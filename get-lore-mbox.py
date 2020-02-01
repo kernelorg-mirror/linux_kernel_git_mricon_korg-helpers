@@ -180,7 +180,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
             if matches:
                 new_vn = int(matches.groups()[0])
 
-        if new_vn != vn:
+        if vn is None or new_vn > vn:
             if new_vn != 1:
                 logger.info('Found new series version: v%s', new_vn)
             if wantver is None or wantver == new_vn:
