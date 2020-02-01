@@ -156,10 +156,10 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
     for key, msg in mbx.items():
         msgid = get_clean_msgid(msg)
         msgid_map[msgid] = key
-        subject = msg['Subject'].replace('\n', '')
+        subject = re.sub(r'\s+', ' ', msg['Subject'])
 
         # Start by looking at prefixes in the subject
-        matches = re.search(r'\[([^\]]+)\]', subject)
+        matches = re.search(r'\[PATCH([^\]]+)\]', subject, re.IGNORECASE)
         if not matches:
             # Ignoring this message
             continue
@@ -207,10 +207,12 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
             # skip to the next message
         # Do we have a '^---' followed by '^+++' in the body anywhere?
         if re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
-            # Contains a diff, so keep it and move to next
-            am_kept.append(key)
-            sorted_keys[cur_count] = key
-            continue
+            # Contains a diff
+            # Do we already have a match for this, though?
+            if sorted_keys[cur_count] is None:
+                am_kept.append(key)
+                sorted_keys[cur_count] = key
+                continue
         # Do we have something that looks like a new trailer?
         matches = re.search(r'^\s*([\w-]+: .*<\S+>)\s*$', body, re.MULTILINE)
         if not matches:
@@ -242,7 +244,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
                 have_missing = True
         else:
             msg = mbx[key]
-            subject = msg['Subject'].replace('\n', '')
+            subject = re.sub(r'\s+', ' ', msg['Subject'])
             logger.critical('  %s', subject)
             if key in trailer_map:
                 msg = git_add_trailers(msg, trailer_map[key])
