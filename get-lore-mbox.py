@@ -17,7 +17,7 @@ import re
 import requests
 import gzip
 
-logger = logging.getLogger('lorify')
+logger = logging.getLogger('get-lore-mbox')
 
 _DEFAULT_CONFIG = {
     'midmask': 'https://lore.kernel.org/r/%s',
@@ -63,7 +63,7 @@ def git_run_command(gitdir, args, stdin=None, logstderr=False):
 
 def get_config_from_git():
     gitconfig = _DEFAULT_CONFIG
-    args = ['config', '-z', '--get-regexp', r'lorify\..*']
+    args = ['config', '-z', '--get-regexp', r'get-lore-mbox\..*']
     out = git_run_command(None, args)
     if not out:
         return gitconfig
@@ -124,15 +124,15 @@ def get_plain_part(msg):
     return body
 
 
-def git_add_trailers(mbx, key, trailers):
+def git_add_trailers(msg, trailers):
     cmdargs = ['interpret-trailers']
-    irt_bytes = mbx.get_bytes(key)
+    payload = msg.get_payload(decode=True)
     for trailer in trailers:
         logger.info('    Adding trailer: %s', trailer)
         cmdargs += ['--trailer', trailer]
-        output = git_run_command(None, args=cmdargs, stdin=irt_bytes)
-        updated_msg = email.message_from_string(output)
-        mbx[key] = updated_msg
+        output = git_run_command(None, args=cmdargs, stdin=payload)
+        msg.set_payload(output.encode('utf-8'))
+    return msg
 
 
 def get_clean_msgid(msg, header='Message-ID'):
@@ -150,6 +150,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
     msgid_map = dict()
     slug = None
     sorted_keys = [None, None]
+    trailer_map = dict()
     expected_count = 1
     vn = None
     for key, msg in mbx.items():
@@ -219,7 +220,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
         irt_id = get_clean_msgid(msg, header='In-Reply-To')
         if irt_id and irt_id in msgid_map:
             irt_key = msgid_map[irt_id]
-        git_add_trailers(mbx, irt_key, matches.groups())
+        trailer_map[irt_key] = matches.groups()
 
     if not len(am_kept):
         logger.critical('Did not find any patches to save')
@@ -240,9 +241,14 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
                 logger.error('  ERROR: missing [%s/%s]!', at, expected_count)
                 have_missing = True
         else:
-            am_mbx.add(mbx[key])
-            subject = mbx[key]['Subject'].replace('\n', '')
+            msg = mbx[key]
+            subject = msg['Subject'].replace('\n', '')
             logger.critical('  %s', subject)
+            if key in trailer_map:
+                msg = git_add_trailers(msg, trailer_map[key])
+                if msg['Content-Transfer-Encoding'] == 'base64':
+                    msg.replace_header('Content-Transfer-Encoding', '8bit')
+            am_mbx.add(msg)
         at += 1
 
     logger.critical('---')
@@ -268,7 +274,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
     return am_filename
 
 
-def lorify(cmdargs):
+def main(cmdargs):
     logger.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler()
@@ -309,4 +315,4 @@ if __name__ == '__main__':
                         help='Get a specific version of the patch/series (use with -a)')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
-    lorify(parser.parse_args())
+    main(parser.parse_args())
