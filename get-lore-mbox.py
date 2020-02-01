@@ -13,6 +13,8 @@ import email.utils
 import subprocess
 import logging
 import re
+import fnmatch
+import time
 
 import requests
 import gzip
@@ -23,6 +25,25 @@ _DEFAULT_CONFIG = {
     'midmask': 'https://lore.kernel.org/r/%s',
     'linkmask': 'https://lore.kernel.org/r/%s',
 }
+
+WANTHDRS = {'sender',
+            'from',
+            'to',
+            'cc',
+            'subject',
+            'date',
+            'message-id',
+            'resent-message-id',
+            'reply-to',
+            'in-reply-to',
+            'references',
+            'mime-*',
+            'list-id',
+            'content-*',
+            'errors-to',
+            'x-mailing-list',
+            'resent-to',
+            }
 
 
 def git_get_command_lines(gitdir, args):
@@ -90,7 +111,7 @@ def get_msgid_from_stdin():
     sys.exit(1)
 
 
-def get_pi_thread_by_msgid(msgid, config, outdir='.'):
+def get_pi_thread_by_msgid(msgid, config, outdir='.', wantname=None):
     # Grab the head from lore, to see where we are redirected
     midmask = config['midmask'] % msgid
     logger.info('Looking up %s', midmask)
@@ -101,15 +122,18 @@ def get_pi_thread_by_msgid(msgid, config, outdir='.'):
     canonical = resp.headers['Location'].rstrip('/')
     resp.close()
     t_mbx_url = '%s/t.mbox.gz' % canonical
-    logger.critical('Grabbing thread from %s', t_mbx_url)
+    logger.info('Grabbing thread from %s', t_mbx_url)
     resp = requests.get(t_mbx_url)
     t_mbox = gzip.decompress(resp.content)
-    # Save it into msgid.mbox
-    savefile = '%s.t.mbx' % msgid
-    savefile = os.path.join(outdir, savefile)
+    if wantname:
+        savefile = os.path.join(outdir, wantname)
+    else:
+        # Save it into msgid.mbox
+        savefile = '%s.t.mbx' % msgid
+        savefile = os.path.join(outdir, savefile)
     with open(savefile, 'wb') as fh:
+        logger.debug('Saving %s', savefile)
         fh.write(t_mbox)
-        logger.info('Saved thread into %s', savefile)
     return savefile
 
 
@@ -127,15 +151,15 @@ def get_plain_part(msg):
     return body
 
 
-def git_add_trailers(msg, trailers):
+def git_add_trailers(body, trailers):
     cmdargs = ['interpret-trailers']
-    payload = msg.get_payload(decode=True)
     for trailer in trailers:
-        logger.info('    Adding trailer: %s', trailer)
-        cmdargs += ['--trailer', trailer]
-        output = git_run_command(None, args=cmdargs, stdin=payload)
-        msg.set_payload(output.encode('utf-8'))
-    return msg
+        # Check if this trailer is already in the body
+        if body.find(trailer) < 0:
+            logger.info('    Adding trailer: %s', trailer)
+            cmdargs += ['--trailer', trailer]
+        output = git_run_command(None, args=cmdargs, stdin=body.encode('utf-8'))
+    return output
 
 
 def get_clean_msgid(msg, header='Message-ID'):
@@ -145,13 +169,14 @@ def get_clean_msgid(msg, header='Message-ID'):
     return msgid
 
 
-def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
+def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
     mbx = mailbox.mbox(mboxfile)
     count = len(mbx)
     logger.info('Analyzing %s messages in the thread', count)
     am_kept = list()
     msgid_map = dict()
     slug = None
+    cover_key = None
     sorted_keys = [None, None]
     trailer_map = dict()
     expected_count = 1
@@ -164,6 +189,15 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
         # Start by looking at prefixes in the subject
         matches = re.search(r'\[PATCH([^\]]+)\]', subject, re.IGNORECASE)
         if not matches:
+            # if the key is 0, it may be a cover letter. Look for
+            # presence of a diffstat
+            if key == 0:
+                body = get_plain_part(msg)
+                if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', body, re.MULTILINE | re.IGNORECASE):
+                    # Looks like a cover letter, so keep it in mind, unless we find
+                    # something else better suited to be a cover letter
+                    cover_key = key
+                    am_kept.append(key)
             # Ignoring this message
             continue
         cur_count = 1
@@ -182,7 +216,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
 
         if vn is None or new_vn > vn:
             if new_vn != 1:
-                logger.info('Found new series version: v%s', new_vn)
+                logger.debug('Found new series version: v%s', new_vn)
             if wantver is None or wantver == new_vn:
                 # Blow away anything we currently have in sorted_keys
                 sorted_keys = [None] * (expected_count + 1)
@@ -195,15 +229,21 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
             logger.info('  Ignoring v%s: %s', vn, subject)
             continue
 
-        # We use a "slug" for mbox name, based on the subject
+        # We use a "slug" for mbox name, based on the date and author
         if not slug:
-            slug = re.sub(r'\s*\[.*?\]\s*', '', subject).lower()
-            slug = re.sub(r'\W+', '_', slug).strip('_')
+            msgdate = email.utils.parsedate_tz(str(msg['Date']))
+            prefix = time.strftime('%Y%m%d', msgdate[:9])
+            authorline = email.utils.getaddresses(msg.get_all('from', []))[0]
+            if authorline[0]:
+                author = re.sub(r'\W+', '_', authorline[0]).strip('_').lower()
+            else:
+                author = re.sub(r'\W+', '_', authorline[1]).strip('_').lower()
+            slug = '%s_%s' % (prefix, author)
             if vn != 1:
                 slug = 'v%s_%s' % (vn, slug)
         body = get_plain_part(msg)
-        logger.info('  Processing: %s', subject)
-        if re.search(r'\D0+/\d+', subject) and sorted_keys[0] is None:
+        logger.debug('  Processing: %s', subject)
+        if cur_count == 0 and sorted_keys[0] is None:
             am_kept.append(key)
             sorted_keys[cur_count] = key
             continue
@@ -228,19 +268,30 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
         trailer_map[irt_key] = matches.groups()
 
     if not len(am_kept):
-        logger.critical('Did not find any patches to save')
+        logger.info('Did not find any patches to save')
         return None
 
-    am_filename = os.path.join(outdir, '%s.mbx' % slug)
+    if not wantname:
+        am_filename = os.path.join(outdir, '%s.mbx' % slug)
+    else:
+        am_filename = os.path.join(outdir, wantname)
+        if wantname.find('.') < 0:
+            slug = wantname
+        else:
+            slug = '.'.join(wantname.split('.')[:-1])
 
     if os.path.exists(am_filename):
         os.unlink(am_filename)
     am_mbx = mailbox.mbox(am_filename)
     at = 0
-    logger.critical('---')
+    logger.info('---')
     logger.critical('Writing %s', am_filename)
     have_missing = False
     for key in sorted_keys:
+        if at == 0 and key is None and cover_key is not None:
+            # Use the best candidate for the cover letter
+            key = cover_key
+
         if key is None:
             if at != 0:
                 logger.error('  ERROR: missing [%s/%s]!', at, expected_count)
@@ -248,32 +299,57 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None):
         else:
             msg = mbx[key]
             subject = re.sub(r'\s+', ' ', msg['Subject'])
-            logger.critical('  %s', subject)
+            logger.info('  %s', subject)
+            body = get_plain_part(msg)
             if key in trailer_map:
-                msg = git_add_trailers(msg, trailer_map[key])
-                if msg['Content-Transfer-Encoding'] == 'base64':
-                    msg.replace_header('Content-Transfer-Encoding', '8bit')
+                body = git_add_trailers(body, trailer_map[key])
+            msg.set_payload(body.encode('utf-8'))
+            if msg['Content-Transfer-Encoding'] not in (None, '8bit'):
+                msg.replace_header('Content-Transfer-Encoding', '8bit')
+
+            newhdrs = []
+            for hdrname, hdrval in list(msg._headers):
+                lhdrname = hdrname.lower()
+                wanthdr = False
+                for hdrmatch in WANTHDRS:
+                    if fnmatch.fnmatch(lhdrname, hdrmatch):
+                        wanthdr = True
+                        break
+                if wanthdr:
+                    newhdrs.append((hdrname, hdrval))
+
+            msg._headers = newhdrs
             am_mbx.add(msg)
         at += 1
+    logger.critical('Total patches: %s', len(am_mbx))
 
-    logger.critical('---')
+    logger.info('---')
     if have_missing:
         logger.critical('WARNING: Thread incomplete, please check above!')
     top_msgid = get_clean_msgid(am_mbx[0])
     linkurl = config['linkmask'] % top_msgid
-    logger.critical('Link: %s', linkurl)
+    logger.info('Link: %s', linkurl)
     # Look for base-commit line in the first message
     body = get_plain_part(am_mbx[0])
-    matches = re.search(r'^\s*base-commit: (\S+)\s*$', body, re.MULTILINE)
+    matches = re.search(r'base-commit: .*?([0-9a-f]+)', body, re.MULTILINE)
+    base_commit = None
+
     if matches:
         base_commit = matches.groups()[0]
-        logger.critical('Base-commit included, you can branch using:')
-        logger.critical('  git checkout -b %s %s', slug, base_commit)
-        logger.critical('  git am %s', am_filename)
     else:
-        logger.critical('No base-commit information included, sorry.')
-        logger.critical('  git checkout -b %s master', slug)
-        logger.critical('  git am %s', am_filename)
+        # Try a more relaxed search
+        matches = re.search(r'based on .*?([0-9a-f]+)', body, re.MULTILINE)
+        if matches:
+            base_commit = matches.groups()[0]
+
+    if base_commit:
+        logger.info('Base-commit included, you can branch using:')
+        logger.info('  git checkout -b %s %s', slug, base_commit)
+        logger.info('  git am %s', am_filename)
+    else:
+        logger.info('No base-commit information included, sorry.')
+        logger.info('  git checkout -b %s master', slug)
+        logger.info('  git am %s', am_filename)
     am_mbx.close()
 
     return am_filename
@@ -288,6 +364,8 @@ def main(cmdargs):
 
     if cmdargs.quiet:
         ch.setLevel(logging.CRITICAL)
+    elif cmdargs.debug:
+        ch.setLevel(logging.DEBUG)
     else:
         ch.setLevel(logging.INFO)
 
@@ -301,9 +379,18 @@ def main(cmdargs):
 
     msgid = msgid.strip('<>')
     config = get_config_from_git()
-    mboxfile = get_pi_thread_by_msgid(msgid, config, outdir=cmdargs.outdir)
+    mboxfile = get_pi_thread_by_msgid(msgid, config, outdir=cmdargs.outdir, wantname=cmdargs.wantname)
     if mboxfile and cmdargs.amready:
-        mbox_to_am(mboxfile, config, outdir=cmdargs.outdir, wantver=cmdargs.version)
+        # Move it into -thread
+        threadmbox = '%s-thread' % mboxfile
+        os.rename(mboxfile, threadmbox)
+        mbox_to_am(threadmbox, config, outdir=cmdargs.outdir, wantver=cmdargs.version,
+                   wantname=cmdargs.wantname)
+        os.unlink(threadmbox)
+    else:
+        mbx = mailbox.mbox(mboxfile)
+        logger.critical('Saved %s', mboxfile)
+        logger.critical('%s messages in the thread', len(mbx))
 
 
 if __name__ == '__main__':
@@ -318,6 +405,10 @@ if __name__ == '__main__':
                         help='Make an mbox ready for git am')
     parser.add_argument('-v', '--version', type=int, default=None,
                         help='Get a specific version of the patch/series (use with -a)')
+    parser.add_argument('-n', '--mbox-name', dest='wantname', default=None,
+                        help='Filename to name the mbox file')
+    parser.add_argument('-d', '--debug', action='store_true', default=False,
+                        help='Add more debugging info to the output')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
     main(parser.parse_args())
