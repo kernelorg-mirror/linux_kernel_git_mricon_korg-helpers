@@ -122,7 +122,7 @@ def get_pi_thread_by_msgid(msgid, config, outdir='.', wantname=None):
     canonical = resp.headers['Location'].rstrip('/')
     resp.close()
     t_mbx_url = '%s/t.mbox.gz' % canonical
-    logger.info('Grabbing thread from %s', t_mbx_url)
+    logger.critical('Grabbing thread from %s', t_mbx_url)
     resp = requests.get(t_mbx_url)
     t_mbox = gzip.decompress(resp.content)
     if wantname:
@@ -153,6 +153,7 @@ def get_plain_part(msg):
 
 def git_add_trailers(body, trailers):
     cmdargs = ['interpret-trailers']
+    output = body
     for trailer in trailers:
         # Check if this trailer is already in the body
         if body.find(trailer) < 0:
@@ -323,12 +324,12 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
         at += 1
     logger.critical('Total patches: %s', len(am_mbx))
 
-    logger.info('---')
+    logger.critical('---')
     if have_missing:
         logger.critical('WARNING: Thread incomplete, please check above!')
     top_msgid = get_clean_msgid(am_mbx[0])
     linkurl = config['linkmask'] % top_msgid
-    logger.info('Link: %s', linkurl)
+    logger.critical('Link: %s', linkurl)
     # Look for base-commit line in the first message
     body = get_plain_part(am_mbx[0])
     matches = re.search(r'base-commit: .*?([0-9a-f]+)', body, re.MULTILINE)
@@ -343,9 +344,9 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
             base_commit = matches.groups()[0]
 
     if base_commit:
-        logger.info('Base-commit included, you can branch using:')
-        logger.info('  git checkout -b %s %s', slug, base_commit)
-        logger.info('  git am %s', am_filename)
+        logger.critical('Base-commit included, you can branch using:')
+        logger.critical('  git checkout -b %s %s', slug, base_commit)
+        logger.critical('  git am %s', am_filename)
     else:
         logger.info('No base-commit information included, sorry.')
         logger.info('  git checkout -b %s master', slug)
@@ -410,5 +411,5 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Add more debugging info to the output')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
-                        help='Only output errors to the stdout')
+                        help='Be very terse outputting to the stdout')
     main(parser.parse_args())
