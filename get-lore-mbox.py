@@ -95,6 +95,9 @@ def get_pi_thread_by_msgid(msgid, config, outdir='.'):
     midmask = config['midmask'] % msgid
     logger.info('Looking up %s', midmask)
     resp = requests.head(midmask)
+    if resp.status_code < 300 or resp.status_code > 400:
+        logger.critical('That message-id is not known.')
+        return None
     canonical = resp.headers['Location'].rstrip('/')
     resp.close()
     t_mbx_url = '%s/t.mbox.gz' % canonical
@@ -299,7 +302,7 @@ def main(cmdargs):
     msgid = msgid.strip('<>')
     config = get_config_from_git()
     mboxfile = get_pi_thread_by_msgid(msgid, config, outdir=cmdargs.outdir)
-    if cmdargs.amready:
+    if mboxfile and cmdargs.amready:
         mbox_to_am(mboxfile, config, outdir=cmdargs.outdir, wantver=cmdargs.version)
 
 
