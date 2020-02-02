@@ -82,6 +82,28 @@ def git_run_command(gitdir, args, stdin=None, logstderr=False):
     return output
 
 
+def amify_msg(msg, trailers):
+    payload = msg.get_payload(decode=True)
+    if trailers:
+        payload = git_add_trailers(payload, trailers)
+    msg.set_payload(payload)
+    # Clean up headers
+    newhdrs = []
+    for hdrname, hdrval in list(msg._headers):
+        lhdrname = hdrname.lower()
+        wanthdr = False
+        for hdrmatch in WANTHDRS:
+            if fnmatch.fnmatch(lhdrname, hdrmatch):
+                wanthdr = True
+                break
+        if wanthdr:
+            if lhdrname == 'content-transfer-encoding':
+                hdrval = '8bit'
+            newhdrs.append((hdrname, hdrval))
+    msg._headers = newhdrs
+    return msg
+
+
 def get_config_from_git():
     gitconfig = _DEFAULT_CONFIG
     args = ['config', '-z', '--get-regexp', r'get-lore-mbox\..*']
@@ -151,15 +173,15 @@ def get_plain_part(msg):
     return body
 
 
-def git_add_trailers(body, trailers):
+def git_add_trailers(payload, trailers):
     cmdargs = ['interpret-trailers']
-    output = body
+    output = payload.decode('utf-8')
     for trailer in trailers:
         # Check if this trailer is already in the body
-        if body.find(trailer) < 0:
+        if output.find(trailer) < 0:
             logger.info('    Adding trailer: %s', trailer)
             cmdargs += ['--trailer', trailer]
-        output = git_run_command(None, args=cmdargs, stdin=body.encode('utf-8'))
+        output = git_run_command(None, args=cmdargs, stdin=output.encode('utf-8'))
     return output
 
 
@@ -177,28 +199,29 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
     am_kept = list()
     msgid_map = dict()
     slug = None
-    cover_key = None
+    cover_keys = dict()
     sorted_keys = [None, None]
     trailer_map = dict()
     expected_count = 1
+    cur_vn = None
     vn = None
     for key, msg in mbx.items():
         msgid = get_clean_msgid(msg)
         msgid_map[msgid] = key
         subject = re.sub(r'\s+', ' ', msg['Subject'])
+        logger.debug('Looking at msg %s: %s', key, subject)
 
         # Start by looking at prefixes in the subject
-        matches = re.search(r'\[PATCH([^\]]+)\]', subject, re.IGNORECASE)
+        matches = re.search(r'\[PATCH([^\]]*)\]', subject, re.IGNORECASE)
         if not matches:
-            # if the key is 0, it may be a cover letter. Look for
-            # presence of a diffstat
+            # if the key is 0, it may be a cover letter
             if key == 0:
                 body = get_plain_part(msg)
                 if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', body, re.MULTILINE | re.IGNORECASE):
                     # Looks like a cover letter, so keep it in mind, unless we find
                     # something else better suited to be a cover letter
-                    cover_key = key
-                    am_kept.append(key)
+                    logger.debug('  Probaby a cover letter')
+                    cover_keys[1] = key
             # Ignoring this message
             continue
         cur_count = 1
@@ -215,20 +238,22 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
             if matches:
                 new_vn = int(matches.groups()[0])
 
-        if vn is None or new_vn > vn:
+        if cur_vn is None or new_vn > cur_vn:
             if new_vn != 1:
                 logger.debug('Found new series version: v%s', new_vn)
             if wantver is None or wantver == new_vn:
                 # Blow away anything we currently have in sorted_keys
                 sorted_keys = [None] * (expected_count + 1)
                 slug = None
-            vn = new_vn
+            cur_vn = new_vn
         elif vn is None:
-            vn = new_vn
+            cur_vn = new_vn
 
-        if wantver is not None and wantver != vn:
-            logger.info('  Ignoring v%s: %s', vn, subject)
+        if wantver is not None and wantver != cur_vn:
+            logger.debug('  Ignoring v%s: %s', cur_vn, subject)
             continue
+
+        vn = cur_vn
 
         # We use a "slug" for mbox name, based on the date and author
         if not slug:
@@ -240,15 +265,18 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
             else:
                 author = re.sub(r'\W+', '_', authorline[1]).strip('_').lower()
             slug = '%s_%s' % (prefix, author)
-            if vn != 1:
-                slug = 'v%s_%s' % (vn, slug)
-        body = get_plain_part(msg)
+            if cur_vn != 1:
+                slug = 'v%s_%s' % (cur_vn, slug)
         logger.debug('  Processing: %s', subject)
-        if cur_count == 0 and sorted_keys[0] is None:
-            am_kept.append(key)
-            sorted_keys[cur_count] = key
+
+        # If the count is 00/NN, it's the cover letter
+        if cur_count == 0 and cur_vn not in cover_keys.keys():
+            # Found the cover letter
+            logger.debug('  Found a cover letter for v%s', cur_vn)
+            cover_keys[cur_vn] = key
             continue
-            # skip to the next message
+
+        body = get_plain_part(msg)
         # Do we have a '^---' followed by '^+++' in the body anywhere?
         if re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
             # Contains a diff
@@ -266,7 +294,9 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
         irt_id = get_clean_msgid(msg, header='In-Reply-To')
         if irt_id and irt_id in msgid_map:
             irt_key = msgid_map[irt_id]
-        trailer_map[irt_key] = matches.groups()
+        if irt_key not in trailer_map:
+            trailer_map[irt_key] = list()
+        trailer_map[irt_key] += matches.groups()
 
     if not len(am_kept):
         logger.info('Did not find any patches to save')
@@ -274,8 +304,10 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
 
     if not wantname:
         am_filename = os.path.join(outdir, '%s.mbx' % slug)
+        am_cover = os.path.join(outdir, '%s.cover' % slug)
     else:
         am_filename = os.path.join(outdir, wantname)
+        am_cover = os.path.join(outdir, '%s.cover' % wantname)
         if wantname.find('.') < 0:
             slug = wantname
         else:
@@ -284,62 +316,53 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
     if os.path.exists(am_filename):
         os.unlink(am_filename)
     am_mbx = mailbox.mbox(am_filename)
-    at = 0
     logger.info('---')
+
     logger.critical('Writing %s', am_filename)
     have_missing = False
-    for key in sorted_keys:
-        if at == 0 and key is None and cover_key is not None:
-            # Use the best candidate for the cover letter
-            key = cover_key
-
+    at = 1
+    for key in sorted_keys[1:]:
         if key is None:
-            if at != 0:
-                logger.error('  ERROR: missing [%s/%s]!', at, expected_count)
-                have_missing = True
+            logger.error('  ERROR: missing [%s/%s]!', at, expected_count)
+            have_missing = True
         else:
             msg = mbx[key]
             subject = re.sub(r'\s+', ' ', msg['Subject'])
             logger.info('  %s', subject)
-            body = get_plain_part(msg)
             if key in trailer_map:
-                body = git_add_trailers(body, trailer_map[key])
-            msg.set_payload(body.encode('utf-8'))
-            if msg['Content-Transfer-Encoding'] not in (None, '8bit'):
-                msg.replace_header('Content-Transfer-Encoding', '8bit')
-
-            newhdrs = []
-            for hdrname, hdrval in list(msg._headers):
-                lhdrname = hdrname.lower()
-                wanthdr = False
-                for hdrmatch in WANTHDRS:
-                    if fnmatch.fnmatch(lhdrname, hdrmatch):
-                        wanthdr = True
-                        break
-                if wanthdr:
-                    newhdrs.append((hdrname, hdrval))
-
-            msg._headers = newhdrs
+                trailers = trailer_map[key]
+            else:
+                trailers = None
+            msg = amify_msg(msg, trailers)
             am_mbx.add(msg)
         at += 1
-    logger.critical('Total patches: %s', len(am_mbx))
 
+    logger.critical('Total patches: %s', len(am_mbx))
     logger.critical('---')
     if have_missing:
-        logger.critical('WARNING: Thread incomplete, please check above!')
+        logger.critical('WARNING: Thread incomplete!')
+
+    if vn in cover_keys:
+        # Save the cover letter
+        cover_msg = amify_msg(mbx[cover_keys[vn]], None)
+        with open(am_cover, 'w') as fh:
+            fh.write(cover_msg.as_string())
+        logger.critical('Cover: %s', am_cover)
+        first_body = get_plain_part(cover_msg)
+    else:
+        first_body = get_plain_part(am_mbx[0])
+
     top_msgid = get_clean_msgid(am_mbx[0])
     linkurl = config['linkmask'] % top_msgid
     logger.critical('Link: %s', linkurl)
-    # Look for base-commit line in the first message
-    body = get_plain_part(am_mbx[0])
-    matches = re.search(r'base-commit: .*?([0-9a-f]+)', body, re.MULTILINE)
-    base_commit = None
 
+    base_commit = None
+    matches = re.search(r'base-commit: .*?([0-9a-f]+)', first_body, re.MULTILINE)
     if matches:
         base_commit = matches.groups()[0]
     else:
         # Try a more relaxed search
-        matches = re.search(r'based on .*?([0-9a-f]+)', body, re.MULTILINE)
+        matches = re.search(r'based on .*?([0-9a-f]{40})', first_body, re.MULTILINE)
         if matches:
             base_commit = matches.groups()[0]
 
