@@ -19,6 +19,8 @@ import time
 import requests
 import gzip
 
+from email import charset
+charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
 
 _DEFAULT_CONFIG = {
@@ -37,9 +39,7 @@ WANTHDRS = {'sender',
             'reply-to',
             'in-reply-to',
             'references',
-            'mime-*',
             'list-id',
-            'content-*',
             'errors-to',
             'x-mailing-list',
             'resent-to',
@@ -97,8 +97,6 @@ def amify_msg(msg, trailers):
                 wanthdr = True
                 break
         if wanthdr:
-            if lhdrname == 'content-transfer-encoding':
-                hdrval = '8bit'
             newhdrs.append((hdrname, hdrval))
     msg._headers = newhdrs
     return msg
@@ -147,6 +145,7 @@ def get_pi_thread_by_msgid(msgid, config, outdir='.', wantname=None):
     logger.critical('Grabbing thread from %s', t_mbx_url)
     resp = requests.get(t_mbx_url)
     t_mbox = gzip.decompress(resp.content)
+    resp.close()
     if wantname:
         savefile = os.path.join(outdir, wantname)
     else:
@@ -205,6 +204,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
     expected_count = 1
     cur_vn = None
     vn = None
+    multiple_revisions = False
     for key, msg in mbx.items():
         msgid = get_clean_msgid(msg)
         msgid_map[msgid] = key
@@ -240,7 +240,12 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
 
         if cur_vn is None or new_vn > cur_vn:
             if new_vn != 1:
-                logger.debug('Found new series version: v%s', new_vn)
+                if wantver and wantver != new_vn:
+                    logger.info('Found series revision: v%s (ignored)', new_vn)
+                else:
+                    logger.info('Found series revision: v%s', new_vn)
+            if cur_vn is not None and new_vn > cur_vn:
+                multiple_revisions = True
             if wantver is None or wantver == new_vn:
                 # Blow away anything we currently have in sorted_keys
                 sorted_keys = [None] * (expected_count + 1)
@@ -313,6 +318,9 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
         else:
             slug = '.'.join(wantname.split('.')[:-1])
 
+    if multiple_revisions and not wantver:
+        logger.info('Will use the latest revision: v%s', vn)
+        logger.info('You can pick other revisions using the -vN flag')
     if os.path.exists(am_filename):
         os.unlink(am_filename)
     am_mbx = mailbox.mbox(am_filename)
