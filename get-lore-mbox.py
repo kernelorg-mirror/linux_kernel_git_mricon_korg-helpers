@@ -180,7 +180,7 @@ def git_add_trailers(payload, trailers):
     cmdargs = ['interpret-trailers']
     output = payload
     if trailers:
-        for trailer in trailers:
+        for trailer in set(trailers):
             # Check if this trailer is already in the body
             if payload.find(trailer) < 0:
                 logger.info('    Adding trailer: %s', trailer)
