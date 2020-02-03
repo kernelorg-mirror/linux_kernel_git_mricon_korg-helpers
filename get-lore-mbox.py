@@ -131,7 +131,9 @@ def get_msgid_from_stdin():
     sys.exit(1)
 
 
-def get_pi_thread_by_msgid(msgid, config, outdir='.', wantname=None):
+def get_pi_thread_by_msgid(msgid, config, cmdargs):
+    wantname = cmdargs.wantname
+    outdir = cmdargs.outdir
     # Grab the head from lore, to see where we are redirected
     midmask = config['midmask'] % msgid
     logger.info('Looking up %s', midmask)
@@ -194,7 +196,11 @@ def get_clean_msgid(msg, header='Message-ID'):
     return msgid
 
 
-def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
+def mbox_to_am(mboxfile, config, cmdargs):
+    outdir = cmdargs.outdir
+    wantver = cmdargs.wantver
+    wantname = cmdargs.wantname
+    covertrailers = cmdargs.covertrailers
     mbx = mailbox.mbox(mboxfile)
     count = len(mbx)
     logger.info('Analyzing %s messages in the thread', count)
@@ -237,7 +243,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
                 cur_count = int(cur)
                 expected_count = int(expected)
             # Is does it have a v\d?
-            matches = re.search(r'v(\d+)', prefix)
+            matches = re.search(r'v(\d+)', prefix, re.IGNORECASE)
             if matches:
                 new_vn = int(matches.groups()[0])
 
@@ -281,6 +287,8 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
         if cur_count == 0 and cur_vn not in cover_keys.keys():
             # Found the cover letter
             logger.debug('  Found a cover letter for v%s', cur_vn)
+            am_kept.append(key)
+            sorted_keys[cur_count] = key
             cover_keys[cur_vn] = key
             continue
 
@@ -329,6 +337,11 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
     am_mbx = mailbox.mbox(am_filename)
     logger.info('---')
 
+    # Check if any trailers were sent to the cover letter
+    global_trailers = []
+    if vn in cover_keys and cover_keys[vn] in trailer_map:
+        global_trailers = trailer_map[cover_keys[vn]]
+
     logger.critical('Writing %s', am_filename)
     have_missing = False
     at = 1
@@ -340,15 +353,24 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
             msg = mbx[key]
             subject = re.sub(r'\s+', ' ', msg['Subject'])
             logger.info('  %s', subject)
+            trailers = []
             if key in trailer_map:
-                trailers = trailer_map[key]
-            else:
-                trailers = None
+                trailers += trailer_map[key]
+            if global_trailers and covertrailers:
+                trailers += global_trailers
             msg = amify_msg(msg, trailers, ensurediff=True)
             am_mbx.add(msg)
         at += 1
 
     logger.critical('Total patches: %s', len(am_mbx))
+    if global_trailers and not covertrailers:
+        # Warn that some trailers were sent to the cover letter
+        logger.critical('---')
+        logger.critical('NOTE: Some trailers were sent to the cover letter:')
+        for trailer in global_trailers:
+            logger.critical('      %s', trailer)
+        logger.critical('NOTE: Rerun with -t to apply them to all patches')
+
     logger.critical('---')
     if have_missing:
         logger.critical('WARNING: Thread incomplete!')
@@ -414,13 +436,12 @@ def main(cmdargs):
 
     msgid = msgid.strip('<>')
     config = get_config_from_git()
-    mboxfile = get_pi_thread_by_msgid(msgid, config, outdir=cmdargs.outdir, wantname=cmdargs.wantname)
+    mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs)
     if mboxfile and cmdargs.amready:
         # Move it into -thread
         threadmbox = '%s-thread' % mboxfile
         os.rename(mboxfile, threadmbox)
-        mbox_to_am(threadmbox, config, outdir=cmdargs.outdir, wantver=cmdargs.version,
-                   wantname=cmdargs.wantname)
+        mbox_to_am(threadmbox, config, cmdargs)
         os.unlink(threadmbox)
     else:
         mbx = mailbox.mbox(mboxfile)
@@ -438,12 +459,14 @@ if __name__ == '__main__':
                         help='Output into this directory')
     parser.add_argument('-a', '--am-ready', dest='amready', action='store_true', default=False,
                         help='Make an mbox ready for git am')
-    parser.add_argument('-v', '--version', type=int, default=None,
+    parser.add_argument('-t', '--apply-cover-trailers', dest='covertrailers', action='store_true', default=False,
+                        help='Apply trailers sent to the cover letter to all patches (use with -a)')
+    parser.add_argument('-v', '--use-version', dest='wantver', type=int, default=None,
                         help='Get a specific version of the patch/series (use with -a)')
     parser.add_argument('-n', '--mbox-name', dest='wantname', default=None,
                         help='Filename to name the mbox file')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Add more debugging info to the output')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
-                        help='Be very terse outputting to the stdout')
+                        help='Output critical information only')
     main(parser.parse_args())
