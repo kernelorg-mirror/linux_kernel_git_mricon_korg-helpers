@@ -82,11 +82,11 @@ def git_run_command(gitdir, args, stdin=None, logstderr=False):
     return output
 
 
-def amify_msg(msg, trailers):
-    payload = msg.get_payload(decode=True)
+def amify_msg(msg, trailers, ensurediff=False):
+    body = get_plain_part(msg, ensurediff=ensurediff)
     if trailers:
-        payload = git_add_trailers(payload, trailers)
-    msg.set_payload(payload)
+        body = git_add_trailers(body, trailers)
+    msg.set_payload(body.encode('utf-8'))
     # Clean up headers
     newhdrs = []
     for hdrname, hdrval in list(msg._headers):
@@ -158,7 +158,7 @@ def get_pi_thread_by_msgid(msgid, config, outdir='.', wantname=None):
     return savefile
 
 
-def get_plain_part(msg):
+def get_plain_part(msg, ensurediff=False):
     # walk until we find the first text/plain part
     body = None
     for part in msg.walk():
@@ -167,20 +167,23 @@ def get_plain_part(msg):
         body = part.get_payload(decode=True)
         if body is None:
             continue
-
         body = body.decode('utf-8', errors='replace')
+        if ensurediff and not re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
+            continue
+        break
     return body
 
 
 def git_add_trailers(payload, trailers):
     cmdargs = ['interpret-trailers']
-    output = payload.decode('utf-8')
-    for trailer in trailers:
-        # Check if this trailer is already in the body
-        if output.find(trailer) < 0:
-            logger.info('    Adding trailer: %s', trailer)
-            cmdargs += ['--trailer', trailer]
-        output = git_run_command(None, args=cmdargs, stdin=output.encode('utf-8'))
+    output = payload
+    if trailers:
+        for trailer in trailers:
+            # Check if this trailer is already in the body
+            if payload.find(trailer) < 0:
+                logger.info('    Adding trailer: %s', trailer)
+                cmdargs += ['--trailer', trailer]
+        output = git_run_command(None, args=cmdargs, stdin=payload.encode('utf-8'))
     return output
 
 
@@ -341,7 +344,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
                 trailers = trailer_map[key]
             else:
                 trailers = None
-            msg = amify_msg(msg, trailers)
+            msg = amify_msg(msg, trailers, ensurediff=True)
             am_mbx.add(msg)
         at += 1
 
@@ -352,7 +355,7 @@ def mbox_to_am(mboxfile, config, outdir='.', wantver=None, wantname=None):
 
     if vn in cover_keys:
         # Save the cover letter
-        cover_msg = amify_msg(mbx[cover_keys[vn]], None)
+        cover_msg = amify_msg(mbx[cover_keys[vn]], None, ensurediff=False)
         with open(am_cover, 'w') as fh:
             fh.write(cover_msg.as_string())
         logger.critical('Cover: %s', am_cover)
