@@ -17,8 +17,11 @@ import fnmatch
 import time
 
 import requests
+import urllib.parse
+import xml.etree.ElementTree as ET
 import gzip
 
+from tempfile import mkstemp
 from email import charset
 charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
@@ -131,6 +134,16 @@ def get_msgid_from_stdin():
     sys.exit(1)
 
 
+def get_pi_thread_by_url(t_mbx_url, savefile):
+    resp = requests.get(t_mbx_url)
+    t_mbox = gzip.decompress(resp.content)
+    resp.close()
+    with open(savefile, 'wb') as fh:
+        logger.debug('Saving %s', savefile)
+        fh.write(t_mbox)
+    return savefile
+
+
 def get_pi_thread_by_msgid(msgid, config, cmdargs):
     wantname = cmdargs.wantname
     outdir = cmdargs.outdir
@@ -144,20 +157,19 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs):
     canonical = resp.headers['Location'].rstrip('/')
     resp.close()
     t_mbx_url = '%s/t.mbox.gz' % canonical
-    logger.critical('Grabbing thread from %s', t_mbx_url)
-    resp = requests.get(t_mbx_url)
-    t_mbox = gzip.decompress(resp.content)
-    resp.close()
     if wantname:
         savefile = os.path.join(outdir, wantname)
     else:
         # Save it into msgid.mbox
         savefile = '%s.t.mbx' % msgid
         savefile = os.path.join(outdir, savefile)
-    with open(savefile, 'wb') as fh:
-        logger.debug('Saving %s', savefile)
-        fh.write(t_mbox)
-    return savefile
+
+    loc = urllib.parse.urlparse(t_mbx_url)
+    if cmdargs.useproject:
+        t_mbx_url = '%s://%s/%s/%s/t.mbox.gz' % (
+            loc.scheme, loc.netloc, cmdargs.useproject, msgid)
+    logger.critical('Grabbing thread from %s', loc.netloc)
+    return get_pi_thread_by_url(t_mbx_url, savefile)
 
 
 def get_plain_part(msg, ensurediff=False):
@@ -170,7 +182,7 @@ def get_plain_part(msg, ensurediff=False):
         if body is None:
             continue
         body = body.decode('utf-8', errors='replace')
-        if ensurediff and not re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
+        if ensurediff and not body_contains_diff(body):
             continue
         break
     return body
@@ -205,66 +217,67 @@ def mbox_to_am(mboxfile, config, cmdargs):
     count = len(mbx)
     logger.info('Analyzing %s messages in the thread', count)
     am_kept = list()
-    msgid_map = dict()
     slug = None
     cover_keys = dict()
     sorted_keys = [None, None]
     trailer_map = dict()
-    expected_count = 1
     cur_vn = None
     vn = None
     multiple_revisions = False
+    msgid_map = dict()
+    irt_map = dict()
+    # Go through the mbox once to build a message map:
     for key, msg in mbx.items():
         msgid = get_clean_msgid(msg)
+        irtid = get_clean_msgid(msg, header='In-Reply-To')
         msgid_map[msgid] = key
-        subject = re.sub(r'\s+', ' ', msg['Subject'])
-        logger.debug('Looking at msg %s: %s', key, subject)
+        if irtid is not None:
+            if irtid not in irt_map.keys():
+                irt_map[irtid] = list()
+            irt_map[irtid].append(key)
+    # Go through it slowly now
+    for key, msg in mbx.items():
+        subj_info = get_subject_info(msg['Subject'])
+        logger.debug('Looking at msg %s: %s', key, subj_info['full_subject'])
+        body = get_plain_part(msg)
+        msgid = get_clean_msgid(msg)
+        irtid = get_clean_msgid(msg, header='In-Reply-To')
+        has_diffstat = body_contains_diffstat(body)
+        has_diff = body_contains_diff(body)
 
-        # Start by looking at prefixes in the subject
-        matches = re.search(r'\[PATCH([^\]]*)\]', subject, re.IGNORECASE)
-        if not matches:
-            # if the key is 0, it may be a cover letter
-            if key == 0:
-                body = get_plain_part(msg)
-                if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', body, re.MULTILINE | re.IGNORECASE):
-                    # Looks like a cover letter, so keep it in mind, unless we find
-                    # something else better suited to be a cover letter
-                    logger.debug('  Probaby a cover letter')
-                    cover_keys[1] = key
-            # Ignoring this message
+        # if it has no in-reply-to, but other messages I-R-T to it, then
+        # it's probably a cover letter that doesn't follow the standard 00/NN notation
+        if irtid is None and msgid in irt_map.keys():
+            logger.debug('  Probaby a cover letter')
+            cover_keys[subj_info['revision']] = key
             continue
-        cur_count = 1
-        expected_count = 1
-        new_vn = 1
-        for prefix in matches.groups()[0].split():
-            # Does it match \d/\d?
-            if re.search(r'\d/\d', prefix):
-                cur, expected = prefix.split('/')
-                cur_count = int(cur)
-                expected_count = int(expected)
-            # Is does it have a v\d?
-            matches = re.search(r'v(\d+)', prefix, re.IGNORECASE)
-            if matches:
-                new_vn = int(matches.groups()[0])
 
+        if subj_info['revision_inferred'] and irtid is not None:
+            # Grab revision info from the cover letter
+            cover_subj_info = get_subject_info(mbx[msgid_map[irtid]]['Subject'])
+            subj_info['revision'] = cover_subj_info['revision']
+            # Make sure sorted_keys has enough members
+            if len(sorted_keys) < subj_info['expected'] + 1:
+                sorted_keys = [None] * (subj_info['expected'] + 1)
+
+        new_vn = subj_info['revision']
         if cur_vn is None or new_vn > cur_vn:
-            if new_vn != 1:
-                if wantver and wantver != new_vn:
-                    logger.info('Found series revision: v%s (ignored)', new_vn)
-                else:
-                    logger.info('Found series revision: v%s', new_vn)
+            if wantver and wantver != new_vn:
+                logger.info('Found series revision: v%s (ignored)', new_vn)
+            else:
+                logger.info('Found series revision: v%s', new_vn)
             if cur_vn is not None and new_vn > cur_vn:
                 multiple_revisions = True
             if wantver is None or wantver == new_vn:
                 # Blow away anything we currently have in sorted_keys
-                sorted_keys = [None] * (expected_count + 1)
+                sorted_keys = [None] * (subj_info['expected'] + 1)
                 slug = None
             cur_vn = new_vn
         elif vn is None:
             cur_vn = new_vn
 
         if wantver is not None and wantver != cur_vn:
-            logger.debug('  Ignoring v%s: %s', cur_vn, subject)
+            logger.debug('  Ignoring v%s: %s', cur_vn, subj_info['full_subject'])
             continue
 
         vn = cur_vn
@@ -281,25 +294,21 @@ def mbox_to_am(mboxfile, config, cmdargs):
             slug = '%s_%s' % (prefix, author)
             if cur_vn != 1:
                 slug = 'v%s_%s' % (cur_vn, slug)
-        logger.debug('  Processing: %s', subject)
 
-        # If the count is 00/NN, it's the cover letter
-        if cur_count == 0 and cur_vn not in cover_keys.keys():
+        # If the counter is 0, it's definitely the cover letter
+        if subj_info['counter'] == 0 and cur_vn not in cover_keys.keys():
             # Found the cover letter
             logger.debug('  Found a cover letter for v%s', cur_vn)
             am_kept.append(key)
-            sorted_keys[cur_count] = key
+            sorted_keys[subj_info['revision']] = key
             cover_keys[cur_vn] = key
             continue
 
-        body = get_plain_part(msg)
-        # Do we have a '^---' followed by '^+++' in the body anywhere?
-        if re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
-            # Contains a diff
+        if has_diff:
             # Do we already have a match for this, though?
-            if sorted_keys[cur_count] is None:
+            if sorted_keys[subj_info['counter']] is None:
                 am_kept.append(key)
-                sorted_keys[cur_count] = key
+                sorted_keys[subj_info['counter']] = key
                 continue
         # Do we have something that looks like a new trailer?
         matches = re.search(r'^\s*([\w-]+: .*<\S+>)\s*$', body, re.MULTILINE)
@@ -347,7 +356,7 @@ def mbox_to_am(mboxfile, config, cmdargs):
     at = 1
     for key in sorted_keys[1:]:
         if key is None:
-            logger.error('  ERROR: missing [%s/%s]!', at, expected_count)
+            logger.error('  ERROR: missing [%s/%s]!', at, len(sorted_keys)-1)
             have_missing = True
         else:
             msg = mbx[key]
@@ -412,6 +421,156 @@ def mbox_to_am(mboxfile, config, cmdargs):
     return am_filename
 
 
+def get_subject_info(subject):
+    subject = re.sub(r'\s+', ' ', subject).strip()
+    subject_info = {
+        'full_subject': subject,
+        'reply': False,
+        'resend': False,
+        'rfc': False,
+        'revision': 1,
+        'revision_inferred': True,
+        'counter': 1,
+        'expected': 1,
+        'prefixes': list(),
+        'subject': None,
+    }
+    # Is it a reply?
+    if re.search(r'^\w+:\s*\[', subject):
+        subject_info['reply'] = True
+        subject = re.sub(r'^\w+:\s*\[', '[', subject)
+
+    # Find all [foo] in the title
+    while subject.find('[') == 0:
+        matches = re.search(r'^\[([^\]]*)\]', subject)
+        for chunk in matches.groups()[0].split():
+            if re.search(r'^\d+/\d+$', chunk):
+                counters = chunk.split('/')
+                subject_info['counter'] = int(counters[0])
+                subject_info['expected'] = int(counters[1])
+            elif re.search(r'^v\d+$', chunk, re.IGNORECASE):
+                subject_info['revision'] = int(chunk[1:])
+                subject_info['revision_inferred'] = False
+            elif chunk.lower() == 'rfc':
+                subject_info['rfc'] = True
+            elif chunk.lower() == 'resend':
+                subject_info['resend'] = True
+            subject_info['prefixes'].append(chunk.lower())
+        subject = re.sub(r'^\s*\[[^\]]*\]\s*', '', subject)
+    subject_info['subject'] = subject
+
+    return subject_info
+
+
+def body_contains_diffstat(body):
+    if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', body, re.MULTILINE | re.IGNORECASE):
+        return True
+    return False
+
+
+def body_contains_diff(body):
+    if re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
+        return True
+    return False
+
+
+def get_newest_series(mboxfile, cmdargs):
+    # Open the mbox and find the latest series mentioned in it
+    mbx = mailbox.mbox(mboxfile)
+    base_msg = None
+    latest_revision = None
+    seen_msgids = list()
+    seen_covers = list()
+    for key, msg in mbx.items():
+        msgid = get_clean_msgid(msg)
+        seen_msgids.append(msgid)
+        subj_info = get_subject_info(msg['Subject'])
+        # Ignore replies or counters above 1
+        if subj_info['reply'] or subj_info['counter'] > 1:
+            continue
+        if latest_revision is None or subj_info['revision'] > latest_revision:
+            # New revision
+            latest_revision = subj_info['revision']
+            if subj_info['counter'] == 0:
+                # And a cover letter, nice. This is the easy case
+                base_msg = msg
+                seen_covers.append(latest_revision)
+                continue
+            if subj_info['counter'] == 1:
+                if latest_revision not in seen_covers:
+                    # A patch/series without a cover letter
+                    base_msg = msg
+
+    # Get subject info from base_msg again
+    subj_info = get_subject_info(base_msg['Subject'])
+    if not len(subj_info['prefixes']):
+        logger.debug('Not checking for new revisions: no prefixes on the cover letter.')
+        mbx.close()
+        return
+    base_msgid = get_clean_msgid(base_msg)
+    fromeml = email.utils.getaddresses(base_msg.get_all('from', []))[0][1]
+    msgdate = email.utils.parsedate_tz(str(base_msg['Date']))
+    startdate = time.strftime('%Y%m%d', msgdate[:9])
+    listarc = base_msg.get_all('List-Archive')[-1].strip('<>')
+    q = 's:"%s" AND f:"%s" AND d:%s..' % (subj_info['subject'], fromeml, startdate)
+    queryurl = '%s?%s' % (listarc, urllib.parse.urlencode({'q': q, 'x': 'A', 'o': '-1'}))
+    logger.critical('Checking for newer revisions on %s', listarc)
+    logger.debug('Query URL: %s', queryurl)
+    resp = requests.get(queryurl)
+    # try to parse it
+    tree = ET.fromstring(resp.content)
+    resp.close()
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+    entries = tree.findall('atom:entry', ns)
+
+    for entry in entries:
+        title = entry.find('atom:title', ns).text
+        subj_info = get_subject_info(title)
+        if subj_info['reply'] or subj_info['counter'] > 1:
+            logger.debug('Ignoring result (not interesting): %s', title)
+            continue
+        link = entry.find('atom:link', ns).get('href')
+        if subj_info['revision'] < latest_revision:
+            logger.debug('Ignoring result (not new revision): %s', title)
+            continue
+        if link.find('/%s/' % base_msgid) > 0:
+            logger.debug('Ignoring result (same thread as ours):%s', title)
+            continue
+        if subj_info['revision'] == 1 and subj_info['revision'] == latest_revision:
+            # Someone sent a separate message with an identical title but no new vX in the subject line
+            # It's *probably* a new revision.
+            logger.debug('Likely a new revision: %s', title)
+        elif subj_info['revision'] > latest_revision:
+            logger.debug('Definitely a new revision [v%s]: %s', subj_info['revision'], title)
+        else:
+            logger.debug('No idea what this is: %s', title)
+            continue
+        t_mbx_url = '%st.mbox.gz' % link
+        savefile = mkstemp('get-lore-mbox')[1]
+        nt_mboxfile = get_pi_thread_by_url(t_mbx_url, savefile)
+        nt_mbx = mailbox.mbox(nt_mboxfile)
+        # Append all of these to the existing mailbox
+        new_adds = 0
+        for nt_msg in nt_mbx:
+            nt_msgid = get_clean_msgid(nt_msg)
+            if nt_msgid in seen_msgids:
+                logger.debug('Duplicate message, skipping')
+                continue
+            nt_subject = re.sub(r'\s+', ' ', nt_msg['Subject'])
+            logger.debug('Adding: %s', nt_subject)
+            new_adds += 1
+            mbx.add(nt_msg)
+            seen_msgids.append(nt_msgid)
+        nt_mbx.close()
+        if new_adds:
+            logger.info('Added %s messages from thread: %s', new_adds, title)
+        logger.debug('Removing temporary %s', nt_mboxfile)
+        os.unlink(nt_mboxfile)
+
+    # We close the mbox, since we'll be reopening it later
+    mbx.close()
+
+
 def main(cmdargs):
     logger.setLevel(logging.DEBUG)
 
@@ -437,6 +596,10 @@ def main(cmdargs):
     msgid = msgid.strip('<>')
     config = get_config_from_git()
     mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs)
+
+    if mboxfile and cmdargs.checknewer:
+        get_newest_series(mboxfile, cmdargs)
+
     if mboxfile and cmdargs.amready:
         # Move it into -thread
         threadmbox = '%s-thread' % mboxfile
@@ -457,6 +620,10 @@ if __name__ == '__main__':
                         help='Message ID to process, or pipe a raw message')
     parser.add_argument('-o', '--outdir', default='.',
                         help='Output into this directory')
+    parser.add_argument('-p', '--use-project', dest='useproject', default=None,
+                        help='Use a specific project instead of guessing (linux-mm, linux-hardening, etc)')
+    parser.add_argument('-c', '--check-newer-revisions', dest='checknewer', action='store_true', default=False,
+                        help='Check if newer patch revisions exist')
     parser.add_argument('-a', '--am-ready', dest='amready', action='store_true', default=False,
                         help='Make an mbox ready for git am')
     parser.add_argument('-t', '--apply-cover-trailers', dest='covertrailers', action='store_true', default=False,
