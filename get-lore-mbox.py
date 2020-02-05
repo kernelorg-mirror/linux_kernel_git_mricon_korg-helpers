@@ -247,7 +247,7 @@ def mbox_to_am(mboxfile, config, cmdargs):
 
         # if it has no in-reply-to, but other messages I-R-T to it, then
         # it's probably a cover letter that doesn't follow the standard 00/NN notation
-        if irtid is None and msgid in irt_map.keys():
+        if irtid is None and not has_diff and msgid in irt_map.keys():
             logger.debug('  Probaby a cover letter')
             cover_keys[subj_info['revision']] = key
             continue
