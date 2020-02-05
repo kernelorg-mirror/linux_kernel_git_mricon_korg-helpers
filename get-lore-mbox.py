@@ -202,9 +202,12 @@ def git_add_trailers(payload, trailers):
 
 
 def get_clean_msgid(msg, header='Message-ID'):
-    msgid = msg.get(header)
-    if msgid:
-        msgid = msg.get(header).strip().strip('<>')
+    msgid = None
+    raw = msg.get(header)
+    if raw:
+        matches = re.search(r'<([^>]+)>', raw)
+        if matches:
+            msgid = matches.groups()[0]
     return msgid
 
 
