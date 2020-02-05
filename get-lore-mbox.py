@@ -303,7 +303,7 @@ def mbox_to_am(mboxfile, config, cmdargs):
             # Found the cover letter
             logger.debug('  Found a cover letter for v%s', cur_vn)
             am_kept.append(key)
-            sorted_keys[subj_info['revision']] = key
+            sorted_keys[subj_info['counter']] = key
             cover_keys[cur_vn] = key
             continue
 
