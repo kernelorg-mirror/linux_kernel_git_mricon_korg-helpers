@@ -255,7 +255,7 @@ def mbox_to_am(mboxfile, config, cmdargs):
             cover_keys[subj_info['revision']] = key
             continue
 
-        if subj_info['revision_inferred'] and irtid is not None:
+        if subj_info['revision_inferred'] and irtid in msgid_map:
             # Grab revision info from the cover letter
             cover_subj_info = get_subject_info(mbx[msgid_map[irtid]]['Subject'])
             subj_info['revision'] = cover_subj_info['revision']
