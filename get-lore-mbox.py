@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 # -*- coding: utf-8 -*-
 #
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
@@ -174,6 +175,9 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs):
 
 def get_plain_part(msg, ensurediff=False):
     # walk until we find the first text/plain part
+    mcharset = msg.get_content_charset()
+    if not mcharset:
+        mcharset = 'utf-8'
     body = None
     for part in msg.walk():
         if part.get_content_type().find('text/plain') < 0:
@@ -181,7 +185,10 @@ def get_plain_part(msg, ensurediff=False):
         body = part.get_payload(decode=True)
         if body is None:
             continue
-        body = body.decode('utf-8', errors='replace')
+        pcharset = part.get_content_charset()
+        if not pcharset:
+            pcharset = mcharset
+        body = body.decode(pcharset, errors='replace')
         if ensurediff and not body_contains_diff(body):
             continue
         break
