@@ -593,6 +593,9 @@ def main(cmdargs):
     if not cmdargs.msgid:
         logger.debug('Getting Message-ID from stdin')
         msgid = get_msgid_from_stdin()
+        if msgid is None:
+            logger.error('Unable to find a valid message-id in stdin.')
+            sys.exit(1)
     else:
         msgid = cmdargs.msgid
 
@@ -603,7 +606,10 @@ def main(cmdargs):
     if mboxfile and cmdargs.checknewer:
         get_newest_series(mboxfile, cmdargs)
 
-    if mboxfile and cmdargs.amready:
+    if mboxfile is None:
+        return
+
+    if cmdargs.amready:
         # Move it into -thread
         threadmbox = '%s-thread' % mboxfile
         os.rename(mboxfile, threadmbox)
