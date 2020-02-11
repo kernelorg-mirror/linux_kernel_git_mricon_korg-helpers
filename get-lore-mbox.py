@@ -381,6 +381,10 @@ def mbox_to_am(mboxfile, config, cmdargs):
             am_mbx.add(msg)
         at += 1
 
+    if not len(am_mbx):
+        logger.info('Did not find any patches to save')
+        return None
+
     logger.critical('Total patches: %s', len(am_mbx))
     if global_trailers and not covertrailers:
         # Warn that some trailers were sent to the cover letter
