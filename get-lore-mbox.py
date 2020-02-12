@@ -454,11 +454,11 @@ class LoreSubject:
                 elif re.search(r'^v\d+$', chunk, re.IGNORECASE):
                     self.revision = int(chunk[1:])
                     self.revision_inferred = False
-                elif chunk.lower() == 'rfc':
+                elif chunk.lower().find('rfc') == 0:
                     self.rfc = True
-                elif chunk.lower() == 'resend':
+                elif chunk.lower().find('resend') == 0:
                     self.resend = True
-                elif chunk.lower() == 'patch':
+                elif chunk.lower().find('patch') == 0:
                     self.patch = True
                 self.prefixes.append(chunk.lower())
             subject = re.sub(r'^\s*\[[^\]]*\]\s*', '', subject)
@@ -470,6 +470,7 @@ class LoreSubject:
         out.append('  subject: %s' % self.subject)
         out.append('  reply: %s' % self.reply)
         out.append('  resend: %s' % self.resend)
+        out.append('  patch: %s' % self.patch)
         out.append('  rfc: %s' % self.rfc)
         out.append('  revision: %s' % self.revision)
         out.append('  revision_inferred: %s' % self.revision_inferred)
