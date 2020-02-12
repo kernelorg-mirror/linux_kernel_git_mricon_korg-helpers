@@ -11,6 +11,7 @@ import mailbox
 import email
 import email.message
 import email.utils
+import email.header
 import subprocess
 import logging
 import re
@@ -19,7 +20,7 @@ import time
 
 import requests
 import urllib.parse
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree
 import gzip
 
 from tempfile import mkstemp
@@ -48,6 +49,436 @@ WANTHDRS = {'sender',
             'x-mailing-list',
             'resent-to',
             }
+
+
+class LoreMailbox:
+    def __init__(self):
+        self.msgid_map = dict()
+        self.series = dict()
+        self.followups = list()
+        self.unknowns = list()
+
+    def __repr__(self):
+        out = list()
+        for key, lser in self.series.items():
+            out.append(str(lser))
+        out.append('--- Followups ---')
+        for lmsg in self.followups:
+            out.append('  %s' % lmsg.full_subject)
+        out.append('--- Unknowns ---')
+        for lmsg in self.unknowns:
+            out.append('  %s' % lmsg.full_subject)
+
+        return '\n'.join(out)
+
+    def get_by_msgid(self, msgid):
+        if msgid in self.msgid_map:
+            return self.msgid_map[msgid]
+        return None
+
+    def get_series(self, revision=None):
+        if revision is None:
+            if not len(self.series):
+                return None
+            # Use the highest revision
+            revision = max(self.series.keys())
+        elif revision not in self.series.keys():
+            return None
+
+        lser = self.series[revision]
+
+        # Do we have a cover letter for it?
+        if not lser.has_cover:
+            # Let's find the first patch with an in-reply-to and see if that
+            # is our cover letter
+            for member in lser.patches:
+                if member is not None and member.in_reply_to is not None:
+                    potential = self.get_by_msgid(member.in_reply_to)
+                    if potential.has_diffstat and not potential.has_diff:
+                        # This is *probably* the cover letter
+                        lser.patches[0] = potential
+                        lser.has_cover = True
+                        break
+
+        # Do we have any follow-ups?
+        for fmsg in self.followups:
+            logger.debug('Analyzing follow-up: %s', fmsg.full_subject)
+            # If there are no trailers in this one, ignore it
+            if not len(fmsg.trailers):
+                continue
+            # if it's for the wrong revision, ignore it
+            if lser.revision != fmsg.revision:
+                continue
+            # Go up through the follow-ups and tally up trailers until
+            # we either run out of in-reply-tos, or we find a patch in
+            # our series
+            pmsg = self.msgid_map[fmsg.in_reply_to]
+            trailers = fmsg.trailers
+            lvl = 1
+            while True:
+                logger.debug('%sParent: %s', ' ' * lvl, pmsg.full_subject)
+                logger.debug('%sTrailers: %s', ' ' * lvl, trailers)
+                found = False
+                for lmsg in lser.patches:
+                    if lmsg is not None and lmsg.msgid == pmsg.msgid:
+                        # Confirmed, this is our parent patch
+                        lmsg.followup_trailers += trailers
+                        found = True
+                        break
+                if found:
+                    break
+                elif pmsg.in_reply_to:
+                    lvl += 1
+                    trailers += pmsg.trailers
+                    pmsg = self.msgid_map[pmsg.in_reply_to]
+                else:
+                    break
+
+        return lser
+
+    def add_message(self, msg):
+        lmsg = LoreMessage(msg)
+        logger.debug('Looking at: %s', lmsg.full_subject)
+        self.msgid_map[lmsg.msgid] = lmsg
+
+        if lmsg.lsubject.patch:
+            if lmsg.revision not in self.series:
+                self.series[lmsg.revision] = LoreSeries(lmsg.revision, lmsg.expected)
+                if len(self.series) > 1:
+                    logger.info('Found new series v%s', lmsg.revision)
+            if lmsg.has_diff and not lmsg.reply:
+                self.series[lmsg.revision].add_patch(lmsg)
+            elif lmsg.counter == 0 and not lmsg.reply:
+                # Bona-fide cover letter
+                self.series[lmsg.revision].add_cover(lmsg)
+            elif lmsg.reply:
+                # We'll figure out where this belongs later
+                self.followups.append(lmsg)
+        elif lmsg.reply:
+            self.followups.append(lmsg)
+        else:
+            self.unknowns.append(lmsg)
+
+
+class LoreSeries:
+    def __init__(self, revision, expected):
+        self.revision = revision
+        self.expected = expected
+        self.patches = [None] * (expected+1)
+        self.followups = list()
+        self.complete = False
+        self.has_cover = False
+
+    def __repr__(self):
+        out = list()
+        if self.has_cover:
+            out.append('- Series: [v%s] %s' % (self.revision, self.patches[0].subject))
+        elif self.patches[1] is not None:
+            out.append('- Series: [v%s] %s' % (self.revision, self.patches[1].subject))
+        else:
+            out.append('- Series: [v%s] (untitled)' % self.revision)
+
+        out.append('  revision: %s' % self.revision)
+        out.append('  expected: %s' % self.expected)
+        out.append('  complete: %s' % self.complete)
+        out.append('  has_cover: %s' % self.has_cover)
+        out.append('  patches:')
+        at = 0
+        for member in self.patches:
+            if member is not None:
+                out.append('    [%s/%s] %s' % (at, self.expected, member.subject))
+                if member.followup_trailers:
+                    out.append('       Add: %s' % ', '.join(member.followup_trailers))
+            else:
+                out.append('    [%s/%s] MISSING' % (at, self.expected))
+            at += 1
+
+        return '\n'.join(out)
+
+    def add_patch(self, lmsg):
+        while len(self.patches) < lmsg.expected + 1:
+            self.patches.append(None)
+        self.expected = lmsg.expected
+        self.patches[lmsg.counter] = lmsg
+        self.complete = not (None in self.patches[1:])
+
+    def add_cover(self, lmsg):
+        self.add_patch(lmsg)
+        self.has_cover = True
+
+    def get_slug(self):
+        # Find the first non-None entry
+        lmsg = None
+        for lmsg in self.patches:
+            if lmsg is not None:
+                break
+
+        if lmsg is None:
+            return 'undefined'
+
+        msgdate = email.utils.parsedate_tz(str(lmsg.msg['Date']))
+        prefix = time.strftime('%Y%m%d', msgdate[:9])
+        authorline = email.utils.getaddresses(lmsg.msg.get_all('from', []))[0]
+        author = re.sub(r'\W+', '_', authorline[1]).strip('_').lower()
+        slug = '%s_%s' % (prefix, author)
+        if self.revision != 1:
+            slug = 'v%s_%s' % (self.revision, slug)
+
+        return slug
+
+    def save_am_mbox(self, outfile, covertrailers):
+        if os.path.exists(outfile):
+            os.unlink(outfile)
+        mbx = mailbox.mbox(outfile)
+        logger.info('---')
+        logger.critical('Writing %s', outfile)
+        at = 1
+        for lmsg in self.patches[1:]:
+            if lmsg is not None:
+                if self.has_cover and covertrailers and self.patches[0].followup_trailers:
+                    lmsg.followup_trailers += self.patches[0].followup_trailers
+                logger.info('  %s', lmsg.full_subject)
+                msg = lmsg.get_am_message()
+                mbx.add(msg)
+            else:
+                logger.error('  ERROR: missing [%s/%s]!', at, self.expected)
+            at += 1
+        return mbx
+
+    def save_cover(self, outfile):
+        cover_msg = self.patches[0].get_am_message(add_trailers=False)
+        with open(outfile, 'w') as fh:
+            fh.write(cover_msg.as_string())
+        logger.critical('Cover: %s', outfile)
+
+
+class LoreMessage:
+    def __init__(self, msg):
+        self.msg = msg
+        self.msgid = None
+
+        # Subject-based info
+        self.lsubject = None
+        self.full_subject = None
+        self.subject = None
+        self.reply = False
+        self.revision = 1
+        self.counter = 1
+        self.expected = 1
+        self.revision_inferred = True
+        self.counters_inferred = True
+
+        # Header-based info
+        self.in_reply_to = None
+
+        # Body and body-based info
+        self.body = None
+        self.has_diff = False
+        self.has_diffstat = False
+        self.trailers = list()
+        self.followup_trailers = list()
+
+        self.msgid = LoreMessage.get_clean_msgid(self.msg)
+        self.lsubject = LoreSubject(msg['Subject'])
+        # Copy them into this object for convenience
+        self.full_subject = self.lsubject.full_subject
+        self.subject = self.lsubject.subject
+        self.reply = self.lsubject.reply
+        self.revision = self.lsubject.revision
+        self.counter = self.lsubject.counter
+        self.expected = self.lsubject.expected
+        self.revision_inferred = self.lsubject.revision_inferred
+        self.counters_inferred = self.lsubject.counters_inferred
+
+        self.in_reply_to = LoreMessage.get_clean_msgid(self.msg, header='In-Reply-To')
+
+        # walk until we find the first text/plain part
+        mcharset = self.msg.get_content_charset()
+        if not mcharset:
+            mcharset = 'utf-8'
+        body = None
+        for part in msg.walk():
+            if part.get_content_type().find('text/plain') < 0:
+                continue
+            body = part.get_payload(decode=True)
+            if body is None:
+                continue
+            pcharset = part.get_content_charset()
+            if not pcharset:
+                pcharset = mcharset
+            body = body.decode(pcharset, errors='replace')
+            break
+        self.body = body
+
+        if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', self.body, re.MULTILINE | re.IGNORECASE):
+            self.has_diffstat = True
+        if re.search(r'^---.*\n\+\+\+', self.body, re.MULTILINE):
+            self.has_diff = True
+
+        # Do we have something that looks like a trailer?
+        matches = re.findall(r'^\s*([\w-]+: .*<\S+>)\s*$', self.body, re.MULTILINE)
+        if matches:
+            self.trailers = matches
+
+    def __repr__(self):
+        out = list()
+        out.append('msgid: %s' % self.msgid)
+        out.append(str(self.lsubject))
+
+        out.append('  in_reply_to: %s' % self.in_reply_to)
+
+        # Header-based info
+        out.append('  --- begin body ---')
+        for line in self.body.split('\n'):
+            out.append('  |%s' % line)
+        out.append('  --- end body ---')
+
+        # Body and body-based info
+        out.append('  has_diff: %s' % self.has_diff)
+        out.append('  has_diffstat: %s' % self.has_diffstat)
+        out.append('  --- begin my trailers ---')
+        for trailer in self.trailers:
+            out.append('  |%s' % trailer)
+        out.append('  --- begin followup trailers ---')
+        for trailer in self.followup_trailers:
+            out.append('  |%s' % trailer)
+        out.append('  --- end trailers ---')
+
+        return '\n'.join(out)
+
+    @staticmethod
+    def clean_header(hdrval):
+        new_hdrval = ''
+        dhdrs = email.header.decode_header(hdrval)
+        for dhdr in dhdrs:
+            if dhdr[1] is not None:
+                try:
+                    uval = dhdr[0].decode(dhdr[1], errors='replace')
+                except LookupError:
+                    # Not known charset/encoding. Try utf-8 and hope for the best.
+                    uval = dhdr[0].decode('utf-8', errors='replace')
+            elif isinstance(dhdr[0], (bytes, bytearray)):
+                uval = dhdr[0].decode('utf-8', errors='replace')
+            else:
+                uval = dhdr[0]
+            uval = uval.replace('\n', ' ')
+            new_hdrval += re.sub(r'\s+', ' ', uval).strip()
+        return new_hdrval
+
+    @staticmethod
+    def get_clean_msgid(msg, header='Message-Id'):
+        msgid = None
+        raw = msg.get(header)
+        if raw:
+            matches = re.search(r'<([^>]+)>', LoreMessage.clean_header(raw))
+            if matches:
+                msgid = matches.groups()[0]
+        return msgid
+
+    def get_am_message(self, add_trailers=True):
+        am_body = self.body
+        if add_trailers and self.followup_trailers:
+            cmdargs = None
+            for trailer in set(self.followup_trailers):
+                # Check if this trailer is already in the body
+                if trailer not in self.trailers:
+                    logger.info('    Adding trailer: %s', trailer)
+                    if cmdargs is None:
+                        cmdargs = ['interpret-trailers']
+                    cmdargs += ['--trailer', trailer]
+            if cmdargs:
+                am_body = git_run_command(None, args=cmdargs, stdin=am_body.encode('utf-8'))
+        am_msg = email.message.EmailMessage()
+        am_msg.set_payload(am_body.encode('utf-8'))
+        # Clean up headers
+        for hdrname, hdrval in self.msg.items():
+            lhdrname = hdrname.lower()
+            wanthdr = False
+            for hdrmatch in WANTHDRS:
+                if fnmatch.fnmatch(lhdrname, hdrmatch):
+                    wanthdr = True
+                    break
+            if wanthdr:
+                new_hdrval = LoreMessage.clean_header(hdrval)
+                am_msg.add_header(hdrname, new_hdrval)
+        return am_msg
+
+
+class LoreSubject:
+    def __init__(self, subject):
+        # Subject-based info
+        self.full_subject = None
+        self.subject = None
+        self.reply = False
+        self.resend = False
+        self.patch = False
+        self.rfc = False
+        self.revision = 1
+        self.counter = 1
+        self.expected = 1
+        self.revision_inferred = True
+        self.counters_inferred = True
+        self.prefixes = list()
+
+        subject = re.sub(r'\s+', ' ', LoreMessage.clean_header(subject)).strip()
+        # Remove any leading [] that don't have the word "patch" in them
+        while True:
+            oldsubj = subject
+            subject = re.sub(r'^\s*\[[^\]]*\]\s*(\[patch.*)', '\\1', subject, flags=re.IGNORECASE)
+            if oldsubj == subject:
+                break
+
+        # Remove any brackets inside brackets
+        while True:
+            oldsubj = subject
+            subject = re.sub(r'^\s*\[([^\]]*)\[([^\]]*)\]', '[\\1\\2]', subject)
+            subject = re.sub(r'^\s*\[([^\]]*)\]([^\]]*)\]', '[\\1\\2]', subject)
+            if oldsubj == subject:
+                break
+
+        self.full_subject = subject
+        # Is it a reply?
+        if re.search(r'^\w+:\s*\[', subject):
+            self.reply = True
+            subject = re.sub(r'^\w+:\s*\[', '[', subject)
+
+        # Find all [foo] in the title
+        while subject.find('[') == 0:
+            matches = re.search(r'^\[([^\]]*)\]', subject)
+            for chunk in matches.groups()[0].split():
+                if re.search(r'^\d+/\d+$', chunk):
+                    counters = chunk.split('/')
+                    self.counter = int(counters[0])
+                    self.expected = int(counters[1])
+                    self.counters_inferred = False
+                elif re.search(r'^v\d+$', chunk, re.IGNORECASE):
+                    self.revision = int(chunk[1:])
+                    self.revision_inferred = False
+                elif chunk.lower() == 'rfc':
+                    self.rfc = True
+                elif chunk.lower() == 'resend':
+                    self.resend = True
+                elif chunk.lower() == 'patch':
+                    self.patch = True
+                self.prefixes.append(chunk.lower())
+            subject = re.sub(r'^\s*\[[^\]]*\]\s*', '', subject)
+        self.subject = subject
+
+    def __repr__(self):
+        out = list()
+        out.append('  full_subject: %s' % self.full_subject)
+        out.append('  subject: %s' % self.subject)
+        out.append('  reply: %s' % self.reply)
+        out.append('  resend: %s' % self.resend)
+        out.append('  rfc: %s' % self.rfc)
+        out.append('  revision: %s' % self.revision)
+        out.append('  revision_inferred: %s' % self.revision_inferred)
+        out.append('  counter: %s' % self.counter)
+        out.append('  expected: %s' % self.expected)
+        out.append('  counters_inferred: %s' % self.counters_inferred)
+        out.append('  prefixes: %s' % ', '.join(self.prefixes))
+
+        return '\n'.join(out)
 
 
 def git_get_command_lines(gitdir, args):
@@ -86,26 +517,6 @@ def git_run_command(gitdir, args, stdin=None, logstderr=False):
     return output
 
 
-def amify_msg(msg, trailers, ensurediff=False):
-    body = get_plain_part(msg, ensurediff=ensurediff)
-    if trailers:
-        body = git_add_trailers(body, trailers)
-    msg.set_payload(body.encode('utf-8'))
-    # Clean up headers
-    newhdrs = []
-    for hdrname, hdrval in list(msg._headers):
-        lhdrname = hdrname.lower()
-        wanthdr = False
-        for hdrmatch in WANTHDRS:
-            if fnmatch.fnmatch(lhdrname, hdrmatch):
-                wanthdr = True
-                break
-        if wanthdr:
-            newhdrs.append((hdrname, hdrval))
-    msg._headers = newhdrs
-    return msg
-
-
 def get_config_from_git():
     gitconfig = _DEFAULT_CONFIG
     args = ['config', '-z', '--get-regexp', r'get-lore-mbox\..*']
@@ -137,8 +548,14 @@ def get_msgid_from_stdin():
 
 def get_pi_thread_by_url(t_mbx_url, savefile):
     resp = requests.get(t_mbx_url)
+    if resp.status_code != 200:
+        logger.critical('Server returned an error: %s', resp.status_code)
+        return None
     t_mbox = gzip.decompress(resp.content)
     resp.close()
+    if not len(t_mbox):
+        logger.critical('No messages found for that query')
+        return None
     with open(savefile, 'wb') as fh:
         logger.debug('Saving %s', savefile)
         fh.write(t_mbox)
@@ -167,55 +584,12 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs):
 
     loc = urllib.parse.urlparse(t_mbx_url)
     if cmdargs.useproject:
+        logger.info('Modifying query to use %s', cmdargs.useproject)
         t_mbx_url = '%s://%s/%s/%s/t.mbox.gz' % (
             loc.scheme, loc.netloc, cmdargs.useproject, msgid)
+        logger.debug('Will query: %s', t_mbx_url)
     logger.critical('Grabbing thread from %s', loc.netloc)
     return get_pi_thread_by_url(t_mbx_url, savefile)
-
-
-def get_plain_part(msg, ensurediff=False):
-    # walk until we find the first text/plain part
-    mcharset = msg.get_content_charset()
-    if not mcharset:
-        mcharset = 'utf-8'
-    body = None
-    for part in msg.walk():
-        if part.get_content_type().find('text/plain') < 0:
-            continue
-        body = part.get_payload(decode=True)
-        if body is None:
-            continue
-        pcharset = part.get_content_charset()
-        if not pcharset:
-            pcharset = mcharset
-        body = body.decode(pcharset, errors='replace')
-        if ensurediff and not body_contains_diff(body):
-            continue
-        break
-    return body
-
-
-def git_add_trailers(payload, trailers):
-    cmdargs = ['interpret-trailers']
-    output = payload
-    if trailers:
-        for trailer in set(trailers):
-            # Check if this trailer is already in the body
-            if payload.find(trailer) < 0:
-                logger.info('    Adding trailer: %s', trailer)
-                cmdargs += ['--trailer', trailer]
-        output = git_run_command(None, args=cmdargs, stdin=payload.encode('utf-8'))
-    return output
-
-
-def get_clean_msgid(msg, header='Message-ID'):
-    msgid = None
-    raw = msg.get(header)
-    if raw:
-        matches = re.search(r'<([^>]+)>', raw)
-        if matches:
-            msgid = matches.groups()[0]
-    return msgid
 
 
 def mbox_to_am(mboxfile, config, cmdargs):
@@ -226,189 +600,59 @@ def mbox_to_am(mboxfile, config, cmdargs):
     mbx = mailbox.mbox(mboxfile)
     count = len(mbx)
     logger.info('Analyzing %s messages in the thread', count)
-    am_kept = list()
-    slug = None
-    cover_keys = dict()
-    sorted_keys = [None, None]
-    trailer_map = dict()
-    cur_vn = None
-    vn = None
-    multiple_revisions = False
-    msgid_map = dict()
-    irt_map = dict()
-    # Go through the mbox once to build a message map:
+    lmbx = LoreMailbox()
+    # Go through the mbox once to populate base series
     for key, msg in mbx.items():
-        msgid = get_clean_msgid(msg)
-        irtid = get_clean_msgid(msg, header='In-Reply-To')
-        msgid_map[msgid] = key
-        if irtid is not None:
-            if irtid not in irt_map.keys():
-                irt_map[irtid] = list()
-            irt_map[irtid].append(key)
-    # Go through it slowly now
-    for key, msg in mbx.items():
-        subj_info = get_subject_info(msg['Subject'])
-        logger.debug('Looking at msg %s: %s', key, subj_info['full_subject'])
-        body = get_plain_part(msg)
-        msgid = get_clean_msgid(msg)
-        irtid = get_clean_msgid(msg, header='In-Reply-To')
-        has_diffstat = body_contains_diffstat(body)
-        has_diff = body_contains_diff(body)
+        lmbx.add_message(msg)
 
-        # if it has no in-reply-to, but other messages I-R-T to it, then
-        # it's probably a cover letter that doesn't follow the standard 00/NN notation
-        if irtid is None and not has_diff and msgid in irt_map.keys():
-            logger.debug('  Probaby a cover letter')
-            cover_keys[subj_info['revision']] = key
-            continue
-
-        if subj_info['revision_inferred'] and irtid in msgid_map:
-            # Grab revision info from the cover letter
-            cover_subj_info = get_subject_info(mbx[msgid_map[irtid]]['Subject'])
-            subj_info['revision'] = cover_subj_info['revision']
-            # Make sure sorted_keys has enough members
-            if len(sorted_keys) < subj_info['expected'] + 1:
-                sorted_keys = [None] * (subj_info['expected'] + 1)
-
-        new_vn = subj_info['revision']
-        if cur_vn is None or new_vn > cur_vn:
-            if wantver and wantver != new_vn:
-                logger.info('Found series revision: v%s (ignored)', new_vn)
-            else:
-                logger.info('Found series revision: v%s', new_vn)
-            if cur_vn is not None and new_vn > cur_vn:
-                multiple_revisions = True
-            if wantver is None or wantver == new_vn:
-                # Blow away anything we currently have in sorted_keys
-                sorted_keys = [None] * (subj_info['expected'] + 1)
-                slug = None
-            cur_vn = new_vn
-        elif vn is None:
-            cur_vn = new_vn
-
-        if wantver is not None and wantver != cur_vn:
-            logger.debug('  Ignoring v%s: %s', cur_vn, subj_info['full_subject'])
-            continue
-
-        vn = cur_vn
-
-        # We use a "slug" for mbox name, based on the date and author
-        if not slug:
-            msgdate = email.utils.parsedate_tz(str(msg['Date']))
-            prefix = time.strftime('%Y%m%d', msgdate[:9])
-            authorline = email.utils.getaddresses(msg.get_all('from', []))[0]
-            if authorline[0]:
-                author = re.sub(r'\W+', '_', authorline[0]).strip('_').lower()
-            else:
-                author = re.sub(r'\W+', '_', authorline[1]).strip('_').lower()
-            slug = '%s_%s' % (prefix, author)
-            if cur_vn != 1:
-                slug = 'v%s_%s' % (cur_vn, slug)
-
-        # If the counter is 0, it's definitely the cover letter
-        if subj_info['counter'] == 0 and cur_vn not in cover_keys.keys():
-            # Found the cover letter
-            logger.debug('  Found a cover letter for v%s', cur_vn)
-            am_kept.append(key)
-            sorted_keys[subj_info['counter']] = key
-            cover_keys[cur_vn] = key
-            continue
-
-        if has_diff:
-            # Do we already have a match for this, though?
-            if sorted_keys[subj_info['counter']] is None:
-                am_kept.append(key)
-                sorted_keys[subj_info['counter']] = key
-                continue
-        # Do we have something that looks like a new trailer?
-        matches = re.search(r'^\s*([\w-]+: .*<\S+>)\s*$', body, re.MULTILINE)
-        if not matches:
-            continue
-        # Where do we need to stick them?
-        irt_key = 0
-        irt_id = get_clean_msgid(msg, header='In-Reply-To')
-        if irt_id and irt_id in msgid_map:
-            irt_key = msgid_map[irt_id]
-        if irt_key not in trailer_map:
-            trailer_map[irt_key] = list()
-        trailer_map[irt_key] += matches.groups()
-
-    if not len(am_kept):
-        logger.info('Did not find any patches to save')
-        return None
-
-    if not wantname:
-        am_filename = os.path.join(outdir, '%s.mbx' % slug)
-        am_cover = os.path.join(outdir, '%s.cover' % slug)
-    else:
-        am_filename = os.path.join(outdir, wantname)
-        am_cover = os.path.join(outdir, '%s.cover' % wantname)
-        if wantname.find('.') < 0:
-            slug = wantname
-        else:
-            slug = '.'.join(wantname.split('.')[:-1])
-
-    if multiple_revisions and not wantver:
-        logger.info('Will use the latest revision: v%s', vn)
+    lser = lmbx.get_series(revision=wantver)
+    if lser is None and wantver is None:
+        logger.critical('No patches found.')
+        return
+    if lser is None:
+        logger.critical('Unable to find revision %s', wantver)
+        return
+    if len(lmbx.series) > 1 and not wantver:
+        logger.info('Will use the latest revision: v%s', lser.revision)
         logger.info('You can pick other revisions using the -vN flag')
-    if os.path.exists(am_filename):
-        os.unlink(am_filename)
-    am_mbx = mailbox.mbox(am_filename)
+
+    if wantname:
+        slug = wantname
+        if wantname.find('.') > -1:
+            slug = '.'.join(wantname.split('.')[:-1])
+    else:
+        slug = lser.get_slug()
+
+    am_filename = os.path.join(outdir, '%s.mbx' % lser.get_slug())
+    am_cover = os.path.join(outdir, '%s.cover' % lser.get_slug())
+
+    am_mbx = lser.save_am_mbox(am_filename, covertrailers)
     logger.info('---')
 
-    # Check if any trailers were sent to the cover letter
-    global_trailers = []
-    if vn in cover_keys and cover_keys[vn] in trailer_map:
-        global_trailers = trailer_map[cover_keys[vn]]
-
-    logger.critical('Writing %s', am_filename)
-    have_missing = False
-    at = 1
-    for key in sorted_keys[1:]:
-        if key is None:
-            logger.error('  ERROR: missing [%s/%s]!', at, len(sorted_keys)-1)
-            have_missing = True
-        else:
-            msg = mbx[key]
-            subject = re.sub(r'\s+', ' ', msg['Subject'])
-            logger.info('  %s', subject)
-            trailers = []
-            if key in trailer_map:
-                trailers += trailer_map[key]
-            if global_trailers and covertrailers:
-                trailers += global_trailers
-            msg = amify_msg(msg, trailers, ensurediff=True)
-            am_mbx.add(msg)
-        at += 1
-
-    if not len(am_mbx):
-        logger.info('Did not find any patches to save')
-        return None
-
     logger.critical('Total patches: %s', len(am_mbx))
-    if global_trailers and not covertrailers:
+    if lser.has_cover and lser.patches[0].followup_trailers and not covertrailers:
         # Warn that some trailers were sent to the cover letter
         logger.critical('---')
         logger.critical('NOTE: Some trailers were sent to the cover letter:')
-        for trailer in global_trailers:
+        for trailer in lser.patches[0].followup_trailers:
             logger.critical('      %s', trailer)
         logger.critical('NOTE: Rerun with -t to apply them to all patches')
 
     logger.critical('---')
-    if have_missing:
+    if not lser.complete:
         logger.critical('WARNING: Thread incomplete!')
 
-    if vn in cover_keys:
-        # Save the cover letter
-        cover_msg = amify_msg(mbx[cover_keys[vn]], None, ensurediff=False)
-        with open(am_cover, 'w') as fh:
-            fh.write(cover_msg.as_string())
-        logger.critical('Cover: %s', am_cover)
-        first_body = get_plain_part(cover_msg)
-    else:
-        first_body = get_plain_part(am_mbx[0])
+    if lser.has_cover:
+        lser.save_cover(am_cover)
 
-    top_msgid = get_clean_msgid(am_mbx[0])
+    top_msgid = None
+    first_body = None
+    for lmsg in lser.patches:
+        if lmsg is not None:
+            first_body = lmsg.body
+            top_msgid = lmsg.msgid
+            break
+
     linkurl = config['linkmask'] % top_msgid
     logger.critical('Link: %s', linkurl)
 
@@ -435,60 +679,7 @@ def mbox_to_am(mboxfile, config, cmdargs):
     return am_filename
 
 
-def get_subject_info(subject):
-    subject = re.sub(r'\s+', ' ', subject).strip()
-    subject_info = {
-        'full_subject': subject,
-        'reply': False,
-        'resend': False,
-        'rfc': False,
-        'revision': 1,
-        'revision_inferred': True,
-        'counter': 1,
-        'expected': 1,
-        'prefixes': list(),
-        'subject': None,
-    }
-    # Is it a reply?
-    if re.search(r'^\w+:\s*\[', subject):
-        subject_info['reply'] = True
-        subject = re.sub(r'^\w+:\s*\[', '[', subject)
-
-    # Find all [foo] in the title
-    while subject.find('[') == 0:
-        matches = re.search(r'^\[([^\]]*)\]', subject)
-        for chunk in matches.groups()[0].split():
-            if re.search(r'^\d+/\d+$', chunk):
-                counters = chunk.split('/')
-                subject_info['counter'] = int(counters[0])
-                subject_info['expected'] = int(counters[1])
-            elif re.search(r'^v\d+$', chunk, re.IGNORECASE):
-                subject_info['revision'] = int(chunk[1:])
-                subject_info['revision_inferred'] = False
-            elif chunk.lower() == 'rfc':
-                subject_info['rfc'] = True
-            elif chunk.lower() == 'resend':
-                subject_info['resend'] = True
-            subject_info['prefixes'].append(chunk.lower())
-        subject = re.sub(r'^\s*\[[^\]]*\]\s*', '', subject)
-    subject_info['subject'] = subject
-
-    return subject_info
-
-
-def body_contains_diffstat(body):
-    if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', body, re.MULTILINE | re.IGNORECASE):
-        return True
-    return False
-
-
-def body_contains_diff(body):
-    if re.search(r'^---.*\n\+\+\+', body, re.MULTILINE):
-        return True
-    return False
-
-
-def get_newest_series(mboxfile, cmdargs):
+def get_newest_series(mboxfile):
     # Open the mbox and find the latest series mentioned in it
     mbx = mailbox.mbox(mboxfile)
     base_msg = None
@@ -496,66 +687,66 @@ def get_newest_series(mboxfile, cmdargs):
     seen_msgids = list()
     seen_covers = list()
     for key, msg in mbx.items():
-        msgid = get_clean_msgid(msg)
+        msgid = LoreMessage.get_clean_msgid(msg)
         seen_msgids.append(msgid)
-        subj_info = get_subject_info(msg['Subject'])
+        lsub = LoreSubject(msg['Subject'])
         # Ignore replies or counters above 1
-        if subj_info['reply'] or subj_info['counter'] > 1:
+        if lsub.reply or lsub.counter > 1:
             continue
-        if latest_revision is None or subj_info['revision'] > latest_revision:
+        if latest_revision is None or lsub.revision > latest_revision:
             # New revision
-            latest_revision = subj_info['revision']
-            if subj_info['counter'] == 0:
+            latest_revision = lsub.revision
+            if lsub.counter == 0:
                 # And a cover letter, nice. This is the easy case
                 base_msg = msg
                 seen_covers.append(latest_revision)
                 continue
-            if subj_info['counter'] == 1:
+            if lsub.counter == 1:
                 if latest_revision not in seen_covers:
                     # A patch/series without a cover letter
                     base_msg = msg
 
     # Get subject info from base_msg again
-    subj_info = get_subject_info(base_msg['Subject'])
-    if not len(subj_info['prefixes']):
+    lsub = LoreSubject(base_msg['Subject'])
+    if not len(lsub.prefixes):
         logger.debug('Not checking for new revisions: no prefixes on the cover letter.')
         mbx.close()
         return
-    base_msgid = get_clean_msgid(base_msg)
+    base_msgid = LoreMessage.get_clean_msgid(base_msg)
     fromeml = email.utils.getaddresses(base_msg.get_all('from', []))[0][1]
     msgdate = email.utils.parsedate_tz(str(base_msg['Date']))
     startdate = time.strftime('%Y%m%d', msgdate[:9])
     listarc = base_msg.get_all('List-Archive')[-1].strip('<>')
-    q = 's:"%s" AND f:"%s" AND d:%s..' % (subj_info['subject'], fromeml, startdate)
+    q = 's:"%s" AND f:"%s" AND d:%s..' % (lsub.subject, fromeml, startdate)
     queryurl = '%s?%s' % (listarc, urllib.parse.urlencode({'q': q, 'x': 'A', 'o': '-1'}))
     logger.critical('Checking for newer revisions on %s', listarc)
     logger.debug('Query URL: %s', queryurl)
     resp = requests.get(queryurl)
     # try to parse it
-    tree = ET.fromstring(resp.content)
+    tree = xml.etree.ElementTree.fromstring(resp.content)
     resp.close()
     ns = {'atom': 'http://www.w3.org/2005/Atom'}
     entries = tree.findall('atom:entry', ns)
 
     for entry in entries:
         title = entry.find('atom:title', ns).text
-        subj_info = get_subject_info(title)
-        if subj_info['reply'] or subj_info['counter'] > 1:
+        lsub = LoreSubject(title)
+        if lsub.reply or lsub.counter > 1:
             logger.debug('Ignoring result (not interesting): %s', title)
             continue
         link = entry.find('atom:link', ns).get('href')
-        if subj_info['revision'] < latest_revision:
+        if lsub.revision < latest_revision:
             logger.debug('Ignoring result (not new revision): %s', title)
             continue
         if link.find('/%s/' % base_msgid) > 0:
             logger.debug('Ignoring result (same thread as ours):%s', title)
             continue
-        if subj_info['revision'] == 1 and subj_info['revision'] == latest_revision:
+        if lsub.revision == 1 and lsub.revision == latest_revision:
             # Someone sent a separate message with an identical title but no new vX in the subject line
             # It's *probably* a new revision.
             logger.debug('Likely a new revision: %s', title)
-        elif subj_info['revision'] > latest_revision:
-            logger.debug('Definitely a new revision [v%s]: %s', subj_info['revision'], title)
+        elif lsub.revision > latest_revision:
+            logger.debug('Definitely a new revision [v%s]: %s', lsub.revision, title)
         else:
             logger.debug('No idea what this is: %s', title)
             continue
@@ -566,7 +757,7 @@ def get_newest_series(mboxfile, cmdargs):
         # Append all of these to the existing mailbox
         new_adds = 0
         for nt_msg in nt_mbx:
-            nt_msgid = get_clean_msgid(nt_msg)
+            nt_msgid = LoreMessage.get_clean_msgid(nt_msg)
             if nt_msgid in seen_msgids:
                 logger.debug('Duplicate message, skipping')
                 continue
@@ -615,7 +806,7 @@ def main(cmdargs):
     mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs)
 
     if mboxfile and cmdargs.checknewer:
-        get_newest_series(mboxfile, cmdargs)
+        get_newest_series(mboxfile)
 
     if mboxfile is None:
         return
