@@ -33,22 +33,41 @@ _DEFAULT_CONFIG = {
     'linkmask': 'https://lore.kernel.org/r/%s',
 }
 
-WANTHDRS = {'sender',
-            'from',
-            'to',
-            'cc',
-            'subject',
-            'date',
-            'message-id',
-            'resent-message-id',
-            'reply-to',
-            'in-reply-to',
-            'references',
-            'list-id',
-            'errors-to',
-            'x-mailing-list',
-            'resent-to',
-            }
+# You can use bash-style globbing here
+WANTHDRS = [
+    'sender',
+    'from',
+    'to',
+    'cc',
+    'subject',
+    'date',
+    'message-id',
+    'resent-message-id',
+    'reply-to',
+    'in-reply-to',
+    'references',
+    'list-id',
+    'errors-to',
+    'x-mailing-list',
+    'resent-to',
+]
+
+# You can use bash-style globbing here
+# end with '*' to include any other trailers
+TRAILER_ORDER = [
+    'fixes*',
+    'reported*',
+    'suggested*',
+    'original*',
+    'co-*',
+    'signed-off*',
+    'tested*',
+    'reviewed*',
+    'acked*',
+    'cc*',
+    'link*',
+    '*',
+]
 
 
 class LoreMailbox:
@@ -87,6 +106,16 @@ class LoreMailbox:
 
         lser = self.series[revision]
 
+        # Is it empty?
+        empty = True
+        for lmsg in lser.patches:
+            if lmsg is not None:
+                empty = False
+                break
+        if empty:
+            logger.critical('All patches in series v%s are missing.', lser.revision)
+            return None
+
         # Do we have a cover letter for it?
         if not lser.has_cover:
             # Let's find the first patch with an in-reply-to and see if that
@@ -117,8 +146,12 @@ class LoreMailbox:
             lvl = 1
             while True:
                 logger.debug('%sParent: %s', ' ' * lvl, pmsg.full_subject)
-                logger.debug('%sTrailers: %s', ' ' * lvl, trailers)
+                logger.debug('%sTrailers:', ' ' * lvl)
+                for trailer in set(trailers):
+                    logger.debug('%s%s: %s', ' ' * (lvl+1), trailer[0], trailer[1])
                 found = False
+                if lser.revision != pmsg.revision:
+                    break
                 for lmsg in lser.patches:
                     if lmsg is not None and lmsg.msgid == pmsg.msgid:
                         # Confirmed, this is our parent patch
@@ -141,14 +174,14 @@ class LoreMailbox:
         logger.debug('Looking at: %s', lmsg.full_subject)
         self.msgid_map[lmsg.msgid] = lmsg
 
-        if lmsg.lsubject.patch:
+        if lmsg.lsubject.patch and (lmsg.has_diff or lmsg.has_diffstat):
             if lmsg.revision not in self.series:
                 self.series[lmsg.revision] = LoreSeries(lmsg.revision, lmsg.expected)
                 if len(self.series) > 1:
                     logger.info('Found new series v%s', lmsg.revision)
-            if lmsg.has_diff and not lmsg.reply:
+            if lmsg.has_diff:
                 self.series[lmsg.revision].add_patch(lmsg)
-            elif lmsg.counter == 0 and not lmsg.reply:
+            elif lmsg.counter == 0 and lmsg.has_diffstat:
                 # Bona-fide cover letter
                 self.series[lmsg.revision].add_cover(lmsg)
             elif lmsg.reply:
@@ -199,7 +232,13 @@ class LoreSeries:
         while len(self.patches) < lmsg.expected + 1:
             self.patches.append(None)
         self.expected = lmsg.expected
-        self.patches[lmsg.counter] = lmsg
+        if self.patches[lmsg.counter] is not None:
+            # Okay, weird, is the one in there a reply?
+            if self.patches[lmsg.counter].reply:
+                # Replace that one with this one
+                self.patches[lmsg.counter] = lmsg
+        else:
+            self.patches[lmsg.counter] = lmsg
         self.complete = not (None in self.patches[1:])
 
     def add_cover(self, lmsg):
@@ -226,9 +265,16 @@ class LoreSeries:
 
         return slug
 
-    def save_am_mbox(self, outfile, covertrailers):
+    def save_am_mbox(self, outfile, covertrailers, addmysob=False, addlink=False, linkmask=None):
         if os.path.exists(outfile):
             os.unlink(outfile)
+        usercfg = dict()
+        if addmysob:
+            usercfg = get_config_from_git(r'user\..*')
+            if 'name' not in usercfg or 'email' not in usercfg:
+                logger.critical('WARNING: Unable to add your Signed-Off-By: git returned no user.name or user.email')
+                addmysob = False
+
         mbx = mailbox.mbox(outfile)
         logger.info('---')
         logger.critical('Writing %s', outfile)
@@ -237,6 +283,10 @@ class LoreSeries:
             if lmsg is not None:
                 if self.has_cover and covertrailers and self.patches[0].followup_trailers:
                     lmsg.followup_trailers += self.patches[0].followup_trailers
+                if addmysob:
+                    lmsg.followup_trailers.append(('Signed-Off-By', '%s <%s>' % (usercfg['name'], usercfg['email'])))
+                if addlink:
+                    lmsg.followup_trailers.append(('Link', linkmask % lmsg.msgid))
                 logger.info('  %s', lmsg.full_subject)
                 msg = lmsg.get_am_message()
                 mbx.add(msg)
@@ -315,8 +365,8 @@ class LoreMessage:
         if re.search(r'^---.*\n\+\+\+', self.body, re.MULTILINE):
             self.has_diff = True
 
-        # Do we have something that looks like a trailer?
-        matches = re.findall(r'^\s*([\w-]+: .*<\S+>)\s*$', self.body, re.MULTILINE)
+        # Do we have something that looks like a person-trailer?
+        matches = re.findall(r'^\s*([\w-]+):\s+(.*<\S+>)\s*$', self.body, re.MULTILINE)
         if matches:
             self.trailers = matches
 
@@ -375,19 +425,52 @@ class LoreMessage:
                 msgid = matches.groups()[0]
         return msgid
 
+    def fix_trailers(self):
+        bodylines = self.body.split('\n')
+        # Get existing trailers
+        # 1. Find the first ---
+        # 2. Go backwards and grab everything matching ^[\w-]+:\s.*$ until a blank line
+        fixlines = list()
+        trailersdone = False
+        for line in bodylines:
+            if trailersdone:
+                fixlines.append(line)
+                continue
+
+            if line.strip() == '---':
+                # Start going backwards in fixlines
+                btrailers = list()
+                for rline in reversed(fixlines):
+                    if not len(rline.strip()):
+                        break
+                    matches = re.search(r'^([\w-]+):\s+(.*)', rline)
+                    if not matches:
+                        break
+                    fixlines.pop()
+                    btrailers.append(matches.groups())
+
+                # Now we add mix-in trailers
+                trailers = btrailers + self.followup_trailers
+                added = list()
+                for trailermatch in TRAILER_ORDER:
+                    for trailer in trailers:
+                        if trailer in added:
+                            continue
+                        if fnmatch.fnmatch(trailer[0].lower(), trailermatch):
+                            fixlines.append('%s: %s' % trailer)
+                            if trailer not in btrailers:
+                                logger.info('    Added: %s: %s' % trailer)
+                            else:
+                                logger.debug('     Kept: %s: %s' % trailer)
+                            added.append(trailer)
+                trailersdone = True
+            fixlines.append(line)
+        self.body = '\n'.join(fixlines)
+
     def get_am_message(self, add_trailers=True):
+        if add_trailers:
+            self.fix_trailers()
         am_body = self.body
-        if add_trailers and self.followup_trailers:
-            cmdargs = None
-            for trailer in set(self.followup_trailers):
-                # Check if this trailer is already in the body
-                if trailer not in self.trailers:
-                    logger.info('    Adding trailer: %s', trailer)
-                    if cmdargs is None:
-                        cmdargs = ['interpret-trailers']
-                    cmdargs += ['--trailer', trailer]
-            if cmdargs:
-                am_body = git_run_command(None, args=cmdargs, stdin=am_body.encode('utf-8'))
         am_msg = email.message.EmailMessage()
         am_msg.set_payload(am_body.encode('utf-8'))
         # Clean up headers
@@ -518,10 +601,12 @@ def git_run_command(gitdir, args, stdin=None, logstderr=False):
     return output
 
 
-def get_config_from_git():
-    gitconfig = _DEFAULT_CONFIG
-    args = ['config', '-z', '--get-regexp', r'get-lore-mbox\..*']
+def get_config_from_git(regexp, defaults=None):
+    args = ['config', '-z', '--get-regexp', regexp]
     out = git_run_command(None, args)
+    gitconfig = defaults
+    if not gitconfig:
+        gitconfig = dict()
     if not out:
         return gitconfig
 
@@ -627,7 +712,8 @@ def mbox_to_am(mboxfile, config, cmdargs):
     am_filename = os.path.join(outdir, '%s.mbx' % lser.get_slug())
     am_cover = os.path.join(outdir, '%s.cover' % lser.get_slug())
 
-    am_mbx = lser.save_am_mbox(am_filename, covertrailers)
+    am_mbx = lser.save_am_mbox(am_filename, covertrailers, addmysob=cmdargs.addmysob,
+                               addlink=cmdargs.addlink, linkmask=config['linkmask'])
     logger.info('---')
 
     logger.critical('Total patches: %s', len(am_mbx))
@@ -653,6 +739,9 @@ def mbox_to_am(mboxfile, config, cmdargs):
             first_body = lmsg.body
             top_msgid = lmsg.msgid
             break
+    if top_msgid is None:
+        logger.critical('Could not find any patches in the series.')
+        return
 
     linkurl = config['linkmask'] % top_msgid
     logger.critical('Link: %s', linkurl)
@@ -803,7 +892,7 @@ def main(cmdargs):
         msgid = cmdargs.msgid
 
     msgid = msgid.strip('<>')
-    config = get_config_from_git()
+    config = get_config_from_git(r'get-lore-mbox\..*', defaults=_DEFAULT_CONFIG)
     mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs)
 
     if mboxfile and cmdargs.checknewer:
@@ -842,6 +931,10 @@ if __name__ == '__main__':
                         help='Apply trailers sent to the cover letter to all patches (use with -a)')
     parser.add_argument('-v', '--use-version', dest='wantver', type=int, default=None,
                         help='Get a specific version of the patch/series (use with -a)')
+    parser.add_argument('-s', '--add-my-sob', dest='addmysob', action='store_true', default=False,
+                        help='Add your own signed-off-by to every patch (use with -a)')
+    parser.add_argument('-l', '--add-link', dest='addlink', action='store_true', default=False,
+                        help='Add a lore.kernel.org/r/ link to every patch (use with -a)')
     parser.add_argument('-n', '--mbox-name', dest='wantname', default=None,
                         help='Filename to name the mbox file')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
