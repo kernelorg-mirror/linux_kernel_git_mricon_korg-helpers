@@ -28,6 +28,8 @@ from email import charset
 charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
 
+VERSION = '0.2'
+
 _DEFAULT_CONFIG = {
     'midmask': 'https://lore.kernel.org/r/%s',
     'linkmask': 'https://lore.kernel.org/r/%s',
@@ -633,8 +635,8 @@ def get_msgid_from_stdin():
     sys.exit(1)
 
 
-def get_pi_thread_by_url(t_mbx_url, savefile):
-    resp = requests.get(t_mbx_url)
+def get_pi_thread_by_url(t_mbx_url, savefile, session):
+    resp = session.get(t_mbx_url)
     if resp.status_code != 200:
         logger.critical('Server returned an error: %s', resp.status_code)
         return None
@@ -649,13 +651,13 @@ def get_pi_thread_by_url(t_mbx_url, savefile):
     return savefile
 
 
-def get_pi_thread_by_msgid(msgid, config, cmdargs):
+def get_pi_thread_by_msgid(msgid, config, cmdargs, session):
     wantname = cmdargs.wantname
     outdir = cmdargs.outdir
     # Grab the head from lore, to see where we are redirected
     midmask = config['midmask'] % msgid
     logger.info('Looking up %s', midmask)
-    resp = requests.head(midmask)
+    resp = session.head(midmask)
     if resp.status_code < 300 or resp.status_code > 400:
         logger.critical('That message-id is not known.')
         return None
@@ -676,7 +678,7 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs):
             loc.scheme, loc.netloc, cmdargs.useproject, msgid)
         logger.debug('Will query: %s', t_mbx_url)
     logger.critical('Grabbing thread from %s', loc.netloc)
-    return get_pi_thread_by_url(t_mbx_url, savefile)
+    return get_pi_thread_by_url(t_mbx_url, savefile, session)
 
 
 def mbox_to_am(mboxfile, config, cmdargs):
@@ -821,7 +823,7 @@ def am_mbox_to_quilt(am_mbx, q_dirname):
             sfh.write('%s\n' % patch_filename)
 
 
-def get_newest_series(mboxfile):
+def get_newest_series(mboxfile, session):
     # Open the mbox and find the latest series mentioned in it
     mbx = mailbox.mbox(mboxfile)
     base_msg = None
@@ -863,7 +865,7 @@ def get_newest_series(mboxfile):
     queryurl = '%s?%s' % (listarc, urllib.parse.urlencode({'q': q, 'x': 'A', 'o': '-1'}))
     logger.critical('Checking for newer revisions on %s', listarc)
     logger.debug('Query URL: %s', queryurl)
-    resp = requests.get(queryurl)
+    resp = session.get(queryurl)
     # try to parse it
     tree = xml.etree.ElementTree.fromstring(resp.content)
     resp.close()
@@ -894,7 +896,7 @@ def get_newest_series(mboxfile):
             continue
         t_mbx_url = '%st.mbox.gz' % link
         savefile = mkstemp('get-lore-mbox')[1]
-        nt_mboxfile = get_pi_thread_by_url(t_mbx_url, savefile)
+        nt_mboxfile = get_pi_thread_by_url(t_mbx_url, savefile, session)
         nt_mbx = mailbox.mbox(nt_mboxfile)
         # Append all of these to the existing mailbox
         new_adds = 0
@@ -945,10 +947,13 @@ def main(cmdargs):
 
     msgid = msgid.strip('<>')
     config = get_config_from_git(r'get-lore-mbox\..*', defaults=_DEFAULT_CONFIG)
-    mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs)
+
+    session = requests.session()
+    session.headers.update({'User-Agent': 'get-lore-mbox/%s' % VERSION})
+    mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs, session)
 
     if mboxfile and cmdargs.checknewer:
-        get_newest_series(mboxfile)
+        get_newest_series(mboxfile, session)
 
     if mboxfile is None:
         return
