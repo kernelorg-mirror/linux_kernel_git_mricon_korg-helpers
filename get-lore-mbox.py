@@ -28,7 +28,7 @@ from email import charset
 charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2'
+VERSION = '0.2.1'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -314,6 +314,8 @@ class LoreMessage:
 
         # Header-based info
         self.in_reply_to = None
+        self.fromname = None
+        self.fromemail = None
 
         # Body and body-based info
         self.body = None
@@ -340,6 +342,13 @@ class LoreMessage:
 
         self.in_reply_to = LoreMessage.get_clean_msgid(self.msg, header='In-Reply-To')
 
+        try:
+            fromdata = email.utils.getaddresses(self.msg.get_all('from', []))[0]
+            self.fromname = fromdata[0]
+            self.fromemail = fromdata[1]
+        except IndexError:
+            pass
+
         # walk until we find the first text/plain part
         mcharset = self.msg.get_content_charset()
         if not mcharset:
@@ -363,16 +372,24 @@ class LoreMessage:
         if re.search(r'^---.*\n\+\+\+', self.body, re.MULTILINE):
             self.has_diff = True
 
-        # Do we have something that looks like a person-trailer?
-        matches = re.findall(r'^\s*([\w-]+):\s+(.*<\S+>)\s*$', self.body, re.MULTILINE)
-        if matches:
-            self.trailers = matches
+        # We only pay attention to trailers that are sent in reply
+        if self.reply:
+            # Do we have something that looks like a person-trailer?
+            matches = re.findall(r'^\s*([\w-]+):\s+(.*<\S+>)\s*$', self.body, re.MULTILINE)
+            if matches:
+                # Does the email in the trailer match what's in the From?
+                for tname, tvalue in matches:
+                    namedata = email.utils.getaddresses([tvalue])[0]
+                    if namedata[1].lower() == self.fromemail.lower():
+                        self.trailers.append((tname, tvalue))
 
     def __repr__(self):
         out = list()
         out.append('msgid: %s' % self.msgid)
         out.append(str(self.lsubject))
 
+        out.append('  fromname: %s' % self.fromname)
+        out.append('  fromemail: %s' % self.fromemail)
         out.append('  in_reply_to: %s' % self.in_reply_to)
 
         # Header-based info
