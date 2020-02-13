@@ -30,11 +30,6 @@ logger = logging.getLogger('get-lore-mbox')
 
 VERSION = '0.2'
 
-_DEFAULT_CONFIG = {
-    'midmask': 'https://lore.kernel.org/r/%s',
-    'linkmask': 'https://lore.kernel.org/r/%s',
-}
-
 # You can use bash-style globbing here
 WANTHDRS = [
     'sender',
@@ -56,20 +51,17 @@ WANTHDRS = [
 
 # You can use bash-style globbing here
 # end with '*' to include any other trailers
-TRAILER_ORDER = [
-    'fixes*',
-    'reported*',
-    'suggested*',
-    'original*',
-    'co-*',
-    'signed-off*',
-    'tested*',
-    'reviewed*',
-    'acked*',
-    'cc*',
-    'link*',
-    '*',
-]
+# You can change the default in your ~/.gitconfig, e.g.:
+# [get-lore-mbox]
+#   # remember to end with ,*
+#   trailer-order=link*,fixes*,cc*,reported*,suggested*,original*,co-*,tested*,reviewed*,acked*,signed-off*,*
+DEFAULT_TRAILER_ORDER = 'fixes*,reported*,suggested*,original*,co-*,signed-off*,tested*,reviewed*,acked*,cc*,link*,*'
+
+DEFAULT_CONFIG = {
+    'midmask': 'https://lore.kernel.org/r/%s',
+    'linkmask': 'https://lore.kernel.org/r/%s',
+    'trailer-order': DEFAULT_TRAILER_ORDER,
+}
 
 
 class LoreMailbox:
@@ -267,7 +259,7 @@ class LoreSeries:
 
         return slug
 
-    def save_am_mbox(self, outfile, covertrailers, addmysob=False, addlink=False, linkmask=None):
+    def save_am_mbox(self, outfile, covertrailers, trailer_order=None, addmysob=False, addlink=False, linkmask=None):
         if os.path.exists(outfile):
             os.unlink(outfile)
         usercfg = dict()
@@ -290,7 +282,7 @@ class LoreSeries:
                 if addlink:
                     lmsg.followup_trailers.append(('Link', linkmask % lmsg.msgid))
                 logger.info('  %s', lmsg.full_subject)
-                msg = lmsg.get_am_message()
+                msg = lmsg.get_am_message(trailer_order=trailer_order)
                 mbx.add(msg)
             else:
                 logger.error('  ERROR: missing [%s/%s]!', at, self.expected)
@@ -298,7 +290,7 @@ class LoreSeries:
         return mbx
 
     def save_cover(self, outfile):
-        cover_msg = self.patches[0].get_am_message(add_trailers=False)
+        cover_msg = self.patches[0].get_am_message(add_trailers=False, trailer_order=None)
         with open(outfile, 'w') as fh:
             fh.write(cover_msg.as_string())
         logger.critical('Cover: %s', outfile)
@@ -341,6 +333,10 @@ class LoreMessage:
         self.expected = self.lsubject.expected
         self.revision_inferred = self.lsubject.revision_inferred
         self.counters_inferred = self.lsubject.counters_inferred
+
+        # Handle [PATCH 6/5]
+        if self.counter > self.expected:
+            self.expected = self.counter
 
         self.in_reply_to = LoreMessage.get_clean_msgid(self.msg, header='In-Reply-To')
 
@@ -427,7 +423,7 @@ class LoreMessage:
                 msgid = matches.groups()[0]
         return msgid
 
-    def fix_trailers(self):
+    def fix_trailers(self, trailer_order=None):
         bodylines = self.body.split('\n')
         # Get existing trailers
         # 1. Find the first ---
@@ -454,11 +450,13 @@ class LoreMessage:
                 # Now we add mix-in trailers
                 trailers = btrailers + self.followup_trailers
                 added = list()
-                for trailermatch in TRAILER_ORDER:
+                if trailer_order is None:
+                    trailer_order = DEFAULT_TRAILER_ORDER
+                for trailermatch in trailer_order:
                     for trailer in trailers:
                         if trailer in added:
                             continue
-                        if fnmatch.fnmatch(trailer[0].lower(), trailermatch):
+                        if fnmatch.fnmatch(trailer[0].lower(), trailermatch.strip()):
                             fixlines.append('%s: %s' % trailer)
                             if trailer not in btrailers:
                                 logger.info('    Added: %s: %s' % trailer)
@@ -469,9 +467,9 @@ class LoreMessage:
             fixlines.append(line)
         self.body = '\n'.join(fixlines)
 
-    def get_am_message(self, add_trailers=True):
+    def get_am_message(self, add_trailers=True, trailer_order=None):
         if add_trailers:
-            self.fix_trailers()
+            self.fix_trailers(trailer_order=trailer_order)
         am_body = self.body
         am_msg = email.message.EmailMessage()
         am_msg.set_payload(am_body.encode('utf-8'))
@@ -532,7 +530,7 @@ class LoreSubject:
         while subject.find('[') == 0:
             matches = re.search(r'^\[([^\]]*)\]', subject)
             for chunk in matches.groups()[0].split():
-                if re.search(r'^\d+/\d+$', chunk):
+                if re.search(r'^\d{1,3}/\d{1,3}$', chunk):
                     counters = chunk.split('/')
                     self.counter = int(counters[0])
                     self.expected = int(counters[1])
@@ -673,7 +671,7 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs, session):
 
     loc = urllib.parse.urlparse(t_mbx_url)
     if cmdargs.useproject:
-        logger.info('Modifying query to use %s', cmdargs.useproject)
+        logger.debug('Modifying query to use %s', cmdargs.useproject)
         t_mbx_url = '%s://%s/%s/%s/t.mbox.gz' % (
             loc.scheme, loc.netloc, cmdargs.useproject, msgid)
         logger.debug('Will query: %s', t_mbx_url)
@@ -715,8 +713,9 @@ def mbox_to_am(mboxfile, config, cmdargs):
     am_filename = os.path.join(outdir, '%s.mbx' % slug)
     am_cover = os.path.join(outdir, '%s.cover' % slug)
 
-    am_mbx = lser.save_am_mbox(am_filename, covertrailers, addmysob=cmdargs.addmysob,
-                               addlink=cmdargs.addlink, linkmask=config['linkmask'])
+    am_mbx = lser.save_am_mbox(am_filename, covertrailers, trailer_order=config['trailer-order'],
+                               addmysob=cmdargs.addmysob, addlink=cmdargs.addlink,
+                               linkmask=config['linkmask'])
     logger.info('---')
 
     logger.critical('Total patches: %s', len(am_mbx))
@@ -946,7 +945,17 @@ def main(cmdargs):
         msgid = cmdargs.msgid
 
     msgid = msgid.strip('<>')
-    config = get_config_from_git(r'get-lore-mbox\..*', defaults=_DEFAULT_CONFIG)
+    # Handle the case when someone pastes a full URL to the message
+    matches = re.search(r'^https?://[^/]+/([^/]+)/([^/]+@[^/]+)', msgid, re.IGNORECASE)
+    if matches:
+        chunks = matches.groups()
+        msgid = chunks[1]
+        # Infer the project name from the URL, if possible
+        if chunks[0] != 'r':
+            cmdargs.useproject = chunks[0]
+
+    config = get_config_from_git(r'get-lore-mbox\..*', defaults=DEFAULT_CONFIG)
+    config['trailer-order'] = config['trailer-order'].split(',')
 
     session = requests.session()
     session.headers.update({'User-Agent': 'get-lore-mbox/%s' % VERSION})
