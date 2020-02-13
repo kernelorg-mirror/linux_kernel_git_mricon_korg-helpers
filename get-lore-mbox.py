@@ -272,7 +272,7 @@ class LoreSeries:
         if addmysob:
             usercfg = get_config_from_git(r'user\..*')
             if 'name' not in usercfg or 'email' not in usercfg:
-                logger.critical('WARNING: Unable to add your Signed-Off-By: git returned no user.name or user.email')
+                logger.critical('WARNING: Unable to add your Signed-off-by: git returned no user.name or user.email')
                 addmysob = False
 
         mbx = mailbox.mbox(outfile)
@@ -284,7 +284,7 @@ class LoreSeries:
                 if self.has_cover and covertrailers and self.patches[0].followup_trailers:
                     lmsg.followup_trailers += self.patches[0].followup_trailers
                 if addmysob:
-                    lmsg.followup_trailers.append(('Signed-Off-By', '%s <%s>' % (usercfg['name'], usercfg['email'])))
+                    lmsg.followup_trailers.append(('Signed-off-by', '%s <%s>' % (usercfg['name'], usercfg['email'])))
                 if addlink:
                     lmsg.followup_trailers.append(('Link', linkmask % lmsg.msgid))
                 logger.info('  %s', lmsg.full_subject)
@@ -484,6 +484,7 @@ class LoreMessage:
             if wanthdr:
                 new_hdrval = LoreMessage.clean_header(hdrval)
                 am_msg.add_header(hdrname, new_hdrval)
+        am_msg.set_charset('utf-8')
         return am_msg
 
 
@@ -709,8 +710,8 @@ def mbox_to_am(mboxfile, config, cmdargs):
     else:
         slug = lser.get_slug()
 
-    am_filename = os.path.join(outdir, '%s.mbx' % lser.get_slug())
-    am_cover = os.path.join(outdir, '%s.cover' % lser.get_slug())
+    am_filename = os.path.join(outdir, '%s.mbx' % slug)
+    am_cover = os.path.join(outdir, '%s.cover' % slug)
 
     am_mbx = lser.save_am_mbox(am_filename, covertrailers, addmysob=cmdargs.addmysob,
                                addlink=cmdargs.addlink, linkmask=config['linkmask'])
@@ -744,7 +745,12 @@ def mbox_to_am(mboxfile, config, cmdargs):
         return
 
     linkurl = config['linkmask'] % top_msgid
-    logger.critical('Link: %s', linkurl)
+    if cmdargs.quiltready:
+        q_dirname = os.path.join(outdir, '%s.patches' % slug)
+        am_mbox_to_quilt(am_mbx, q_dirname)
+        logger.critical('Quilt: %s', q_dirname)
+
+    logger.critical(' Link: %s', linkurl)
 
     base_commit = None
     matches = re.search(r'base-commit: .*?([0-9a-f]+)', first_body, re.MULTILINE)
@@ -757,16 +763,62 @@ def mbox_to_am(mboxfile, config, cmdargs):
             base_commit = matches.groups()[0]
 
     if base_commit:
-        logger.critical('Base-commit included, you can branch using:')
-        logger.critical('  git checkout -b %s %s', slug, base_commit)
-        logger.critical('  git am %s', am_filename)
+        logger.critical(' Base: %s', base_commit)
+        logger.critical('       git checkout -b %s %s', slug, base_commit)
+        logger.critical('       git am %s', am_filename)
     else:
-        logger.info('No base-commit information included, sorry.')
-        logger.info('  git checkout -b %s master', slug)
-        logger.info('  git am %s', am_filename)
+        logger.critical(' Base: not found, sorry')
+        logger.critical('       git checkout -b %s master', slug)
+        logger.critical('       git am %s', am_filename)
+
     am_mbx.close()
 
     return am_filename
+
+
+def am_mbox_to_quilt(am_mbx, q_dirname):
+    if os.path.exists(q_dirname):
+        logger.critical('ERROR: Directory %s exists, not saving quilt patches', q_dirname)
+        return
+    os.mkdir(q_dirname, 0o755)
+    patch_filenames = list()
+    for key, msg in am_mbx.items():
+        # Run each message through git mailinfo
+        msg_out = mkstemp(suffix=None, prefix=None, dir=q_dirname)
+        patch_out = mkstemp(suffix=None, prefix=None, dir=q_dirname)
+        cmdargs = ['mailinfo', '--encoding=UTF-8', msg_out[1], patch_out[1]]
+        info = git_run_command(None, cmdargs, msg.as_string().encode('utf-8'))
+        if not len(info.strip()):
+            logger.critical('ERROR: Could not get mailinfo from patch %s', msg['Subject'])
+            continue
+        patchinfo = dict()
+        for line in info.split('\n'):
+            chunks = line.split(':',  1)
+            patchinfo[chunks[0]] = chunks[1]
+
+        slug = re.sub(r'\W+', '_', patchinfo['Subject']).strip('_').lower()
+        patch_filename = '%04d_%s.patch' % (key+1, slug)
+        patch_filenames.append(patch_filename)
+        quilt_out = os.path.join(q_dirname, patch_filename)
+        with open(quilt_out, 'wb') as fh:
+            line = 'From: %s <%s>\n' % (patchinfo['Author'].strip(), patchinfo['Email'].strip())
+            fh.write(line.encode('utf-8'))
+            line = 'Subject: %s\n' % patchinfo['Subject'].strip()
+            fh.write(line.encode('utf-8'))
+            line = 'Date: %s\n' % patchinfo['Date'].strip()
+            fh.write(line.encode('utf-8'))
+            fh.write('\n'.encode('utf-8'))
+            with open(msg_out[1], 'r') as mfh:
+                fh.write(mfh.read().encode('utf-8'))
+            with open(patch_out[1], 'r') as pfh:
+                fh.write(pfh.read().encode('utf-8'))
+        logger.debug('  Wrote: %s', patch_filename)
+        os.unlink(msg_out[1])
+        os.unlink(patch_out[1])
+    # Write the series file
+    with open(os.path.join(q_dirname, 'series'), 'w') as sfh:
+        for patch_filename in patch_filenames:
+            sfh.write('%s\n' % patch_filename)
 
 
 def get_newest_series(mboxfile):
@@ -937,6 +989,8 @@ if __name__ == '__main__':
                         help='Add a lore.kernel.org/r/ link to every patch (use with -a)')
     parser.add_argument('-n', '--mbox-name', dest='wantname', default=None,
                         help='Filename to name the mbox file')
+    parser.add_argument('-Q', '--quilt-ready', dest='quiltready', action='store_true', default=False,
+                        help='Save mbox patches in a quilt-ready folder (use with -a)')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Add more debugging info to the output')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
