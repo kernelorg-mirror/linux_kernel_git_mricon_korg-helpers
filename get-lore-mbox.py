@@ -12,6 +12,7 @@ import email
 import email.message
 import email.utils
 import email.header
+import email.policy
 import subprocess
 import logging
 import re
@@ -28,7 +29,7 @@ from email import charset
 charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.1'
+VERSION = '0.2.2'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -283,7 +284,8 @@ class LoreSeries:
                     lmsg.followup_trailers.append(('Link', linkmask % lmsg.msgid))
                 logger.info('  %s', lmsg.full_subject)
                 msg = lmsg.get_am_message(trailer_order=trailer_order)
-                mbx.add(msg)
+                # Pass a policy that avoids most legacy encoding horrors
+                mbx.add(msg.as_bytes(policy=msg.policy.clone(utf8=True, cte_type='8bit', max_line_length=None)))
             else:
                 logger.error('  ERROR: missing [%s/%s]!', at, self.expected)
             at += 1
@@ -413,22 +415,9 @@ class LoreMessage:
 
     @staticmethod
     def clean_header(hdrval):
-        new_hdrval = ''
-        dhdrs = email.header.decode_header(hdrval)
-        for dhdr in dhdrs:
-            if dhdr[1] is not None:
-                try:
-                    uval = dhdr[0].decode(dhdr[1], errors='replace')
-                except LookupError:
-                    # Not known charset/encoding. Try utf-8 and hope for the best.
-                    uval = dhdr[0].decode('utf-8', errors='replace')
-            elif isinstance(dhdr[0], (bytes, bytearray)):
-                uval = dhdr[0].decode('utf-8', errors='replace')
-            else:
-                uval = dhdr[0]
-            uval = uval.replace('\n', ' ')
-            new_hdrval += re.sub(r'\s+', ' ', uval).strip()
-        return new_hdrval
+        uval = hdrval.replace('\n', ' ')
+        new_hdrval = re.sub(r'\s+', ' ', uval)
+        return new_hdrval.strip()
 
     @staticmethod
     def get_clean_msgid(msg, header='Message-Id'):
