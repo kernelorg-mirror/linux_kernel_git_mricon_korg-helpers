@@ -27,9 +27,10 @@ import gzip
 from tempfile import mkstemp
 from email import charset
 charset.add_charset('utf-8', None)
+emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.3'
+VERSION = '0.2.4'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -285,7 +286,7 @@ class LoreSeries:
                 logger.info('  %s', lmsg.full_subject)
                 msg = lmsg.get_am_message(trailer_order=trailer_order)
                 # Pass a policy that avoids most legacy encoding horrors
-                mbx.add(msg.as_bytes(policy=msg.policy.clone(utf8=True, cte_type='8bit', max_line_length=None)))
+                mbx.add(msg.as_bytes(policy=emlpolicy))
             else:
                 logger.error('  ERROR: missing [%s/%s]!', at, self.expected)
             at += 1
@@ -294,7 +295,7 @@ class LoreSeries:
     def save_cover(self, outfile):
         cover_msg = self.patches[0].get_am_message(add_trailers=False, trailer_order=None)
         with open(outfile, 'w') as fh:
-            fh.write(cover_msg.as_string())
+            fh.write(cover_msg.as_string(policy=emlpolicy))
         logger.critical('Cover: %s', outfile)
 
 
@@ -355,19 +356,25 @@ class LoreMessage:
         mcharset = self.msg.get_content_charset()
         if not mcharset:
             mcharset = 'utf-8'
-        body = None
+
         for part in msg.walk():
-            if part.get_content_type().find('text/plain') < 0:
+            cte = part.get_content_type()
+            if cte.find('/plain') < 0 and cte.find('/x-patch') < 0:
                 continue
-            body = part.get_payload(decode=True)
-            if body is None:
+            payload = part.get_payload(decode=True)
+            if payload is None:
                 continue
             pcharset = part.get_content_charset()
             if not pcharset:
                 pcharset = mcharset
-            body = body.decode(pcharset, errors='replace')
-            break
-        self.body = body
+            payload = payload.decode(pcharset, errors='replace')
+            if self.body is None:
+                self.body = payload
+                continue
+            # If we already found a body, but we now find something that contains a diff,
+            # then we prefer this part
+            if re.search(r'^---.*\n\+\+\+', payload, re.MULTILINE):
+                self.body = payload
 
         if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', self.body, re.MULTILINE | re.IGNORECASE):
             self.has_diffstat = True
@@ -796,7 +803,7 @@ def am_mbox_to_quilt(am_mbx, q_dirname):
         msg_out = mkstemp(suffix=None, prefix=None, dir=q_dirname)
         patch_out = mkstemp(suffix=None, prefix=None, dir=q_dirname)
         cmdargs = ['mailinfo', '--encoding=UTF-8', msg_out[1], patch_out[1]]
-        info = git_run_command(None, cmdargs, msg.as_string().encode('utf-8'))
+        info = git_run_command(None, cmdargs, msg.as_bytes(policy=emlpolicy))
         if not len(info.strip()):
             logger.critical('ERROR: Could not get mailinfo from patch %s', msg['Subject'])
             continue
