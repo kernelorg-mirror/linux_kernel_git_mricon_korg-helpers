@@ -29,7 +29,7 @@ from email import charset
 charset.add_charset('utf-8', None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.2'
+VERSION = '0.2.3'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -536,6 +536,8 @@ class LoreSubject:
         while subject.find('[') == 0:
             matches = re.search(r'^\[([^\]]*)\]', subject)
             for chunk in matches.groups()[0].split():
+                # Remove any trailing commas or semicolons
+                chunk = chunk.strip(',;')
                 if re.search(r'^\d{1,3}/\d{1,3}$', chunk):
                     counters = chunk.split('/')
                     self.counter = int(counters[0])
