@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.4'
+VERSION = '0.2.5'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -156,7 +156,7 @@ class LoreMailbox:
                         break
                 if found:
                     break
-                elif pmsg.in_reply_to:
+                elif pmsg.in_reply_to and pmsg.in_reply_to in self.msgid_map:
                     lvl += 1
                     trailers += pmsg.trailers
                     pmsg = self.msgid_map[pmsg.in_reply_to]
