@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.5'
+VERSION = '0.2.6'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -376,7 +376,7 @@ class LoreMessage:
             if re.search(r'^---.*\n\+\+\+', payload, re.MULTILINE):
                 self.body = payload
 
-        if re.search(r'^\s*\d+\sfile.*\d+ insertion.*\d+ deletion', self.body, re.MULTILINE | re.IGNORECASE):
+        if re.search(r'^\s*\d+ file.*\d+ insertion.*\d+ deletion', self.body, re.MULTILINE | re.IGNORECASE):
             self.has_diffstat = True
         if re.search(r'^---.*\n\+\+\+', self.body, re.MULTILINE):
             self.has_diff = True
@@ -384,7 +384,7 @@ class LoreMessage:
         # We only pay attention to trailers that are sent in reply
         if self.reply:
             # Do we have something that looks like a person-trailer?
-            matches = re.findall(r'^\s*([\w-]+):\s+(.*<\S+>)\s*$', self.body, re.MULTILINE)
+            matches = re.findall(r'^\s*([\w-]+):[ \t]+(.*<\S+>)\s*$', self.body, re.MULTILINE)
             if matches:
                 # Does the email in the trailer match what's in the From?
                 for tname, tvalue in matches:
