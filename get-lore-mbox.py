@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.6'
+VERSION = '0.2.7'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -352,6 +352,9 @@ class LoreMessage:
         except IndexError:
             pass
 
+        diffre = re.compile(r'^(---.*\n\+\+\+|GIT binary patch)', re.M | re.I)
+        diffstatre = re.compile(r'^\s*\d+ file.*\d+ insertion.*\d+ deletion', re.M | re.I)
+
         # walk until we find the first text/plain part
         mcharset = self.msg.get_content_charset()
         if not mcharset:
@@ -373,12 +376,12 @@ class LoreMessage:
                 continue
             # If we already found a body, but we now find something that contains a diff,
             # then we prefer this part
-            if re.search(r'^---.*\n\+\+\+', payload, re.MULTILINE):
+            if diffre.search(payload):
                 self.body = payload
 
-        if re.search(r'^\s*\d+ file.*\d+ insertion.*\d+ deletion', self.body, re.MULTILINE | re.IGNORECASE):
+        if diffstatre.search(self.body):
             self.has_diffstat = True
-        if re.search(r'^---.*\n\+\+\+', self.body, re.MULTILINE):
+        if diffre.search(self.body):
             self.has_diff = True
 
         # We only pay attention to trailers that are sent in reply
