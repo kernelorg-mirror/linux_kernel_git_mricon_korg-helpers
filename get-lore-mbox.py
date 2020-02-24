@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.7'
+VERSION = '0.2.8'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -119,7 +119,7 @@ class LoreMailbox:
             for member in lser.patches:
                 if member is not None and member.in_reply_to is not None:
                     potential = self.get_by_msgid(member.in_reply_to)
-                    if potential.has_diffstat and not potential.has_diff:
+                    if potential is not None and potential.has_diffstat and not potential.has_diff:
                         # This is *probably* the cover letter
                         lser.patches[0] = potential
                         lser.has_cover = True
@@ -230,7 +230,8 @@ class LoreSeries:
         self.expected = lmsg.expected
         if self.patches[lmsg.counter] is not None:
             # Okay, weird, is the one in there a reply?
-            if self.patches[lmsg.counter].reply:
+            omsg = self.patches[lmsg.counter]
+            if omsg.reply:
                 # Replace that one with this one
                 self.patches[lmsg.counter] = lmsg
         else:
@@ -251,8 +252,7 @@ class LoreSeries:
         if lmsg is None:
             return 'undefined'
 
-        msgdate = email.utils.parsedate_tz(str(lmsg.msg['Date']))
-        prefix = time.strftime('%Y%m%d', msgdate[:9])
+        prefix = time.strftime('%Y%m%d', lmsg.date[:9])
         authorline = email.utils.getaddresses(lmsg.msg.get_all('from', []))[0]
         author = re.sub(r'\W+', '_', authorline[1]).strip('_').lower()
         slug = '%s_%s' % (prefix, author)
@@ -319,6 +319,7 @@ class LoreMessage:
         self.in_reply_to = None
         self.fromname = None
         self.fromemail = None
+        self.date = None
 
         # Body and body-based info
         self.body = None
@@ -351,6 +352,8 @@ class LoreMessage:
             self.fromemail = fromdata[1]
         except IndexError:
             pass
+
+        self.date = email.utils.parsedate_tz(str(self.msg['Date']))
 
         diffre = re.compile(r'^(---.*\n\+\+\+|GIT binary patch)', re.M | re.I)
         diffstatre = re.compile(r'^\s*\d+ file.*\d+ insertion.*\d+ deletion', re.M | re.I)
@@ -402,6 +405,7 @@ class LoreMessage:
 
         out.append('  fromname: %s' % self.fromname)
         out.append('  fromemail: %s' % self.fromemail)
+        out.append('  date: %s' % self.date)
         out.append('  in_reply_to: %s' % self.in_reply_to)
 
         # Header-based info
