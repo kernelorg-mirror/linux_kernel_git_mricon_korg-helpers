@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.8'
+VERSION = '0.2.9'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -137,7 +137,21 @@ class LoreMailbox:
             # Go up through the follow-ups and tally up trailers until
             # we either run out of in-reply-tos, or we find a patch in
             # our series
-            pmsg = self.msgid_map[fmsg.in_reply_to]
+            if fmsg.in_reply_to is None:
+                # Check if there's something matching in References
+                refs = fmsg.msg.get('References', '')
+                pmsg = None
+                for ref in refs.split():
+                    refid = ref.strip('<>')
+                    if refid in self.msgid_map and refid != fmsg.msgid:
+                        pmsg = self.msgid_map[refid]
+                        break
+                if pmsg is None:
+                    # Can't find the message we're replying to here
+                    continue
+            else:
+                pmsg = self.msgid_map[fmsg.in_reply_to]
+
             trailers = fmsg.trailers
             lvl = 1
             while True:
@@ -170,7 +184,7 @@ class LoreMailbox:
         logger.debug('Looking at: %s', lmsg.full_subject)
         self.msgid_map[lmsg.msgid] = lmsg
 
-        if lmsg.lsubject.patch and (lmsg.has_diff or lmsg.has_diffstat):
+        if lmsg.has_diff or lmsg.has_diffstat:
             if lmsg.revision not in self.series:
                 self.series[lmsg.revision] = LoreSeries(lmsg.revision, lmsg.expected)
                 if len(self.series) > 1:
@@ -356,7 +370,7 @@ class LoreMessage:
         self.date = email.utils.parsedate_tz(str(self.msg['Date']))
 
         diffre = re.compile(r'^(---.*\n\+\+\+|GIT binary patch)', re.M | re.I)
-        diffstatre = re.compile(r'^\s*\d+ file.*\d+ insertion.*\d+ deletion', re.M | re.I)
+        diffstatre = re.compile(r'^\s*\d+ file.*\d+ (insertion|deletion)', re.M | re.I)
 
         # walk until we find the first text/plain part
         mcharset = self.msg.get_content_charset()
@@ -405,7 +419,7 @@ class LoreMessage:
 
         out.append('  fromname: %s' % self.fromname)
         out.append('  fromemail: %s' % self.fromemail)
-        out.append('  date: %s' % self.date)
+        out.append('  date: %s' % str(self.date))
         out.append('  in_reply_to: %s' % self.in_reply_to)
 
         # Header-based info
@@ -419,10 +433,10 @@ class LoreMessage:
         out.append('  has_diffstat: %s' % self.has_diffstat)
         out.append('  --- begin my trailers ---')
         for trailer in self.trailers:
-            out.append('  |%s' % trailer)
+            out.append('  |%s' % str(trailer))
         out.append('  --- begin followup trailers ---')
         for trailer in self.followup_trailers:
-            out.append('  |%s' % trailer)
+            out.append('  |%s' % str(trailer))
         out.append('  --- end trailers ---')
 
         return '\n'.join(out)
@@ -503,7 +517,12 @@ class LoreMessage:
                     break
             if wanthdr:
                 new_hdrval = LoreMessage.clean_header(hdrval)
-                am_msg.add_header(hdrname, new_hdrval)
+                # noinspection PyBroadException
+                try:
+                    am_msg.add_header(hdrname, new_hdrval)
+                except:
+                    # A broad except to handle any potential weird header conditions
+                    pass
         am_msg.set_charset('utf-8')
         return am_msg
 
@@ -525,10 +544,10 @@ class LoreSubject:
         self.prefixes = list()
 
         subject = re.sub(r'\s+', ' ', LoreMessage.clean_header(subject)).strip()
-        # Remove any leading [] that don't have the word "patch" in them
+        # Remove any leading [] that don't have "patch", "resend" or "rfc" in them
         while True:
             oldsubj = subject
-            subject = re.sub(r'^\s*\[[^\]]*\]\s*(\[patch.*)', '\\1', subject, flags=re.IGNORECASE)
+            subject = re.sub(r'^\s*\[[^\]]*\]\s*(\[[^\]]*(:?patch|resend|rfc).*)', '\\1', subject, flags=re.IGNORECASE)
             if oldsubj == subject:
                 break
 
