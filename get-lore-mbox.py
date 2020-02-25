@@ -901,7 +901,7 @@ def get_newest_series(mboxfile, session):
     msgdate = email.utils.parsedate_tz(str(base_msg['Date']))
     startdate = time.strftime('%Y%m%d', msgdate[:9])
     listarc = base_msg.get_all('List-Archive')[-1].strip('<>')
-    q = 's:"%s" AND f:"%s" AND d:%s..' % (lsub.subject, fromeml, startdate)
+    q = 's:"%s" AND f:"%s" AND d:%s..' % (lsub.subject.replace('"', ''), fromeml, startdate)
     queryurl = '%s?%s' % (listarc, urllib.parse.urlencode({'q': q, 'x': 'A', 'o': '-1'}))
     logger.critical('Checking for newer revisions on %s', listarc)
     logger.debug('Query URL: %s', queryurl)
