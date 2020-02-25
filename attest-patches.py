@@ -193,6 +193,10 @@ def create_attestation(cmdargs):
     for patchfile in cmdargs.attest:
         with open(patchfile, 'rb') as fh:
             ihash, mhash, phash = get_mailinfo_hashes(fh.read())
+            if not phash:
+                logger.info('SKP | %s', os.path.basename(patchfile))
+                continue
+            logger.info('ADD | %s', os.path.basename(patchfile))
             attid = '%s-%s-%s' % (ihash[:8], mhash[:8], phash[:8])
             attlines.append('%s:' % attid)
             attlines.append('  i: %s' % ihash)
@@ -230,6 +234,7 @@ def create_attestation(cmdargs):
     with open(cmdargs.output, 'wb') as fh:
         fh.write(att_msg.as_bytes())
 
+    logger.info('---')
     logger.info('Wrote %s', cmdargs.output)
     logger.info('You can send it using:')
     logger.info('  sendmail -oi signatures@kernel.org < %s', cmdargs.output)
@@ -376,7 +381,7 @@ def verify_attestation(cmdargs):
         load_attestation_file(cmdargs.attfile)
     session = requests.session()
     session.headers.update({'User-Agent': 'attest-patches/%s' % VERSION})
-    ecode = 0
+    ecode = 1
     for msg in mbx:
         content = msg.as_bytes()
         ihash, mhash, phash = get_mailinfo_hashes(content)
@@ -392,9 +397,13 @@ def verify_attestation(cmdargs):
         except KeyError:
             # No attestations found
             logger.critical('FAIL | %s', msg['Subject'])
-            logger.critical('Aborting due to failure.')
-            ecode = 1
-            break
+            if not cmdargs.nofast:
+                logger.critical('Aborting due to failure.')
+                ecode = 1
+                break
+            else:
+                ecode = 128
+                continue
 
         for good, valid, trusted, sigkey, siguid in adata:
             if cmdargs.ignorefrom or check_if_from_matches_uids(sigkey, msg):
@@ -405,14 +414,15 @@ def verify_attestation(cmdargs):
                     ecode = 128
                 else:
                     logger.critical('PASS | %s', msg['Subject'])
-                    ecode = 0
+                    if ecode != 128:
+                        ecode = 0
                     break
             else:
                 logger.critical('FAIL | %s', msg['Subject'])
                 VALIDATION_ERRORS.update(('Attestation ignored due to From/UID mismatch: %s' % siguid,))
                 ecode = 1
 
-        if ecode > 0:
+        if not cmdargs.nofast and ecode > 0:
             logger.critical('Aborting due to failure.')
             break
 
@@ -475,6 +485,8 @@ if __name__ == '__main__':
                         help='Use this file for attestation data instead of querying lore.kernel.org')
     parser.add_argument('-t', '--tofu', action='store_true', default=False,
                         help='Force TOFU trust model (otherwise uses your global GnuPG setting)')
+    parser.add_argument('-X', '--no-fast-exit', dest='nofast', action='store_true', default=False,
+                        help='Do not exit after first failure')
     parser.add_argument('-F', '--ignore-from-mismatch', dest='ignorefrom', action='store_true',
                         default=False, help='Ignore mismatches between From: and PGP uid data')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
