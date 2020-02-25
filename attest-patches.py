@@ -39,6 +39,9 @@ logger = logging.getLogger('attest-patches')
 VERSION = '0.1'
 ATTESTATION_FORMAT = '0.1'
 
+GPGBIN = 'gpg2'
+GPGTRUSTMODEL = 'pgp'
+
 
 def get_config_from_git(regexp, defaults=None):
     args = ['config', '-z', '--get-regexp', regexp]
@@ -199,21 +202,18 @@ def create_attestation(cmdargs):
     payload = '\n'.join(attlines)
 
     usercfg = get_config_from_git(r'user\..*')
-    gpgcfg = get_config_from_git(r'gpg\..*', {'program': 'gpg'})
 
-    gpgargs = [gpgcfg['program'], '--batch']
+    gpgargs = [GPGBIN, '--batch']
     if 'signingkey' in usercfg:
         gpgargs += ['-u', usercfg['signingkey']]
     gpgargs += ['--clearsign',
-                '--comment',
-                'att-fmt-ver: %s' % ATTESTATION_FORMAT,
-                '--comment',
-                'att-hash: sha256',
+                '--comment', 'att-fmt-ver: %s' % ATTESTATION_FORMAT,
+                '--comment', 'att-hash: sha256',
                 ]
 
     ecode, signed = gpg_run_command(gpgargs, stdin=payload.encode('utf-8'))
     if ecode > 0:
-        logger.critical('ERROR: Unable to sign using %s', gpgcfg['program'])
+        logger.critical('ERROR: Unable to sign using %s', GPGBIN)
         sys.exit(1)
 
     att_msg = email.message.EmailMessage()
@@ -236,6 +236,69 @@ def create_attestation(cmdargs):
     logger.info('  mutt -H %s', cmdargs.output)
 
 
+def load_attestation_data(link, content):
+    global ATTESTATION_DATA
+    gpgargs = [GPGBIN, '--batch', '--verify', '--status-fd=1']
+    if GPGTRUSTMODEL == 'tofu':
+        gpgargs += ['--trust-model', 'tofu', '--tofu-default-policy', 'good']
+
+    ecode, output = gpg_run_command(gpgargs, stdin=content.encode('utf-8'))
+    good = False
+    valid = False
+    trusted = False
+    sigkey = None
+    siguid = None
+    if ecode == 0:
+        # We're looking for both GOODSIG and VALIDSIG
+        gs_matches = re.search(r'^\[GNUPG:\] GOODSIG ([0-9A-F]+)\s+(.*)$', output, re.M)
+        if gs_matches:
+            logger.debug('  GOODSIG')
+            good = True
+            sigkey, siguid = gs_matches.groups()
+            if re.search(r'^\[GNUPG:\] VALIDSIG', output, re.M):
+                logger.debug('  VALIDSIG')
+                valid = True
+                # Do we have a TRUST_(FULLY|ULTIMATE)?
+                matches = re.search(r'^\[GNUPG:\] TRUST_(FULLY|ULTIMATE)', output, re.M)
+                if matches:
+                    logger.debug('  TRUST_%s', matches.groups()[0])
+                    trusted = True
+    else:
+        # Are we missing a key?
+        matches = re.search(r'^\[GNUPG:\] NO_PUBKEY ([0-9A-F]+)$', output, re.M)
+        if matches:
+            VALIDATION_ERRORS.update(('Missing public key: %s' % matches.groups()[0],))
+        else:
+            VALIDATION_ERRORS.update(('PGP Validation failed for: %s' % link,))
+
+    siginfo = (good, valid, trusted, sigkey, siguid)
+
+    # No need to go on if it's no good
+    if not good:
+        return
+
+    ihash = mhash = phash = None
+    for line in content.split('\n'):
+        # It's a yaml, but we don't parse it as yaml for safety reasons
+        line = line.rstrip()
+        if re.search(r'^([0-9a-f-]{26}:|-----BEGIN.*)$', line):
+            if ihash and mhash and phash:
+                if (ihash, mhash, phash) not in ATTESTATION_DATA:
+                    ATTESTATION_DATA[(ihash, mhash, phash)] = list()
+                ATTESTATION_DATA[(ihash, mhash, phash)].append(siginfo)
+                ihash = mhash = phash = None
+            continue
+        matches = re.search(r'^\s+([imp]):\s*([0-9a-f]{64})$', line)
+        if matches:
+            t = matches.groups()[0]
+            if t == 'i':
+                ihash = matches.groups()[1]
+            elif t == 'm':
+                mhash = matches.groups()[1]
+            elif t == 'p':
+                phash = matches.groups()[1]
+
+
 def query_lore_signatures(attid, session):
     global ATTESTATION_DATA
     global VALIDATION_ERRORS
@@ -249,65 +312,17 @@ def query_lore_signatures(attid, session):
                          content, flags=re.DOTALL)
 
     if not matches:
-        VALIDATION_ERRORS.update(('No matches found in the signatures archive',))
+        VALIDATION_ERRORS.update(('No matches found in the signatures archive on lore.',))
         return
 
-    gpgcfg = get_config_from_git(r'gpg\..*', {'program': 'gpg'})
-    gpgargs = [gpgcfg['program'], '--batch', '--verify', '--status-fd=1']
-
     for link, sigdata in matches:
-        ecode, output = gpg_run_command(gpgargs, stdin=sigdata.encode('utf-8'))
-        good = False
-        valid = False
-        trusted = False
-        sigkey = None
-        siguid = None
-        if ecode == 0:
-            # We're looking for both GOODSIG and VALIDSIG
-            gs_matches = re.search(r'^\[GNUPG:\] GOODSIG ([0-9A-F]+)\s+(.*)$', output, re.M)
-            if gs_matches:
-                logger.debug('  GOODSIG')
-                good = True
-                sigkey, siguid = gs_matches.groups()
-                if re.search(r'^\[GNUPG:\] VALIDSIG', output, re.M):
-                    logger.debug('  VALIDSIG')
-                    valid = True
-                    # Do we have a TRUST_(FULLY|ULTIMATE)?
-                    matches = re.search(r'^\[GNUPG:\] TRUST_(FULLY|ULTIMATE)', output, re.M)
-                    if matches:
-                        logger.debug('  TRUST_%s', matches.groups()[0])
-                        trusted = True
-        else:
-            # Are we missing a key?
-            matches = re.search(r'^\[GNUPG:\] NO_PUBKEY ([0-9A-F]+)$', output, re.M)
-            if matches:
-                VALIDATION_ERRORS.update(('Missing public key: %s' % matches.groups()[0],))
-                continue
-            VALIDATION_ERRORS.update(('PGP Validation failed for: %s' % link,))
+        load_attestation_data(link, sigdata)
 
-        if not good:
-            continue
 
-        ihash = mhash = phash = None
-        for line in sigdata.split('\n'):
-            # It's a yaml, but we don't parse it as yaml for safety reasons
-            line = line.rstrip()
-            if re.search(r'^([0-9a-f-]{26}:|-----BEGIN.*)$', line):
-                if ihash and mhash and phash:
-                    if (ihash, mhash, phash) not in ATTESTATION_DATA:
-                        ATTESTATION_DATA[(ihash, mhash, phash)] = list()
-                    ATTESTATION_DATA[(ihash, mhash, phash)].append((good, valid, trusted, sigkey, siguid))
-                    ihash = mhash = phash = None
-                continue
-            matches = re.search(r'^\s+([imp]):\s*([0-9a-f]{64})$', line)
-            if matches:
-                t = matches.groups()[0]
-                if t == 'i':
-                    ihash = matches.groups()[1]
-                elif t == 'm':
-                    mhash = matches.groups()[1]
-                elif t == 'p':
-                    phash = matches.groups()[1]
+def load_attestation_file(afile):
+    with open(afile, 'r') as fh:
+        sigdata = fh.read()
+        load_attestation_data(afile, sigdata)
 
 
 def get_lore_attestation(c_ihash, c_mhash, c_phash, session):
@@ -326,8 +341,7 @@ def get_subkey_uids(keyid):
     if keyid in SUBKEY_DATA:
         return SUBKEY_DATA[keyid]
 
-    gpgcfg = get_config_from_git(r'gpg\..*', {'program': 'gpg'})
-    gpgargs = [gpgcfg['program'], '--batch', '--with-colons', '--list-keys', keyid]
+    gpgargs = [GPGBIN, '--batch', '--with-colons', '--list-keys', keyid]
     ecode, keyinfo = gpg_run_command(gpgargs)
     if ecode > 0:
         logger.critical('ERROR: Unable to get UIDs list matching key %s', keyid)
@@ -358,6 +372,8 @@ def check_if_from_matches_uids(keyid, msg):
 
 def verify_attestation(cmdargs):
     mbx = mailbox.mbox(cmdargs.check)
+    if cmdargs.attfile:
+        load_attestation_file(cmdargs.attfile)
     session = requests.session()
     session.headers.update({'User-Agent': 'attest-patches/%s' % VERSION})
     ecode = 0
@@ -373,21 +389,6 @@ def verify_attestation(cmdargs):
         logger.debug(' p: %s', phash)
         try:
             adata = get_lore_attestation(ihash, mhash, phash, session)
-            for good, valid, trusted, sigkey, siguid in adata:
-                if check_if_from_matches_uids(sigkey, msg):
-                    logger.critical('PASS | %s', msg['Subject'])
-                    state = ['G', 'V', 'T']
-                    if not valid:
-                        state[1] = ' '
-                    if not trusted:
-                        state[2] = ' '
-                    logger.debug('       [%s]: %s (%s)', '/'.join(state), siguid, sigkey)
-                else:
-                    logger.critical('FAIL | %s', msg['Subject'])
-                    VALIDATION_ERRORS.update(('Failed due to From/UID mismatch: %s' % msg['Subject'],))
-                    logger.critical('Aborting due to failure.')
-                    ecode = 1
-                    break
         except KeyError:
             # No attestations found
             logger.critical('FAIL | %s', msg['Subject'])
@@ -395,19 +396,43 @@ def verify_attestation(cmdargs):
             ecode = 1
             break
 
-    if len(VALIDATION_ERRORS):
-        logger.critical('---')
-        logger.critical('The validation process reported the following errors:')
-        for error in VALIDATION_ERRORS:
-            logger.critical('  %s', error)
+        for good, valid, trusted, sigkey, siguid in adata:
+            if cmdargs.ignorefrom or check_if_from_matches_uids(sigkey, msg):
+                if not trusted:
+                    logger.critical('FAIL | %s', msg['Subject'])
+                    VALIDATION_ERRORS.update(('Insufficient owner trust (model=%s): %s (key=%s)'
+                                              % (GPGTRUSTMODEL, siguid, sigkey),))
+                    ecode = 128
+                else:
+                    logger.critical('PASS | %s', msg['Subject'])
+                    ecode = 0
+                    break
+            else:
+                logger.critical('FAIL | %s', msg['Subject'])
+                VALIDATION_ERRORS.update(('Attestation ignored due to From/UID mismatch: %s' % siguid,))
+                ecode = 1
+
+        if ecode > 0:
+            logger.critical('Aborting due to failure.')
+            break
+
+    logger.critical('---')
+    if ecode > 0:
+        logger.critical('Attestation verification failed.')
+        if len(VALIDATION_ERRORS):
+            logger.critical('---')
+            logger.critical('The validation process reported the following errors:')
+            for error in VALIDATION_ERRORS:
+                logger.critical('  %s', error)
     else:
-        logger.critical('---')
         logger.critical('All patches passed attestation.')
 
     sys.exit(ecode)
 
 
 def main(cmdargs):
+    global GPGBIN
+    global GPGTRUSTMODEL
     logger.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler()
@@ -422,6 +447,11 @@ def main(cmdargs):
         ch.setLevel(logging.INFO)
 
     logger.addHandler(ch)
+    gpgcfg = get_config_from_git(r'gpg\..*', {'program': GPGBIN})
+    GPGBIN = gpgcfg['program']
+    if cmdargs.tofu:
+        GPGTRUSTMODEL = 'tofu'
+
     if cmdargs.attest and cmdargs.check:
         logger.critical('You cannot both --attest and --check. Pick one.')
         sys.exit(1)
@@ -437,10 +467,16 @@ if __name__ == '__main__':
     )
     parser.add_argument('-a', '--attest', nargs='+',
                         help='Create attestation for patches')
+    parser.add_argument('-o', '--output', default='attestation.eml',
+                        help='Save attestation message in this file (use with -a)')
     parser.add_argument('-c', '--check',
                         help='Check attestation for patches in an mbox file')
-    parser.add_argument('-o', '--output', default='attestation.eml',
-                        help='Save attestation message in this file')
+    parser.add_argument('-i', '--attestation-file', dest='attfile',
+                        help='Use this file for attestation data instead of querying lore.kernel.org')
+    parser.add_argument('-t', '--tofu', action='store_true', default=False,
+                        help='Force TOFU trust model (otherwise uses your global GnuPG setting)')
+    parser.add_argument('-F', '--ignore-from-mismatch', dest='ignorefrom', action='store_true',
+                        default=False, help='Ignore mismatches between From: and PGP uid data')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
     parser.add_argument('-v', '--verbose', action='store_true', default=False,
