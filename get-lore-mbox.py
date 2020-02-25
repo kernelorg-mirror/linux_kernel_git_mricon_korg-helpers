@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.9'
+VERSION = '0.2.10'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -275,7 +275,8 @@ class LoreSeries:
 
         return slug
 
-    def save_am_mbox(self, outfile, covertrailers, trailer_order=None, addmysob=False, addlink=False, linkmask=None):
+    def save_am_mbox(self, outfile, noaddtrailers, covertrailers,
+                     trailer_order=None, addmysob=False, addlink=False, linkmask=None):
         if os.path.exists(outfile):
             os.unlink(outfile)
         usercfg = dict()
@@ -298,7 +299,10 @@ class LoreSeries:
                 if addlink:
                     lmsg.followup_trailers.append(('Link', linkmask % lmsg.msgid))
                 logger.info('  %s', lmsg.full_subject)
-                msg = lmsg.get_am_message(trailer_order=trailer_order)
+                add_trailers = True
+                if noaddtrailers:
+                    add_trailers = False
+                msg = lmsg.get_am_message(add_trailers=add_trailers, trailer_order=trailer_order)
                 # Pass a policy that avoids most legacy encoding horrors
                 mbx.add(msg.as_bytes(policy=emlpolicy))
             else:
@@ -754,7 +758,8 @@ def mbox_to_am(mboxfile, config, cmdargs):
     am_filename = os.path.join(outdir, '%s.mbx' % slug)
     am_cover = os.path.join(outdir, '%s.cover' % slug)
 
-    am_mbx = lser.save_am_mbox(am_filename, covertrailers, trailer_order=config['trailer-order'],
+    am_mbx = lser.save_am_mbox(am_filename, cmdargs.noaddtrailers, covertrailers,
+                               trailer_order=config['trailer-order'],
                                addmysob=cmdargs.addmysob, addlink=cmdargs.addlink,
                                linkmask=config['linkmask'])
     logger.info('---')
@@ -1036,6 +1041,8 @@ if __name__ == '__main__':
                         help='Make an mbox ready for git am')
     parser.add_argument('-t', '--apply-cover-trailers', dest='covertrailers', action='store_true', default=False,
                         help='Apply trailers sent to the cover letter to all patches (use with -a)')
+    parser.add_argument('-T', '--no-add-trailers', dest='noaddtrailers', action='store_true', default=False,
+                        help='Do not add or sort any trailers (use with -a)')
     parser.add_argument('-v', '--use-version', dest='wantver', type=int, default=None,
                         help='Get a specific version of the patch/series (use with -a)')
     parser.add_argument('-s', '--add-my-sob', dest='addmysob', action='store_true', default=False,
