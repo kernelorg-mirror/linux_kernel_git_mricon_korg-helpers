@@ -103,9 +103,19 @@ def get_mailinfo_hashes(content):
     ecode, info = git_run_command(None, cmdargs, content)
     if ecode > 0:
         logger.critical('ERROR: Could not get mailinfo')
-        return None, None, None, None
+        return None, None, None
+    logger.debug(info)
     ihasher = hashlib.sha256()
-    ihasher.update(info.encode('utf-8'))
+    for line in info.split('\n'):
+        # We don't use the "Date:" field because it is likely to be
+        # mangled between when git-format-patch generates it and
+        # when it is sent out by git-send-email (or other tools).
+        # TODO: We can do some basic date sanity checking by
+        #       looking at the PGP signature date and making sure
+        #       that it is within a sane limit compared to the
+        #       commit, though it is unlikely to matter for attestation
+        if re.search(r'^(Author|Email|Subject):', line):
+            ihasher.update((line + '\n').encode('utf-8'))
     ihash = ihasher.hexdigest()
 
     with open(msg_out[1], 'r') as mfh:
@@ -117,7 +127,10 @@ def get_mailinfo_hashes(content):
 
     with open(patch_out[1], 'r') as pfh:
         patch = pfh.read()
-        phash = get_patch_hash(patch)
+        if len(patch.strip()):
+            phash = get_patch_hash(patch)
+        else:
+            phash = None
     os.unlink(patch_out[1])
 
     return ihash, mhash, phash
@@ -351,6 +364,13 @@ def verify_attestation(cmdargs):
     for msg in mbx:
         content = msg.as_bytes()
         ihash, mhash, phash = get_mailinfo_hashes(content)
+        if not phash:
+            logger.debug('SKIP | %s', msg['Subject'])
+            continue
+        logger.debug('Verifying: %s', msg['Subject'])
+        logger.debug(' i: %s', ihash)
+        logger.debug(' m: %s', mhash)
+        logger.debug(' p: %s', phash)
         try:
             adata = get_lore_attestation(ihash, mhash, phash, session)
             for good, valid, trusted, sigkey, siguid in adata:
