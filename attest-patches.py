@@ -366,14 +366,14 @@ def get_subkey_uids(keyid):
     return SUBKEY_DATA[keyid]
 
 
-def check_if_from_matches_uids(keyid, msg):
+def get_matching_uid(keyid, msg):
     uids = get_subkey_uids(keyid)
     fromaddr = email.utils.getaddresses(msg.get_all('from', []))[0]
     for uid in uids:
         if fromaddr[1] == uid[1]:
-            return True
+            return '%s <%s>' % uid
 
-    return False
+    return None
 
 
 def verify_attestation(cmdargs):
@@ -408,14 +408,17 @@ def verify_attestation(cmdargs):
                 continue
 
         for good, valid, trusted, sigkey, siguid in adata:
-            if cmdargs.ignorefrom or check_if_from_matches_uids(sigkey, msg):
+            muid = get_matching_uid(sigkey, msg)
+            if muid is None and cmdargs.ignorefrom:
+                muid = siguid
+            if muid is not None:
                 if not trusted:
                     VALIDATION_ERRORS.update(('Insufficient owner trust (model=%s): %s (key=%s)'
                                               % (GPGTRUSTMODEL, siguid, sigkey),))
                     ecode = 128
                 else:
                     if ecode != 128:
-                        attestors.update(('%s (pgp:%s)' % (siguid, sigkey),))
+                        attestors.update(('%s (pgp:%s)' % (muid, sigkey),))
                         ecode = 0
                     break
             else:
