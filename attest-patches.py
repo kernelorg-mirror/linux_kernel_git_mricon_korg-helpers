@@ -382,6 +382,7 @@ def verify_attestation(cmdargs):
     session = requests.session()
     session.headers.update({'User-Agent': 'attest-patches/%s' % VERSION})
     ecode = 1
+    attestors = set()
     for msg in mbx:
         content = msg.as_bytes()
         ihash, mhash, phash = get_mailinfo_hashes(content)
@@ -413,6 +414,7 @@ def verify_attestation(cmdargs):
                     ecode = 128
                 else:
                     if ecode != 128:
+                        attestors.update(('%s (%s)' % (siguid, sigkey),))
                         ecode = 0
                     break
             else:
@@ -436,7 +438,9 @@ def verify_attestation(cmdargs):
             for error in VALIDATION_ERRORS:
                 logger.critical('  %s', error)
     else:
-        logger.critical('All patches passed attestation.')
+        logger.critical('All patches passed attestation:')
+        for attestor in attestors:
+            logger.critical('  Attested-by: %s', attestor)
 
     sys.exit(ecode)
 
