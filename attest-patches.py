@@ -309,7 +309,8 @@ def query_lore_signatures(attid, session):
     global VALIDATION_ERRORS
     # XXX: Querying this via the Atom feed is a temporary kludge until we have
     #      proper search API on lore.kernel.org
-    queryurl = '%s?%s' % ('https://lore.kernel.org/signatures/', urllib.parse.urlencode({'q': attid, 'x': 'A'}))
+    queryurl = '%s?%s' % ('https://lore.kernel.org/signatures/',
+                          urllib.parse.urlencode({'q': attid, 'x': 'A', 'o': '-1'}))
     logger.debug('Query URL: %s', queryurl)
     resp = session.get(queryurl)
     content = resp.content.decode('utf-8')
@@ -414,7 +415,7 @@ def verify_attestation(cmdargs):
                     ecode = 128
                 else:
                     if ecode != 128:
-                        attestors.update(('%s (%s)' % (siguid, sigkey),))
+                        attestors.update(('%s (pgp:%s)' % (siguid, sigkey),))
                         ecode = 0
                     break
             else:
@@ -440,7 +441,7 @@ def verify_attestation(cmdargs):
     else:
         logger.critical('All patches passed attestation:')
         for attestor in attestors:
-            logger.critical('  Attested-by: %s', attestor)
+            logger.critical('  Attestation-by: %s', attestor)
 
     sys.exit(ecode)
 
