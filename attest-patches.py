@@ -408,23 +408,24 @@ def verify_attestation(cmdargs):
         for good, valid, trusted, sigkey, siguid in adata:
             if cmdargs.ignorefrom or check_if_from_matches_uids(sigkey, msg):
                 if not trusted:
-                    logger.critical('FAIL | %s', msg['Subject'])
                     VALIDATION_ERRORS.update(('Insufficient owner trust (model=%s): %s (key=%s)'
                                               % (GPGTRUSTMODEL, siguid, sigkey),))
                     ecode = 128
                 else:
-                    logger.critical('PASS | %s', msg['Subject'])
                     if ecode != 128:
                         ecode = 0
                     break
             else:
-                logger.critical('FAIL | %s', msg['Subject'])
                 VALIDATION_ERRORS.update(('Attestation ignored due to From/UID mismatch: %s' % siguid,))
                 ecode = 1
 
-        if not cmdargs.nofast and ecode > 0:
-            logger.critical('Aborting due to failure.')
-            break
+        if ecode > 0:
+            logger.critical('FAIL | %s', msg['Subject'])
+            if not cmdargs.nofast:
+                logger.critical('Aborting due to failure.')
+                break
+        else:
+            logger.critical('PASS | %s', msg['Subject'])
 
     logger.critical('---')
     if ecode > 0:
