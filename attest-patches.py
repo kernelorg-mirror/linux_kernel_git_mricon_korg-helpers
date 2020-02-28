@@ -21,6 +21,7 @@ import email.utils
 import mailbox
 import urllib
 import requests
+import smtplib
 
 from tempfile import mkstemp
 
@@ -190,11 +191,21 @@ def get_patch_hash(diff):
 
 def create_attestation(cmdargs):
     attlines = list()
+    subject = 'Patch attestation'
     for patchfile in cmdargs.attest:
         with open(patchfile, 'rb') as fh:
-            ihash, mhash, phash = get_mailinfo_hashes(fh.read())
+            content = fh.read()
+            ihash, mhash, phash = get_mailinfo_hashes(content)
             if not phash:
                 logger.info('SKP | %s', os.path.basename(patchfile))
+                # See if it's a cover letter
+                matches = re.search(r'^Subject:\s*\[([^\]]*)\s+0{1,3}/(\d{1,3})([^\]]*)]\s+(.*)',
+                                    content.decode('utf-8'), re.I | re.M)
+                if matches:
+                    mgr = matches.groups()
+                    # Set the subject to match cover letter
+                    subject = '[%s %s/%s%s] %s' % (mgr[0].replace('PATCH', 'PSIGN'), 'X' * len(mgr[1]),
+                                                   mgr[1], mgr[2], mgr[3])
                 continue
             logger.info('ADD | %s', os.path.basename(patchfile))
             attid = '%s-%s-%s' % (ihash[:8], mhash[:8], phash[:8])
@@ -222,19 +233,38 @@ def create_attestation(cmdargs):
 
     att_msg = email.message.EmailMessage()
     att_msg.set_payload(signed.encode('utf-8'))
-    # GDPR-proofing: we don't care about the envelope.
-    # All we need is in the hashes and in the PGP payload
-    att_msg['From'] = '<devnull@kernel.org>'
+    sender = cmdargs.sender
+    if '>' not in sender:
+        sender = '<%s>' % sender
+    att_msg['From'] = sender
     att_msg['To'] = '<signatures@kernel.org>'
     att_msg['Message-Id'] = email.utils.make_msgid(domain='kernel.org')
-    att_msg['Subject'] = 'Patch attestation'
+    att_msg['Subject'] = subject
 
-    # Future iterations will be able to submit this to a RESTful URL at git.kernel.org,
-    # in order not to depend on avaialbility of SMTP gateways
+    logger.info('---')
+    # Try to deliver it via mail.kernel.org
+    try:
+        mailserver = smtplib.SMTP('mail.kernel.org', 587)
+        # identify ourselves to smtp gmail client
+        mailserver.ehlo()
+        # secure our email with tls encryption
+        mailserver.starttls()
+        # re-identify ourselves as an encrypted connection
+        mailserver.ehlo()
+        logger.info('Delivering via mail.kernel.org')
+        if cmdargs.dryrun:
+            raise Exception('Dry-run, not delivering mail.')
+        mailserver.sendmail('devnull@kernel.org', 'signatures@kernel.org', att_msg.as_string())
+        mailserver.quit()
+        sys.exit(0)
+    except Exception as ex:
+        logger.info('Could not deliver: %s', ex)
+
+    # Future iterations will also be able to submit this to a RESTful URL
+    # at git.kernel.org, in order not to depend on avaialbility of SMTP gateways
     with open(cmdargs.output, 'wb') as fh:
         fh.write(att_msg.as_bytes())
 
-    logger.info('---')
     logger.info('Wrote %s', cmdargs.output)
     logger.info('You can send it using:')
     logger.info('  sendmail -oi signatures@kernel.org < %s', cmdargs.output)
@@ -484,23 +514,32 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('-a', '--attest', nargs='+',
-                        help='Create attestation for patches')
-    parser.add_argument('-o', '--output', default='attestation.eml',
-                        help='Save attestation message in this file (use with -a)')
-    parser.add_argument('-c', '--check',
-                        help='Check attestation for patches in an mbox file')
-    parser.add_argument('-i', '--attestation-file', dest='attfile',
-                        help='Use this file for attestation data instead of querying lore.kernel.org')
-    parser.add_argument('-t', '--tofu', action='store_true', default=False,
-                        help='Force TOFU trust model (otherwise uses your global GnuPG setting)')
-    parser.add_argument('-X', '--no-fast-exit', dest='nofast', action='store_true', default=False,
-                        help='Do not exit after first failure')
-    parser.add_argument('-F', '--ignore-from-mismatch', dest='ignorefrom', action='store_true',
-                        default=False, help='Ignore mismatches between From: and PGP uid data')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Only output errors to the stdout')
     parser.add_argument('-v', '--verbose', action='store_true', default=False,
                         help='Be more verbose in logging output')
+    # Attestation arguments
+    agroup = parser.add_argument_group('attestation', 'Attestation parameters')
+    agroup.add_argument('-a', '--attest', nargs='+',
+                        help='Create attestation for patches')
+    # GDPR-proofing: by default, we add as little PII-sensitive info as possible
+    agroup.add_argument('-f', '--from', dest='sender', default='devnull@kernel.org',
+                        help='Use custom From field (use with -a)')
+    agroup.add_argument('-o', '--output', default='attestation.eml',
+                        help='Save attestation message in this file (use with -a)')
+    agroup.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
+                        help='Do not send any mail')
+    # Verification arguments
+    vgroup = parser.add_argument_group('verification', 'Verification parameters')
+    vgroup.add_argument('-c', '--check',
+                        help='Check attestation for patches in an mbox file')
+    vgroup.add_argument('-i', '--attestation-file', dest='attfile',
+                        help='Use this file for attestation data instead of querying lore.kernel.org')
+    vgroup.add_argument('-t', '--tofu', action='store_true', default=False,
+                        help='Force TOFU trust model (otherwise uses your global GnuPG setting)')
+    vgroup.add_argument('-X', '--no-fast-exit', dest='nofast', action='store_true', default=False,
+                        help='Do not exit after first failure')
+    vgroup.add_argument('-F', '--ignore-from-mismatch', dest='ignorefrom', action='store_true',
+                        default=False, help='Ignore mismatches between From: and PGP uid data')
 
     main(parser.parse_args())
