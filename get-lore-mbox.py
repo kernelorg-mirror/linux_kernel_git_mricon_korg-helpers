@@ -912,7 +912,13 @@ def get_newest_series(mboxfile, session):
     logger.debug('Query URL: %s', queryurl)
     resp = session.get(queryurl)
     # try to parse it
-    tree = xml.etree.ElementTree.fromstring(resp.content)
+    try:
+        tree = xml.etree.ElementTree.fromstring(resp.content)
+    except xml.etree.ElementTree.ParseError as ex:
+        logger.debug('Unable to parse results, ignoring', ex)
+        resp.close()
+        mbx.close()
+        return
     resp.close()
     ns = {'atom': 'http://www.w3.org/2005/Atom'}
     entries = tree.findall('atom:entry', ns)
