@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.10'
+VERSION = '0.2.11'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -987,47 +987,56 @@ def main(cmdargs):
 
     logger.addHandler(ch)
 
-    if not cmdargs.msgid:
-        logger.debug('Getting Message-ID from stdin')
-        msgid = get_msgid_from_stdin()
-        if msgid is None:
-            logger.error('Unable to find a valid message-id in stdin.')
-            sys.exit(1)
-    else:
-        msgid = cmdargs.msgid
-
-    msgid = msgid.strip('<>')
-    # Handle the case when someone pastes a full URL to the message
-    matches = re.search(r'^https?://[^/]+/([^/]+)/([^/]+@[^/]+)', msgid, re.IGNORECASE)
-    if matches:
-        chunks = matches.groups()
-        msgid = chunks[1]
-        # Infer the project name from the URL, if possible
-        if chunks[0] != 'r':
-            cmdargs.useproject = chunks[0]
+    session = requests.session()
+    session.headers.update({'User-Agent': 'get-lore-mbox/%s' % VERSION})
 
     config = get_config_from_git(r'get-lore-mbox\..*', defaults=DEFAULT_CONFIG)
     config['trailer-order'] = config['trailer-order'].split(',')
 
-    session = requests.session()
-    session.headers.update({'User-Agent': 'get-lore-mbox/%s' % VERSION})
-    mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs, session)
+    if not cmdargs.localmbox:
+        if not cmdargs.msgid:
+            logger.debug('Getting Message-ID from stdin')
+            msgid = get_msgid_from_stdin()
+            if msgid is None:
+                logger.error('Unable to find a valid message-id in stdin.')
+                sys.exit(1)
+        else:
+            msgid = cmdargs.msgid
 
-    if mboxfile and cmdargs.checknewer:
-        get_newest_series(mboxfile, session)
+        msgid = msgid.strip('<>')
+        # Handle the case when someone pastes a full URL to the message
+        matches = re.search(r'^https?://[^/]+/([^/]+)/([^/]+@[^/]+)', msgid, re.IGNORECASE)
+        if matches:
+            chunks = matches.groups()
+            msgid = chunks[1]
+            # Infer the project name from the URL, if possible
+            if chunks[0] != 'r':
+                cmdargs.useproject = chunks[0]
 
-    if mboxfile is None:
-        return
+        mboxfile = get_pi_thread_by_msgid(msgid, config, cmdargs, session)
+        if mboxfile is None:
+            return
 
-    if cmdargs.amready:
         # Move it into -thread
         threadmbox = '%s-thread' % mboxfile
         os.rename(mboxfile, threadmbox)
-        mbox_to_am(threadmbox, config, cmdargs)
-        os.unlink(threadmbox)
     else:
-        mbx = mailbox.mbox(mboxfile)
-        logger.critical('Saved %s', mboxfile)
+        if os.path.exists(cmdargs.localmbox):
+            threadmbox = cmdargs.localmbox
+        else:
+            logger.critical('Mailbox %s does not exist', cmdargs.localmbox)
+            sys.exit(1)
+
+    if threadmbox and cmdargs.checknewer:
+        get_newest_series(threadmbox, session)
+
+    if cmdargs.amready:
+        mbox_to_am(threadmbox, config, cmdargs)
+        if not cmdargs.localmbox:
+            os.unlink(threadmbox)
+    else:
+        mbx = mailbox.mbox(threadmbox)
+        logger.critical('Saved %s', threadmbox)
         logger.critical('%s messages in the thread', len(mbx))
 
 
@@ -1043,24 +1052,28 @@ if __name__ == '__main__':
                         help='Use a specific project instead of guessing (linux-mm, linux-hardening, etc)')
     parser.add_argument('-c', '--check-newer-revisions', dest='checknewer', action='store_true', default=False,
                         help='Check if newer patch revisions exist')
-    parser.add_argument('-a', '--am-ready', dest='amready', action='store_true', default=False,
-                        help='Make an mbox ready for git am')
-    parser.add_argument('-t', '--apply-cover-trailers', dest='covertrailers', action='store_true', default=False,
-                        help='Apply trailers sent to the cover letter to all patches (use with -a)')
-    parser.add_argument('-T', '--no-add-trailers', dest='noaddtrailers', action='store_true', default=False,
-                        help='Do not add or sort any trailers (use with -a)')
-    parser.add_argument('-v', '--use-version', dest='wantver', type=int, default=None,
-                        help='Get a specific version of the patch/series (use with -a)')
-    parser.add_argument('-s', '--add-my-sob', dest='addmysob', action='store_true', default=False,
-                        help='Add your own signed-off-by to every patch (use with -a)')
-    parser.add_argument('-l', '--add-link', dest='addlink', action='store_true', default=False,
-                        help='Add a lore.kernel.org/r/ link to every patch (use with -a)')
     parser.add_argument('-n', '--mbox-name', dest='wantname', default=None,
                         help='Filename to name the mbox file')
-    parser.add_argument('-Q', '--quilt-ready', dest='quiltready', action='store_true', default=False,
-                        help='Save mbox patches in a quilt-ready folder (use with -a)')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Add more debugging info to the output')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Output critical information only')
+
+    agroup = parser.add_argument_group('am-ready parameters')
+    agroup.add_argument('-a', '--am-ready', dest='amready', action='store_true', default=False,
+                        help='Make an mbox ready for git am')
+    agroup.add_argument('-m', '--use-local-mbox', dest='localmbox', default=None,
+                        help='Instead of grabbing a thread from lore, process this mbox file')
+    agroup.add_argument('-v', '--use-version', dest='wantver', type=int, default=None,
+                        help='Get a specific version of the patch/series')
+    agroup.add_argument('-t', '--apply-cover-trailers', dest='covertrailers', action='store_true', default=False,
+                        help='Apply trailers sent to the cover letter to all patches')
+    agroup.add_argument('-T', '--no-add-trailers', dest='noaddtrailers', action='store_true', default=False,
+                        help='Do not add or sort any trailers')
+    agroup.add_argument('-s', '--add-my-sob', dest='addmysob', action='store_true', default=False,
+                        help='Add your own signed-off-by to every patch')
+    agroup.add_argument('-l', '--add-link', dest='addlink', action='store_true', default=False,
+                        help='Add a lore.kernel.org/r/ link to every patch')
+    agroup.add_argument('-Q', '--quilt-ready', dest='quiltready', action='store_true', default=False,
+                        help='Save mbox patches in a quilt-ready folder')
     main(parser.parse_args())
