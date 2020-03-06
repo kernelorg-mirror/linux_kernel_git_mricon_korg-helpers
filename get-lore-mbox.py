@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.11'
+VERSION = '0.2.12'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -190,12 +190,15 @@ class LoreMailbox:
                 if len(self.series) > 1:
                     logger.info('Found new series v%s', lmsg.revision)
             if lmsg.has_diff:
+                logger.debug('  adding as patch')
                 self.series[lmsg.revision].add_patch(lmsg)
             elif lmsg.counter == 0 and lmsg.has_diffstat:
                 # Bona-fide cover letter
+                logger.debug('  adding as cover letter')
                 self.series[lmsg.revision].add_cover(lmsg)
             elif lmsg.reply:
                 # We'll figure out where this belongs later
+                logger.debug('  adding to followups')
                 self.followups.append(lmsg)
         elif lmsg.reply:
             self.followups.append(lmsg)
@@ -245,8 +248,9 @@ class LoreSeries:
         if self.patches[lmsg.counter] is not None:
             # Okay, weird, is the one in there a reply?
             omsg = self.patches[lmsg.counter]
-            if omsg.reply:
+            if omsg.reply or (omsg.counters_inferred and not lmsg.counters_inferred):
                 # Replace that one with this one
+                logger.debug('  replacing existing: %s', omsg.subject)
                 self.patches[lmsg.counter] = lmsg
         else:
             self.patches[lmsg.counter] = lmsg
@@ -565,7 +569,7 @@ class LoreSubject:
 
         self.full_subject = subject
         # Is it a reply?
-        if re.search(r'^\w+:\s*\[', subject):
+        if re.search(r'^(Re|Aw|Fwd):', subject, re.I) or re.search(r'^\w{2,3}:\s*\[', subject):
             self.reply = True
             subject = re.sub(r'^\w+:\s*\[', '[', subject)
 
