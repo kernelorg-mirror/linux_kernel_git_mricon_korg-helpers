@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.12'
+VERSION = '0.2.13'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -127,12 +127,14 @@ class LoreMailbox:
 
         # Do we have any follow-ups?
         for fmsg in self.followups:
-            logger.debug('Analyzing follow-up: %s', fmsg.full_subject)
+            logger.debug('Analyzing follow-up: %s (%s)', fmsg.full_subject, fmsg.fromemail)
             # If there are no trailers in this one, ignore it
             if not len(fmsg.trailers):
+                logger.debug('  no trailers found, skipping')
                 continue
             # if it's for the wrong revision, ignore it
-            if lser.revision != fmsg.revision:
+            if not fmsg.revision_inferred and lser.revision != fmsg.revision:
+                logger.debug('  follow-up for the wrong revision, skipping')
                 continue
             # Go up through the follow-ups and tally up trailers until
             # we either run out of in-reply-tos, or we find a patch in
@@ -190,6 +192,16 @@ class LoreMailbox:
                 if len(self.series) > 1:
                     logger.info('Found new series v%s', lmsg.revision)
             if lmsg.has_diff:
+                # Attempt to auto-number series from the same author who did not bother
+                # to set v2, v3, etc in the patch revision
+                if (lmsg.counter == 1 and lmsg.counters_inferred
+                        and not lmsg.reply and lmsg.lsubject.patch and not lmsg.lsubject.resend):
+                    omsg = self.series[lmsg.revision].patches[lmsg.counter]
+                    if (omsg is not None and omsg.counters_inferred and lmsg.fromemail == omsg.fromemail
+                            and omsg.date < lmsg.date):
+                        lmsg.revision = len(self.series) + 1
+                        self.series[lmsg.revision] = LoreSeries(lmsg.revision, lmsg.expected)
+                        logger.info('Assuming new revision: v%s (%s)', lmsg.revision, lmsg.full_subject)
                 logger.debug('  adding as patch')
                 self.series[lmsg.revision].add_patch(lmsg)
             elif lmsg.counter == 0 and lmsg.has_diffstat:
@@ -201,8 +213,10 @@ class LoreMailbox:
                 logger.debug('  adding to followups')
                 self.followups.append(lmsg)
         elif lmsg.reply:
+            logger.debug('  adding to followups')
             self.followups.append(lmsg)
         else:
+            logger.debug('  adding to unknowns')
             self.unknowns.append(lmsg)
 
 
@@ -417,8 +431,13 @@ class LoreMessage:
                 # Does the email in the trailer match what's in the From?
                 for tname, tvalue in matches:
                     namedata = email.utils.getaddresses([tvalue])[0]
-                    if namedata[1].lower() == self.fromemail.lower():
+                    tfrom = re.sub(r'\+[^@]+@', '@', namedata[1].lower())
+                    hfrom = re.sub(r'\+[^@]+@', '@', self.fromemail.lower())
+                    if tfrom == hfrom:
                         self.trailers.append((tname, tvalue))
+                    else:
+                        logger.debug('  ignoring "%s: %s" due to from mismatch (from: %s)', tname, tvalue,
+                                     self.fromemail)
 
     def __repr__(self):
         out = list()
