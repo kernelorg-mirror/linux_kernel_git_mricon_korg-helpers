@@ -428,16 +428,17 @@ class LoreMessage:
             # Do we have something that looks like a person-trailer?
             matches = re.findall(r'^\s*([\w-]+):[ \t]+(.*<\S+>)\s*$', self.body, re.MULTILINE)
             if matches:
-                # Does the email in the trailer match what's in the From?
+                # Basic sanity checking -- the trailer must match the name or the email
+                # in the From header, to avoid false-positive trailer parsing errors
                 for tname, tvalue in matches:
                     namedata = email.utils.getaddresses([tvalue])[0]
                     tfrom = re.sub(r'\+[^@]+@', '@', namedata[1].lower())
                     hfrom = re.sub(r'\+[^@]+@', '@', self.fromemail.lower())
-                    if tfrom == hfrom:
+                    if tfrom == hfrom or namedata[0].lower() == self.fromname.lower():
                         self.trailers.append((tname, tvalue))
                     else:
-                        logger.debug('  ignoring "%s: %s" due to from mismatch (from: %s)', tname, tvalue,
-                                     self.fromemail)
+                        logger.debug('  ignoring "%s: %s" due to from mismatch (from: %s %s)', tname, tvalue,
+                                     self.fromname, self.fromemail)
 
     def __repr__(self):
         out = list()
