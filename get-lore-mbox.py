@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.13'
+VERSION = '0.2.14'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -744,7 +744,54 @@ def get_pi_thread_by_msgid(msgid, config, cmdargs, session):
             loc.scheme, loc.netloc, cmdargs.useproject, msgid)
         logger.debug('Will query: %s', t_mbx_url)
     logger.critical('Grabbing thread from %s', loc.netloc)
-    return get_pi_thread_by_url(t_mbx_url, savefile, session)
+    pi_mbx = get_pi_thread_by_url(t_mbx_url, '%s-loose' % savefile, session)
+    return get_strict_thread(pi_mbx, msgid, savefile)
+
+
+def get_strict_thread(pi_mbx, msgid, savefile):
+    pmbx = mailbox.mbox(pi_mbx)
+    smbx = mailbox.mbox(savefile)
+    want = {msgid}
+    got = set()
+    seen = set()
+    while True:
+        for msg in pmbx:
+            c_msgid = LoreMessage.get_clean_msgid(msg)
+            seen.add(c_msgid)
+            if c_msgid in got:
+                continue
+
+            refs = list()
+            for ref in msg.get('References', msg.get('In-Reply-To', '')).split():
+                ref = ref.strip().strip('<>')
+                if ref in got or ref in want:
+                    want.add(c_msgid)
+                elif len(ref):
+                    refs.append(ref)
+
+            if c_msgid in want:
+                smbx.add(msg)
+                got.add(c_msgid)
+                want.update(refs)
+                want.discard(c_msgid)
+                logger.debug('Kept in thread: %s', c_msgid)
+
+        # Remove any entries not in "seen" (missing messages)
+        for c_msgid in set(want):
+            if c_msgid not in seen:
+                want.remove(c_msgid)
+        if not len(want):
+            break
+
+    if not len(smbx):
+        return None
+
+    if len(pmbx) > len(smbx):
+        logger.info('Reduced thread to strict matches only (%s->%s)', len(pmbx), len(smbx))
+    pmbx.close()
+    smbx.close()
+    os.unlink(pi_mbx)
+    return savefile
 
 
 def mbox_to_am(mboxfile, config, cmdargs):
