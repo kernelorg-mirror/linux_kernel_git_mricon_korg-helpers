@@ -30,7 +30,7 @@ charset.add_charset('utf-8', None)
 emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 logger = logging.getLogger('get-lore-mbox')
 
-VERSION = '0.2.15'
+VERSION = '0.2.16'
 
 # You can use bash-style globbing here
 WANTHDRS = [
@@ -540,6 +540,7 @@ class LoreMessage:
                     btrailers.append(matches.groups())
 
                 # Now we add mix-in trailers
+                btrailers.reverse()
                 trailers = btrailers + self.followup_trailers
                 added = list()
                 if trailer_order is None:
