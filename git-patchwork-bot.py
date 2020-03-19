@@ -535,7 +535,6 @@ def send_summary(serieslist, to_state, refname, config, nomail):
                '%s (%s):\n'
            ) % (to_state, config['treename'], refname)
 
-    references = list()
     count = 0
     for sdata in serieslist:
         count += 1
@@ -544,10 +543,6 @@ def send_summary(serieslist, to_state, refname, config, nomail):
         # If we have a cover letter, then the reference is the msgid of the cover letter,
         # else the reference is the msgid of the first patch
         patches = sdata.get('patches')
-        if sdata.get('cover_letter'):
-            references.append(sdata.get('cover_letter').get('msgid'))
-        else:
-            references.append(patches[0].get('msgid'))
 
         submitter = sdata.get('submitter')
         body += '\n'
@@ -559,6 +554,12 @@ def send_summary(serieslist, to_state, refname, config, nomail):
 
         body += '  Submitter: %s <%s>\n' % (submitter.get('name'), submitter.get('email'))
         body += '  Patchwork: %s\n' % sdata.get('web_url')
+
+        if sdata.get('cover_letter'):
+            link = sdata.get('cover_letter').get('msgid')
+        else:
+            link = patches[0].get('msgid')
+        body += '  Link: %s\n' % link
 
         if len(patches) > 1:
             body += '    Patches: %s\n' % patches[0].get('name')
@@ -577,7 +578,6 @@ def send_summary(serieslist, to_state, refname, config, nomail):
     msg['From'] = Header(config['from'], 'utf-8')
     msg['Message-Id'] = make_msgid('git-patchwork-summary')
     msg['Date'] = formatdate(localtime=True)
-    msg['References'] = Header(', '.join(references), 'utf-8')
 
     targets = config['summaryto'].split(',')
     msg['To'] = Header(', '.join(targets), 'utf-8')
