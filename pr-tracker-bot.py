@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # PR Tracker Bot tracks pull requests sent to a mailing list (via its
@@ -10,10 +10,6 @@
 #
 # https://korg.wiki.kernel.org/userdoc/prtracker
 #
-from __future__ import (absolute_import,
-                        division,
-                        print_function,
-                        unicode_literals)
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
@@ -23,14 +19,13 @@ import argparse
 import email
 import email.message
 import email.utils
-import random
 import smtplib
 import time
 import subprocess
 import sqlite3
 import logging
+import pathlib
 import re
-import glob
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
 from string import Template
@@ -56,19 +51,6 @@ PULL_BODY_REMOTE_REF_RE = [
 ]
 
 logger = logging.getLogger('prtracker')
-
-
-# Python-2.7 doesn't have a domain= keyword argument, so steal make_msgid from python-3.2+
-def make_msgid(idstring=None, domain='kernel.org'):
-    timeval = int(time.time()*100)
-    pid = os.getpid()
-    randint = random.getrandbits(64)
-    if idstring is None:
-        idstring = ''
-    else:
-        idstring = '.' + idstring
-
-    return '<%d.%d.%d%s@%s>' % (timeval, pid, randint, idstring, domain)
 
 
 def db_migrate_1_to_2(projpath):
@@ -178,15 +160,14 @@ def git_get_command_lines(gitdir, args):
 
 
 def git_run_command(gitdir, args, logstderr=False):
-    cmdargs = ['git', '--no-pager']
+    fullargs = ['git', '--no-pager']
     if gitdir:
-        cmdargs += ['--git-dir', gitdir]
-    cmdargs += args
+        fullargs += ['--git-dir', gitdir]
+    fullargs += args
 
-    logger.debug('Running %s' % ' '.join(cmdargs))
+    logger.debug('Running %s' % ' '.join(fullargs))
 
-    (output, error) = subprocess.Popen(cmdargs, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE).communicate()
+    (output, error) = subprocess.Popen(fullargs, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     output = output.strip().decode('utf-8', errors='replace')
 
     if logstderr and len(error.strip()):
@@ -211,7 +192,7 @@ def git_get_message_from_pi(projpath, shard, commit_id):
     if not len(full_email):
         return None
 
-    msg = email.message_from_string(full_email.encode('utf-8'))
+    msg = email.message_from_string(full_email)
     return msg
 
 
@@ -255,7 +236,7 @@ def get_remote_ref_from_body(body):
     for reporef_re in PULL_BODY_REMOTE_REF_RE:
         matches = reporef_re.search(body)
         if matches:
-            chunks = matches.groups(0)
+            chunks = matches.groups()
             if len(chunks) > 1:
                 (repo, ref) = chunks
             else:
@@ -274,7 +255,7 @@ def record_pr_data(shard, msg_commit_id, msg, c):
     for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
         matches = cid_re.search(body)
         if matches:
-            (pr_commit_id,) = matches.groups(0)
+            pr_commit_id = matches.groups()[0]
             break
 
     if pr_commit_id is None:
@@ -470,54 +451,35 @@ def parse_pull_requests(pirepo, topdir, dryrun):
         dbconn.commit()
 
 
-def get_config_from_repo(repo, pitopdir, cmdconfig):
+def get_config_from_cfgfile(repo, pitopdir, cmdconfig, cfgfile=None):
+    from configparser import ConfigParser
     config = dict()
-    args = ['config', '-z', '--local', '--get-regexp', r'prtracker\..*']
-    out = git_run_command(repo, args)
-    if not out:
-        return config
-
-    for line in out.split('\x00'):
-        if not line:
-            continue
-        key, value = line.split('\n', 1)
-        try:
-            chunks = key.split('.')
-            pirepo = '.'.join(chunks[1:-1])
-            if not pirepo:
-                pirepo = '*'
-            if pirepo not in config:
-                config[pirepo] = dict()
-            cfgkey = chunks[-1]
-            config[pirepo][cfgkey] = value
-        except ValueError:
-            logger.debug('Ignoring git config entry %s', line)
-
-    if '*' in config and 'pirepos' in config['*']:
-        subconfig = dict(config['*'])
-        del(subconfig['pirepos'])
-        for repoglob in config['*']['pirepos'].split(','):
-            repoglob = repoglob.strip()
-            if pitopdir:
-                # It's hurky to add it here only to remove it there, but
-                # the alternatives were hurkier.
-                repoglob = os.path.join(pitopdir, repoglob)
-            for pirepo in glob.glob(repoglob):
-                if pitopdir:
-                    pirepo = pirepo.replace(pitopdir, '').lstrip('/')
-                config[pirepo] = subconfig
-        del(config['*'])
-
     if cmdconfig:
-        superconfig = dict()
         for entry in cmdconfig:
             key, value = entry.split('=', 1)
-            superconfig[key] = value
-        # add/override values with those passed from cmdline
-        for pirepo in config.keys():
-            config[pirepo].update(superconfig)
+            config[key] = value
+    if not cfgfile:
+        cfgfile = os.path.join(repo, 'thanks.conf')
+    if not os.path.exists(cfgfile):
+        logger.critical('Could not find cfgfile %s', cfgfile)
+        sys.exit(1)
+    cfg = ConfigParser()
+    cfg.read(cfgfile)
+    for key, value in cfg.items('main'):
+        if key not in config:
+            config[key] = value
 
-    return config
+    globpatts = [x.strip() for x in config.get('pirepos', '*').split('\n')]
+
+    # Find all prtracker.db files in pitopdir
+    tp = pathlib.Path(pitopdir)
+    pirepos = set()
+    for subp in tp.glob('**/prtracker.db'):
+        for globpatt in globpatts:
+            if subp.match(globpatt):
+                pirepos.add(subp.parent.resolve().as_posix())
+
+    return pirepos, config
 
 
 def get_all_thanked_prs(c, cutoffdays=30):
@@ -561,7 +523,17 @@ def get_plain_part(msg):
         if body is None:
             continue
 
+        # We don't have to bother with charsets, because
+        # we are looking for content that's guaranteed to be
+        # in us-ascii.
         body = body.decode('utf-8', errors='replace')
+        # Look for evidence of a git pull request in this body
+        (repo, ref) = get_remote_ref_from_body(body)
+        if repo is None:
+            body = None
+            continue
+        logger.debug('Found a part with (%s, %s)', repo, ref)
+        break
 
     return body
 
@@ -686,7 +658,7 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     msg['X-PR-Merge-Refname'] = refname
     msg['X-PR-Merge-Commit-Id'] = merge_id
 
-    msg['Message-Id'] = make_msgid('pr-tracker-bot')
+    msg['Message-Id'] = email.utils.make_msgid('pr-tracker-bot', domain='kernel.org')
     msg['Date'] = email.utils.formatdate(localtime=True)
 
     # Set to and cc
@@ -737,7 +709,7 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     return msg['Message-Id']
 
 
-def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
+def send_thanks(repo, pitopdir, cfgfile, cmdconfig, nomail, dryrun):
     if dryrun:
         nomail = True
 
@@ -766,14 +738,14 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
         dbconn.commit()
         return
 
-    config = get_config_from_repo(repo, pitopdir, cmdconfig)
+    pirepos, settings = get_config_from_cfgfile(repo, pitopdir, cmdconfig, cfgfile=cfgfile)
+    logger.debug('config follows')
+    logger.debug(settings)
 
     tycount = 0
-    for pirepo, settings in config.items():
-        projpath, maxshard = get_pirepo_dir(pirepo, pitopdir)
+    for pirepo in pirepos:
+        projpath, maxshard = get_pirepo_dir(pirepo, None)
         logger.info('Grabbing PR commits from %s', projpath)
-        logger.debug('config follows')
-        logger.debug(settings)
 
         cutoffdays = 30
         try:
@@ -809,21 +781,23 @@ def send_thanks(repo, pitopdir, cmdconfig, nomail, dryrun):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--parse-requests', dest='pirepo', default=None,
                         help='Check the Public Inbox ML repository for any new pull requests.')
     parser.add_argument('-m', '--mail-thankyous', dest='tyrepo', default=None,
                         help='Check the repository and thank for any matching pulled PRs.')
     parser.add_argument('-t', '--pirepos-topdir', dest='topdir', default=None,
                         help='Toplevel path where all public-inbox repos are (optional)')
-    parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
-                        help='Use these config values instead of looking in the repo (used with -m)')
+    parser.add_argument('-o', '--override-config', dest='config', nargs='+', default=list(),
+                        help='Override config entries in the cfgfile (used with -m)')
+    parser.add_argument('-c', '--cfgfile', default=None,
+                        help='Config file to use instead of thanks.conf in the repo (used with -m)')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
     parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
                         help='Do not mail or store anything, just do a dry run.')
+    parser.add_argument('-b', '--debug', dest='debug', action='store_true', default=False,
+                        help='Add debug information to the log file, if specified.')
     parser.add_argument('-n', '--no-mail', dest='nomail', action='store_true', default=False,
                         help='Do not mail anything, but store database entries.')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
@@ -837,11 +811,10 @@ if __name__ == '__main__':
 
     if cmdargs.logfile:
         ch = logging.FileHandler(cmdargs.logfile)
-        formatter = logging.Formatter(
-            '[%(asctime)s] %(message)s')
+        formatter = logging.Formatter('[%(asctime)s] %(message)s')
         ch.setFormatter(formatter)
 
-        if cmdargs.verbose:
+        if cmdargs.debug:
             ch.setLevel(logging.DEBUG)
         else:
             ch.setLevel(logging.INFO)
@@ -864,4 +837,4 @@ if __name__ == '__main__':
         parse_pull_requests(cmdargs.pirepo, cmdargs.topdir, cmdargs.dryrun)
 
     if cmdargs.tyrepo is not None:
-        send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
+        send_thanks(cmdargs.tyrepo, cmdargs.topdir, cmdargs.cfgfile, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
