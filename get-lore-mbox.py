@@ -1089,6 +1089,11 @@ def main(cmdargs):
 
     logger.addHandler(ch)
 
+    logger.critical('--- WARNING: OBSOLETE ---')
+    logger.critical('This script has been obsoleted by "b4" and is unmaintained.')
+    logger.critical('https://git.kernel.org/pub/scm/utils/b4/b4.git')
+    logger.critical('-------------------------')
+
     session = requests.session()
     session.headers.update({'User-Agent': 'get-lore-mbox/%s' % VERSION})
 
