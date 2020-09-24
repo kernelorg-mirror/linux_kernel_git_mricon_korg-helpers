@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # This bot automatically recognizes when patchwork-tracked patches
@@ -6,16 +6,17 @@
 # additionally send mail notifications to the maintainers and to the
 # patch submitters.
 #
+# While we continue to support the 1.1 API, we must rely on
+# username/password authentication. To make that work, set up the
+# $HOME/.netrc file. Once we drop support for patchwork < 2.2, we'll
+# switch over to using the API keys entirely.
+#
 # It runs from a cronjob, but can be also run from post-update hooks with 
 # extra wrappers. For more details, consult:
 #
 # https://korg.wiki.kernel.org/userdoc/pwbot
 #
 #
-from __future__ import (absolute_import,
-                        division,
-                        print_function,
-                        unicode_literals)
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
@@ -30,32 +31,44 @@ import hashlib
 import re
 import requests
 import datetime
-import time
-import random
+import netrc
+
+import ruamel.yaml # noqa
 
 from email.mime.text import MIMEText
 from email.header import Header
-from email.utils import formatdate, getaddresses
+from email.utils import formatdate, getaddresses, make_msgid
 
 from fcntl import lockf, LOCK_EX, LOCK_NB
 
-try:
-    import xmlrpclib
-except ImportError:
-    # Python 3 has merged/renamed things.
-    import xmlrpc.client as xmlrpclib
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+from string import Template
+
+import xmlrpc.client as xmlrpclib
 
 # Send all email 8-bit, this is not 1999
 from email import charset
-charset.add_charset('utf-8', charset.SHORTEST, '8bit')
+charset.add_charset('utf-8', charset.SHORTEST)
 
+__VERSION__ = '2.0'
 DB_VERSION = 1
 REST_API_VERSION = '1.1'
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE = 50
 
-_project_cache = None
+CONFIG = None
+
+NOMAIL = False
+DRYRUN = False
+MAILHOST = 'localhost'
+DOMAIN = None
+CACHEDIR = os.path.expanduser('~/.cache/git-patchwork-bot')
+
+_project_cache = dict()
+_server_cache = dict()
 
 logger = logging.getLogger('gitpwcron')
 
@@ -77,46 +90,29 @@ class Transport(xmlrpclib.SafeTransport):
         if self.proxy:
             self.https = self.proxy.startswith('https')
 
-    def set_credentials(self, username=None, password=None):
-        self.credentials = '%s:%s' % (username, password)
-
     def make_connection(self, host):
         self.host = host
         if self.proxy:
             host = self.proxy.split('://', 1)[-1].rstrip('/')
-        if self.credentials:
-            host = '@'.join([self.credentials, host])
+        nc = netrc.netrc()
+        auths = nc.authenticators(host)
+        if auths:
+            login, account, password = auths
+            host = '{}:{}@{}'.format(login, password, host)
         if self.https:
             return xmlrpclib.SafeTransport.make_connection(self, host)
         else:
             return xmlrpclib.Transport.make_connection(self, host)
 
-    if sys.version_info[0] == 2:
-        # Python 2
-        # noinspection PyArgumentList,PyMethodOverriding
-        def send_request(self, connection, handler, request_body):
-            handler = '%s://%s%s' % (self.scheme, self.host, handler)
-            xmlrpclib.Transport.send_request(self, connection, handler,
-                                             request_body)
-    else:
-        # Python 3
-        def send_request(self, host, handler, request_body, debug):
-            handler = '%s://%s%s' % (self.scheme, host, handler)
-            return xmlrpclib.Transport.send_request(self, host, handler,
-                                                    request_body, debug)
+    def send_request(self, host, handler, request_body, debug):
+        handler = '%s://%s%s' % (self.scheme, host, handler)
+        return xmlrpclib.Transport.send_request(self, host, handler, request_body, debug)
 
 
 class Restmaker:
-    def __init__(self, server, settings):
+    def __init__(self, server):
         self.server = server
         self.url = '/'.join((server.rstrip('/'), 'api', REST_API_VERSION))
-        self.headers = {
-            'User-Agent': 'git-patchwork-bot',
-        }
-        # As long as the REST api does not expose filtering by hash, we have to use
-        # user/pass authentication for xmlrpc purposes. We'll implement token
-        # authentication when that stops being the case.
-        self.auth = requests.auth.HTTPBasicAuth(settings['user'], settings['pass'])
 
         self.series_url = '/'.join((self.url, 'series'))
         self.patches_url = '/'.join((self.url, 'patches'))
@@ -125,13 +121,19 @@ class Restmaker:
         # Simple local cache
         self._patches = dict()
 
+        self.session = requests.session()
+        retry = Retry(connect=3, backoff_factor=0.5)
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        self.session.headers.update({'User-Agent': 'git-patchwork-bot/%s' % __VERSION__})
+
     def get_cover(self, cover_id):
         try:
             logger.debug('Grabbing cover %d', cover_id)
             url = '/'.join((self.covers_url, str(cover_id), ''))
             logger.debug('url=%s', url)
-            rsp = requests.get(url, auth=self.auth, headers=self.headers,
-                               params=list(), stream=False)
+            rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
             return rsp.json()
         except requests.exceptions.RequestException as ex:
@@ -144,8 +146,7 @@ class Restmaker:
                 logger.debug('Grabbing patch %d', patch_id)
                 url = '/'.join((self.patches_url, str(patch_id), ''))
                 logger.debug('url=%s', url)
-                rsp = requests.get(url, auth=self.auth, headers=self.headers,
-                                   params=list(), stream=False)
+                rsp = self.session.get(url, stream=False)
                 rsp.raise_for_status()
                 self._patches[patch_id] = rsp.json()
             except requests.exceptions.RequestException as ex:
@@ -159,8 +160,7 @@ class Restmaker:
             logger.debug('Grabbing series %d', series_id)
             url = '/'.join((self.series_url, str(series_id), ''))
             logger.debug('url=%s', url)
-            rsp = requests.get(url, auth=self.auth, headers=self.headers,
-                               params=list(), stream=False)
+            rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
@@ -171,8 +171,7 @@ class Restmaker:
     def get_patch_list(self, params):
         try:
             logger.debug('Grabbing patch list with params=%s', params)
-            rsp = requests.get(self.patches_url, auth=self.auth, headers=self.headers,
-                               params=params, stream=False)
+            rsp = self.session.get(self.patches_url, params=params, stream=False)
             rsp.raise_for_status()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
@@ -183,8 +182,7 @@ class Restmaker:
     def get_series_list(self, params):
         try:
             logger.debug('Grabbing series with params=%s', params)
-            rsp = requests.get(self.series_url, auth=self.auth, headers=self.headers,
-                               params=params, stream=False)
+            rsp = self.session.get(self.series_url, params=params, stream=False)
             rsp.raise_for_status()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
@@ -212,27 +210,13 @@ class Restmaker:
                 logger.debug('  commit_ref=%s', commit_ref)
                 data.append(('commit_ref', commit_ref))
 
-            rsp = requests.patch(url, auth=self.auth, headers=self.headers,
-                                 data=data, stream=False)
+            rsp = self.session.patch(url, data=data, stream=False)
             rsp.raise_for_status()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             return None
 
         return rsp.json()
-
-
-# Python-2.7 doesn't have a domain= keyword argument, so steal make_msgid from python-3.2+
-def make_msgid(idstring=None, domain='kernel.org'):
-    timeval = int(time.time()*100)
-    pid = os.getpid()
-    randint = random.getrandbits(64)
-    if idstring is None:
-        idstring = ''
-    else:
-        idstring = '.' + idstring
-
-    return '<%d.%d.%d%s@%s>' % (timeval, pid, randint, idstring, domain)
 
 
 def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
@@ -253,7 +237,7 @@ def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
 def get_patchwork_pull_requests_by_project(rm, project, fromstate):
     page = 0
     pagedata = list()
-    prs = list()
+    prs = set()
     more = True
     while True:
         if not pagedata and more:
@@ -289,26 +273,60 @@ def get_patchwork_pull_requests_by_project(rm, project, fromstate):
             else:
                 pull_refname = 'master'
 
-            prs.append((pull_host, pull_refname, patch_id))
+            prs.add((pull_host, pull_refname, patch_id))
 
     return prs
 
 
-def project_id_by_name(rpc, name):
-    if not name:
-        return 0
-
+def project_by_name(pname):
     global _project_cache
+    global _server_cache
 
-    if _project_cache is None:
-        _project_cache = rpc.project_list('', 0)
+    if not pname:
+        return None
 
-    for project in _project_cache:
-        if project['linkname'].lower().startswith(name.lower()):
-            logger.debug('project lookup: linkname=%s, id=%d', name, project['id'])
-            return project['id']
+    if pname not in _project_cache:
+        # Find patchwork definition containing this project
+        server = None
+        pconfig = None
+        for defurl in CONFIG['patchworks']:
+            if pname in CONFIG['patchworks'][defurl]['projects']:
+                server = defurl
+                pconfig = CONFIG['patchworks'][defurl]['projects'][pname]
+                break
+        if not server:
+            logger.critical('Could not find project matching %s in config', pname)
+            sys.exit(1)
 
-    return 0
+        if server not in _server_cache:
+            rm = Restmaker(server)
+            _project_cache[server] = dict()
+            url = '%s/xmlrpc/' % server
+            transport = Transport(url)
+
+            try:
+                rpc = xmlrpclib.Server(url, transport=transport)
+            except (IOError, OSError):
+                logger.info('Unable to connect to %s', url)
+                sys.exit(1)
+
+            plist = rpc.project_list('', 0)
+            _server_cache[server] = (rm, rpc, plist)
+        else:
+            rm, rpc, plist = _server_cache[server]
+
+        found = False
+        for project in plist:
+            if project['linkname'].lower().startswith(pname.lower()):
+                logger.debug('project lookup: linkname=%s, server=%s, id=%d', pname, server, project['id'])
+                _project_cache[pname] = (project, rm, rpc, pconfig)
+                found = True
+                break
+        if not found:
+            logger.info('Could not find project matching %s on server %s', pname, server)
+            return None
+
+    return _project_cache[pname]
 
 
 def db_save_meta(c):
@@ -332,16 +350,29 @@ def db_init_common_sqlite_db(c):
             version INTEGER
         )''')
     db_save_meta(c)
+
+
+def db_init_cache_sqlite_db(c):
+    logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
+    db_init_common_sqlite_db(c)
     c.execute('''
-        CREATE TABLE heads (
-            refname TEXT,
-            commit_id TEXT
+        CREATE TABLE revs (
+            rev TEXT NOT NULL,
+            patchwork_id TEXT NOT NULL,
+            git_id TEXT NOT NULL,
+            created DATE
         )''')
+    c.execute('''CREATE UNIQUE INDEX idx_rev ON revs(rev)''')
 
 
 def db_init_pw_sqlite_db(c):
     logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
     db_init_common_sqlite_db(c)
+    c.execute('''
+        CREATE TABLE heads (
+            refname TEXT,
+            commit_id TEXT
+        )''')
 
 
 def git_get_command_lines(gitdir, args):
@@ -362,11 +393,9 @@ def git_run_command(gitdir, args, stdin=None):
     logger.debug('Running %s' % ' '.join(args))
 
     if stdin is None:
-        (output, error) = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE).communicate()
+        (output, error) = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
     else:
-        pp = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
+        pp = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (output, error) = pp.communicate(input=stdin.encode('utf-8'))
 
     output = output.strip().decode('utf-8', errors='replace')
@@ -386,8 +415,10 @@ def git_get_repo_heads(gitdir):
     return refs
 
 
-def git_get_new_revs(gitdir, db_heads, git_heads, merges=False):
+def git_get_new_revs(gitdir, db_heads, git_heads, committers, merges=False):
     newrevs = dict()
+    if committers:
+        logger.debug('filtering by committers=%s', committers)
     for db_refrow in list(db_heads):
         if db_refrow in git_heads:
             logger.debug('No changes in %s', db_refrow[0])
@@ -410,7 +441,7 @@ def git_get_new_revs(gitdir, db_heads, git_heads, merges=False):
             continue
 
         rev_range = '%s..%s' % (db_commit_id, git_commit_id)
-        args = ['rev-list', '--pretty=oneline', '--reverse']
+        args = ['log', '--pretty=%H:%ce:%s', '--reverse']
         if not merges:
             args += ['--no-merges']
 
@@ -420,12 +451,18 @@ def git_get_new_revs(gitdir, db_heads, git_heads, merges=False):
         if not lines:
             continue
 
-        newrevs[refname] = list()
+        revs = list()
 
         for line in lines:
-            (commit_id, logmsg) = line.split(' ', 1)
-            logger.debug('commit_id=%s, subject=%s', commit_id, logmsg)
-            newrevs[refname].append((commit_id, logmsg))
+            (commit_id, committer, logmsg) = line.split(':', 2)
+            if committers and committer not in committers:
+                logger.debug('Skipping %s, committer=%s', commit_id, committer)
+                continue
+            logger.debug('commit_id=%s, committer=%s, subject=%s', commit_id, committer, logmsg)
+            revs.append((commit_id, logmsg))
+
+        if revs:
+            newrevs[refname] = revs
 
     return newrevs
 
@@ -490,52 +527,18 @@ def get_patchwork_hash(diff):
     return hashed.hexdigest()
 
 
-def get_config_from_repo(repo, regexp, cmdconfig):
-    config = dict()
-    args = ['config', '-z', '--local', '--get-regexp', regexp]
-    out = git_run_command(repo, args)
-    if not out:
-        return config
-
-    for line in out.split('\x00'):
-        if not line:
-            continue
-        key, value = line.split('\n', 1)
-        try:
-            chunks = key.split('.')
-            ident = '.'.join(chunks[1:-1])
-            if not ident:
-                ident = '*'
-            if ident not in config:
-                config[ident] = dict()
-            cfgkey = chunks[-1]
-            config[ident][cfgkey] = value
-        except ValueError:
-            logger.debug('Ignoring git config entry %s', line)
-
-    if cmdconfig:
-        superconfig = dict()
-        for entry in cmdconfig:
-            key, value = entry.split('=', 1)
-            superconfig[key] = value
-        # add/override values with those passed from cmdline
-        for ident in config.keys():
-            config[ident].update(superconfig)
-
-    return config
+def listify(obj):
+    if isinstance(obj, str):
+        return [obj]
+    return obj
 
 
-def send_summary(serieslist, to_state, refname, config, nomail):
+def send_summary(serieslist, to_state, refname, pname, rs, hs):
     logger.info('Preparing summary')
     # we send summaries by project, so the project name is going to be all the same
-    project = serieslist[0].get('project').get('link_name')
-    body = (
-               'Hello:\n\n'
-               'The following patches were marked "%s", because they were applied to\n'
-               '%s (%s):\n'
-           ) % (to_state, config['treename'], refname)
 
     count = 0
+    summary = list()
     for sdata in serieslist:
         count += 1
         logger.debug('Summarizing: %s', sdata.get('name'))
@@ -545,67 +548,95 @@ def send_summary(serieslist, to_state, refname, config, nomail):
         patches = sdata.get('patches')
 
         submitter = sdata.get('submitter')
-        body += '\n'
 
         if len(patches) == 1:
-            body += 'Patch: %s\n' % sdata.get('name')
+            summary.append('Patch: %s' % sdata.get('name'))
         else:
-            body += 'Series: %s\n' % sdata.get('name')
+            summary.append('Series: %s' % sdata.get('name'))
 
-        body += '  Submitter: %s <%s>\n' % (submitter.get('name'), submitter.get('email'))
-        body += '  Patchwork: %s\n' % sdata.get('web_url')
+        summary.append('  Submitter: %s <%s>' % (submitter.get('name'), submitter.get('email')))
+        summary.append('  Patchwork: %s' % sdata.get('web_url'))
 
         if sdata.get('cover_letter'):
-            link = sdata.get('cover_letter').get('msgid')
+            msgid = sdata.get('cover_letter').get('msgid').strip('<>')
         else:
-            link = patches[0].get('msgid')
-        body += '  Link: %s\n' % link
+            msgid = patches[0].get('msgid').strip('<>')
+
+        link = 'https://lore.kernel.org/r/%s' % msgid
+        summary.append('  Lore link: %s' % link)
 
         if len(patches) > 1:
-            body += '    Patches: %s\n' % patches[0].get('name')
+            summary.append('    Patches: %s' % patches[0].get('name'))
             for patch in patches[1:]:
                 count += 1
-                body += '             %s\n' % patch.get('name')
+                summary.append('             %s' % patch.get('name'))
 
-    body += '\nTotal patches: %d\n' % count
+    bodytpt = Template(CONFIG['templates']['summary'])
+    params = {
+        'newstate': to_state,
+        'treename': rs['treename'],
+        'refname': refname,
+        'summary': '\n'.join(summary),
+        'total': count,
+        'signature': CONFIG['templates']['signature'],
+    }
+    body = bodytpt.safe_substitute(params)
 
-    body += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
+    project, rm, rpc, pconfig = project_by_name(pname)
+    tweaks = get_tweaks(pconfig, hs)
 
-    msg = MIMEText(body.encode('utf-8'), _charset='utf-8')
+    msg = MIMEText(body, _charset='utf-8')
     msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-    msg['Subject'] = Header('Patchwork summary for: %s' % project, 'utf-8')
-    msg['From'] = Header(config['from'], 'utf-8')
-    msg['Message-Id'] = make_msgid('git-patchwork-summary')
+    msg['Subject'] = Header('Patchwork summary for: %s' % pname)
+    msg['From'] = Header(pconfig['from'])
+    msg['Message-Id'] = make_msgid('git-patchwork-summary', domain=DOMAIN)
     msg['Date'] = formatdate(localtime=True)
 
-    targets = config['summaryto'].split(',')
-    msg['To'] = Header(', '.join(targets), 'utf-8')
-    if 'alwayscc' in config:
-        msg['Cc'] = config['alwayscc']
-        targets.append(config['alwayscc'])
-    if 'alwaysbcc' in config:
-        targets.append(config['alwaysbcc'])
+    targets = listify(pconfig['summaryto'])
+    msg['To'] = Header(', '.join(targets))
+    if 'alwayscc' in tweaks:
+        msg['Cc'] = Header(', '.join(listify(tweaks['alwayscc'])))
+        targets.append(listify(tweaks['alwayscc']))
+    if 'alwaysbcc' in tweaks:
+        targets.append(listify(tweaks['alwaysbcc']))
 
-    if not nomail:
+    if not NOMAIL:
         logger.debug('Message follows')
-        logger.debug(msg.as_string().decode('utf-8'))
+        logger.debug(msg.as_string())
         logger.info('Sending summary to: %s', msg['To'])
 
-        smtp = smtplib.SMTP(config['mailhost'])
-        smtp.sendmail(msg['From'], targets, msg.as_string())
+        smtp = smtplib.SMTP(MAILHOST)
+        smtp.sendmail(msg['From'], targets, msg.as_bytes())
         smtp.close()
     else:
         logger.info('Would have sent the following:')
         logger.info('------------------------------')
-        logger.info(msg.as_string().decode('utf-8'))
+        logger.info(msg.as_string())
         logger.info('------------------------------')
 
     return msg['Message-Id']
 
 
-def notify_submitters(rm, serieslist, refname, config, revs, nomail):
+def get_tweaks(pconfig, hconfig):
+    fields = ['from', 'onlyto', 'neverto', 'onlyifto', 'neverifto', 'onlyifcc',
+              'neverifcc', 'alwayscc', 'alwaysbcc', 'cclist']
+    bubbled = dict()
+    for field in fields:
+        if field in hconfig:
+            bubbled[field] = hconfig[field]
+            continue
+        if field in pconfig:
+            bubbled[field] = pconfig[field]
+    return bubbled
+
+
+def notify_submitters(serieslist, refname, revs, pname, rs, hs):
     logger.info('Sending submitter notifications')
+    project, rm, rpc, pconfig = project_by_name(pname)
+
+    tweaks = get_tweaks(pconfig, hs)
+
     for sdata in serieslist:
         # If we have a cover letter, then the reference is the msgid of the cover letter,
         # else the reference is the msgid of the first patch
@@ -627,8 +658,8 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
         submitter = sdata.get('submitter')
         project = sdata.get('project')
 
-        if 'neverto' in config:
-            neverto = config['neverto'].split(',')
+        if 'neverto' in tweaks:
+            neverto = listify(tweaks['neverto'])
             if submitter.get('email') in neverto:
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
@@ -638,7 +669,7 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
         # If X-Patchwork-Bot header is set to "notify" we always notify
         if xpb != 'notify':
             # Use cc-based notification logic
-            ccs = []
+            ccs = list()
             cchdr = headers.get('Cc')
             if not cchdr:
                 cchdr = headers.get('cc')
@@ -648,24 +679,24 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
                     cchdr = [cchdr]
                 ccs = [chunk[1] for chunk in getaddresses(cchdr)]
 
-            if 'onlyifcc' in config:
+            if 'onlyifcc' in tweaks:
                 match = None
-                for chunk in config['onlyifcc'].split(','):
+                for chunk in listify(tweaks['onlyifcc']):
                     if chunk.strip() in ccs:
                         match = chunk
                         break
                 if match is None:
-                    logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), config['onlyifcc'])
+                    logger.debug('Skipping %s due to onlyifcc=%s', submitter.get('email'), tweaks['onlyifcc'])
                     continue
 
-            if ccs and 'neverifcc' in config:
+            if ccs and 'neverifcc' in tweaks:
                 match = None
-                for chunk in config['neverifcc'].split(','):
+                for chunk in listify(tweaks['neverifcc']):
                     if chunk.strip() in ccs:
                         match = chunk
                         break
                 if match is not None:
-                    logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), config['neverifcc'])
+                    logger.debug('Skipping %s due to neverifcc=%s', submitter.get('email'), tweaks['neverifcc'])
                     continue
 
         logger.debug('Preparing a notification for %s', submitter.get('email'))
@@ -676,315 +707,311 @@ def notify_submitters(rm, serieslist, refname, config, revs, nomail):
         else:
             reqtype = 'patch'
 
-        body = (
-            'Hello:\n\n'
-            'This %s was applied to %s (%s).\n\n'
-        ) % (reqtype, config['treename'], refname)
-        body += 'On %s you wrote:\n' % headers.get('Date')
-
+        trimquote = list()
         if content:
             qcount = 0
             for cline in content.split('\n'):
                 # Quote the first paragraph only and then [snip] if we quoted more than 5 lines
                 if qcount > 5 and (not len(cline.strip()) or cline.strip().find('---') == 0):
-                    body += '> \n> [...]\n'
+                    trimquote.append('> ')
+                    trimquote.append('> [...]')
                     break
-                body += '> %s\n' % cline.rstrip()
+                trimquote.append('> %s' % cline.rstrip())
                 qcount += 1
-            body += '\n'
 
-        body += '\nHere is a summary with links:\n'
-
+        summary = list()
         for patch in sdata.get('patches'):
-            body += '  - %s\n' % patch.get('name')
-            if 'commitlink' in config:
-                body += '    %s%s\n' % (config['commitlink'], revs[patch.get('id')])
+            summary.append('  - %s' % patch.get('name'))
+            if 'commitlink' in rs:
+                summary.append('    %s' % (rs['commitlink'] % revs[patch.get('id')]))
 
-        body += ('\nYou are awesome, thank you!\n\n'
-                 '-- \nDeet-doot-dot, I am a bot.\n'
-                 'https://korg.wiki.kernel.org/userdoc/pwbot\n')
+        bodytpt = Template(CONFIG['templates']['submitter'])
+        params = {
+            'reqtype': reqtype,
+            'treename': rs['treename'],
+            'refname': refname,
+            'sentdate': str(headers.get('Date')),
+            'trimquote': '\n'.join(trimquote),
+            'summary': '\n'.join(summary),
+            'signature': CONFIG['templates']['signature'],
+        }
+
+        body = bodytpt.safe_substitute(params)
 
         msg = MIMEText(body, _charset='utf-8')
         msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-        msg['Subject'] = Header('Re: %s' % headers.get('Subject'), 'utf-8')
-        msg['From'] = Header(config['from'], 'utf-8')
-        msg['Message-Id'] = make_msgid('git-patchwork-notify')
+        msg['Subject'] = Header('Re: %s' % headers.get('Subject'))
+        msg['From'] = Header(tweaks['from'])
+        msg['Message-Id'] = make_msgid('git-patchwork-notify', domain=DOMAIN)
         msg['Date'] = formatdate(localtime=True)
-        msg['References'] = Header(reference, 'utf-8')
-        msg['In-Reply-To'] = Header(reference, 'utf-8')
+        msg['References'] = Header(reference)
+        msg['In-Reply-To'] = Header(reference)
 
-        if 'onlyto' in config:
-            targets = [config['onlyto']]
-            msg['To'] = '%s <%s>' % (submitter.get('name'), config['onlyto'])
+        if 'onlyto' in tweaks:
+            targets = [tweaks['onlyto']]
+            msg['To'] = '%s <%s>' % (submitter.get('name'), tweaks['onlyto'])
         else:
             targets = [submitter.get('email')]
-            msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email')), 'utf-8')
+            msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email')))
 
-            if 'alwayscc' in config:
-                msg['Cc'] = config['alwayscc']
-                targets += config['alwayscc'].split(',')
-            if 'alwaysbcc' in config:
-                targets += config['alwaysbcc'].split(',')
-            if 'cclist' in config and config['cclist'] == 'true':
+            if 'alwayscc' in tweaks:
+                msg['Cc'] = ', '.join(listify(tweaks['alwayscc']))
+                targets += listify(tweaks['alwayscc'])
+            if 'alwaysbcc' in tweaks:
+                targets += listify(tweaks['alwaysbcc'])
+            if 'cclist' in tweaks and tweaks['cclist']:
                 targets.append(project.get('list_email'))
                 msg['Cc'] = project.get('list_email')
 
-        if not nomail:
+        if not NOMAIL:
             logger.debug('Message follows')
-            logger.debug(msg.as_string().decode('utf-8'))
+            logger.debug(msg.as_string())
             logger.info('Notifying %s', submitter.get('email'))
 
-            smtp = smtplib.SMTP(config['mailhost'])
-            smtp.sendmail(msg['From'], targets, msg.as_string())
+            smtp = smtplib.SMTP(MAILHOST)
+            smtp.sendmail(msg['From'], targets, msg.as_bytes())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
             logger.info('------------------------------')
-            logger.info(msg.as_string().decode('utf-8'))
+            logger.info(msg.as_string())
             logger.info('------------------------------')
 
 
-def housekeeping(rm, settings, nomail, dryrun):
-    logger.info('Running housekeeping in %s', rm.server)
-    hconfig = dict()
+def housekeeping(pname):
+    project, rm, rpc, pconfig = project_by_name(pname)
+    if 'housekeeping' not in pconfig:
+        return
+
+    project_id = project['id']
+
+    logger.info('Running housekeeping for %s', pname)
+    hconfig = pconfig['housekeeping']
     cutoffdays = 90
+    report = ''
 
-    for chunk in settings['housekeeping'].split(','):
+    if 'autosupersede' in hconfig:
+        logger.info('Getting series from %s/%s', rm.server, pname)
         try:
-            key, val = chunk.split('=')
+            cutoffdays = int(hconfig['autosupersede'])
         except ValueError:
-            logger.debug('Invalid housekeeping setting: %s', chunk)
-            continue
-        hconfig[key] = val
+            pass
 
-    for project in settings['projects'].split(','):
-        report = ''
-        project = project.strip()
-        if 'autosupersede' in hconfig:
-            logger.info('Getting series from %s/%s', rm.server, project)
-            try:
-                cutoffdays = int(hconfig['autosupersede'])
-            except ValueError:
-                pass
+        cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
+        logger.debug('cutoffdate=%s', cutoffdate)
+        series = dict()
+        page = 0
+        pagedata = list()
+        while True:
+            if not pagedata:
+                page += 1
+                logger.debug('  grabbing page %d', page)
+                params = [
+                    ('project', project_id),
+                    ('order', '-date'),
+                    ('page', page),
+                    ('per_page', REST_PER_PAGE)
+                ]
+                pagedata = rm.get_series_list(params)
 
-            cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
-            logger.debug('cutoffdate=%s', cutoffdate)
-            series = dict()
-            page = 0
-            pagedata = list()
-            while True:
-                if not pagedata:
+            if not pagedata:
+                # Got them all?
+                logger.debug('Finished processing all series')
+                break
+
+            entry = pagedata.pop()
+            # Did we go too far back?
+            s_date = entry.get('date')
+            series_date = datetime.datetime.strptime(s_date, "%Y-%m-%dT%H:%M:%S")
+            if series_date < cutoffdate:
+                logger.debug('Went too far back, stopping at %s', series_date)
+                break
+
+            s_id = entry.get('id')
+            s_name = entry.get('name')
+            if s_name is None:
+                # Ignoring this one, because we must have a name
+                continue
+
+            # Remove any [foo] from the front, for best matching.
+            # Usually, patchwork strips these, but not always.
+            s_name = re.sub(r'^\[.*?]\s*', '', s_name)
+
+            ver = entry.get('version')
+            subm_id = entry.get('submitter').get('id')
+            patches = list()
+            for patch in entry.get('patches'):
+                patches.append(patch.get('id'))
+
+            if not patches:
+                # Not sure how we can have a series without patches, but ok
+                continue
+
+            received_all = entry.get('received_all')
+            if (subm_id, s_name) not in series:
+                series[(subm_id, s_name)] = dict()
+
+            series[(subm_id, s_name)][series_date] = {
+                'id': id,
+                'patches': patches,
+                'complete': received_all,
+                'date': s_date,
+                'rev': ver,
+            }
+            logger.debug('Processed id=%s (%s)', s_id, s_name)
+
+        for key, items in series.items():
+            if len(items) < 2:
+                # Not a redundant series
+                continue
+
+            subm_id, subject = key
+            versions = list(items.keys())
+            versions.sort()
+            latest_version = versions.pop()
+            logger.debug('%s: latest_version: %s', subject, items[latest_version]['date'])
+            if not items[latest_version]['complete']:
+                logger.debug('Skipping this series, because it is not complete')
+                continue
+
+            sreport = list()
+            logger.info('Checking: [v%s] %s (%s)', items[latest_version]['rev'], subject,
+                        items[latest_version]['date'])
+            for v in versions:
+                rev = items[v]['rev']
+                s_date = items[v]['date']
+                patch_id = items[v]['patches'][0]
+                patch = rm.get_patch(patch_id)
+                state = patch.get('state')
+                if state != 'superseded':
+                    logger.info('  Marking series as superseded: [v%s] %s (%s)', rev, subject, s_date)
+                    sreport.append('  Superseding: [v%s] %s (%s):' % (rev, subject, s_date))
+                    # Yes, we need to supersede these patches
+                    for patch_id in items[v]['patches']:
+                        logger.info('    Superseding patch: %d', patch_id)
+                        patch = rm.get_patch(patch_id)
+                        patch_title = patch.get('name')
+                        current_state = patch.get('state')
+                        if current_state == 'superseded':
+                            logger.info('    Patch already set to superseded, skipping')
+                            continue
+                        sreport.append('    %s' % patch_title)
+                        if not DRYRUN:
+                            rm.update_patch(patch_id, state='superseded')
+                        else:
+                            logger.info('    Dryrun: Not actually setting state')
+
+            if sreport:
+                report += 'Latest series: [v%s] %s (%s)\n' % (items[latest_version]['rev'], subject,
+                                                              items[latest_version]['date'])
+                report += '\n'.join(sreport)
+                report += '\n\n'
+
+    if 'autoarchive' in hconfig:
+        logger.info('Auto-archiving old patches in %s/%s', rm.server, pname)
+        try:
+            cutoffdays = int(hconfig['autoarchive'])
+        except ValueError:
+            pass
+
+        cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
+        logger.debug('cutoffdate=%s', cutoffdate)
+
+        page = 0
+        seen = set()
+        pagedata = list()
+        while True:
+            if not pagedata:
+                params = [
+                    ('project', project_id),
+                    ('archived', 'false'),
+                    ('state', 'new'),
+                    ('order', 'date'),
+                    ('per_page', REST_PER_PAGE)
+                ]
+
+                if DRYRUN:
+                    # We don't need pagination if we're not in dryrun, because
+                    # once we archive the patches, they don't show up in this
+                    # query any more.
                     page += 1
-                    logger.debug('  grabbing page %d', page)
-                    params = [
-                        ('project', project),
-                        ('order', '-date'),
-                        ('page', page),
-                        ('per_page', REST_PER_PAGE)
-                    ]
-                    pagedata = rm.get_series_list(params)
+                    params.append(('page', page))
 
-                if not pagedata:
-                    # Got them all?
-                    logger.debug('Finished processing all series')
-                    break
+                pagedata = rm.get_patch_list(params)
 
-                entry = pagedata.pop()
-                # Did we go too far back?
-                s_date = entry.get('date')
-                series_date = datetime.datetime.strptime(s_date, "%Y-%m-%dT%H:%M:%S")
-                if series_date < cutoffdate:
-                    logger.debug('Went too far back, stopping at %s', series_date)
-                    break
+            if not pagedata:
+                logger.debug('Finished processing all patches')
+                break
 
-                s_id = entry.get('id')
-                s_name = entry.get('name')
-                if s_name is None:
-                    # Ignoring this one, because we must have a name
-                    continue
+            entry = pagedata.pop()
+            # Did we go too far forward?
+            patch_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
+            if patch_date >= cutoffdate:
+                logger.debug('Reached the cutoff date, stopping at %s', patch_date)
+                break
 
-                # Remove any [foo] from the front, for best matching.
-                # Usually, patchwork strips these, but not always.
-                s_name = re.sub(r'^\[.*?\]\s*', '', s_name)
+            patch_id = entry.get('id')
+            if patch_id in seen:
+                # If the archived setting isn't actually sticking on the server for
+                # some reason, then we are in for an infinite loop. Recognize this
+                # and quit when that happens.
+                logger.info('Setting to archived is not working, exiting loop.')
+                break
 
-                ver = entry.get('version')
-                subm_id = entry.get('submitter').get('id')
-                patches = list()
-                for patch in entry.get('patches'):
-                    patches.append(patch.get('id'))
-
-                if not patches:
-                    # Not sure how we can have a series without patches, but ok
-                    continue
-
-                received_all = entry.get('received_all')
-                if (subm_id, s_name) not in series:
-                    series[(subm_id, s_name)] = dict()
-
-                series[(subm_id, s_name)][series_date] = {
-                    'id': id,
-                    'patches': patches,
-                    'complete': received_all,
-                    'date': s_date,
-                    'rev': ver,
-                }
-                logger.debug('Processed id=%s (%s)', s_id, s_name)
-
-            for key, items in series.items():
-                if len(items) < 2:
-                    # Not a redundant series
-                    continue
-
-                subm_id, name = key
-                versions = list(items.keys())
-                versions.sort()
-                latest_version = versions.pop()
-                logger.debug('%s: latest_version: %s', name, items[latest_version]['date'])
-                if not items[latest_version]['complete']:
-                    logger.debug('Skipping this series, because it is not complete')
-                    continue
-
-                sreport = list()
-                logger.info('Checking: [v%s] %s (%s)', items[latest_version]['rev'], name,
-                            items[latest_version]['date'])
-                for v in versions:
-                    rev = items[v]['rev']
-                    s_date = items[v]['date']
-                    patch_id = items[v]['patches'][0]
-                    patch = rm.get_patch(patch_id)
-                    state = patch.get('state')
-                    if state != 'superseded':
-                        logger.info('  Marking series as superseded: [v%s] %s (%s)', rev, name, s_date)
-                        sreport.append('  Superseding: [v%s] %s (%s):' % (rev, name, s_date))
-                        # Yes, we need to supersede these patches
-                        for patch_id in items[v]['patches']:
-                            logger.info('    Superseding patch: %d', patch_id)
-                            patch = rm.get_patch(patch_id)
-                            patch_title = patch.get('name')
-                            current_state = patch.get('state')
-                            if current_state == 'superseded':
-                                logger.info('    Patch already set to superseded, skipping')
-                                continue
-                            sreport.append('    %s' % patch_title)
-                            if not dryrun:
-                                rm.update_patch(patch_id, state='superseded')
-                            else:
-                                logger.info('    Dryrun: Not actually setting state')
-
-                if sreport:
-                    report += 'Latest series: [v%s] %s (%s)\n' % (items[latest_version]['rev'], name,
-                                                                  items[latest_version]['date'])
-                    report += '\n'.join(sreport)
-                    report += '\n\n'
-
-        if 'autoarchive' in hconfig:
-            logger.info('Auto-archiving old patches in %s/%s', rm.server, project)
-            try:
-                cutoffdays = int(hconfig['autoarchive'])
-            except ValueError:
-                pass
-
-            cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
-            logger.debug('cutoffdate=%s', cutoffdate)
-
-            page = 0
-            seen = set()
-            pagedata = list()
-            while True:
-                if not pagedata:
-                    params = [
-                        ('project', project),
-                        ('archived', 'false'),
-                        ('state', 'new'),
-                        ('order', 'date'),
-                        ('per_page', REST_PER_PAGE)
-                    ]
-
-                    if dryrun:
-                        # We don't need pagination if we're not in dryrun, because
-                        # once we archive the patches, they don't show up in this
-                        # query any more.
-                        page += 1
-                        params.append(('page', page))
-
-                    pagedata = rm.get_patch_list(params)
-
-                if not pagedata:
-                    logger.debug('Finished processing all patches')
-                    break
-
-                entry = pagedata.pop()
-                # Did we go too far forward?
-                patch_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
-                if patch_date >= cutoffdate:
-                    logger.debug('Reached the cutoff date, stopping at %s', patch_date)
-                    break
-
-                patch_id = entry.get('id')
-                if patch_id in seen:
-                    # If the archived setting isn't actually sticking on the server for
-                    # some reason, then we are in for an infinite loop. Recognize this
-                    # and quit when that happens.
-                    logger.info('Setting to archived is not working, exiting loop.')
-                    break
-
-                seen.update([patch_id])
-                patch_title = entry.get('name')
-                logger.info('Archiving: %s', patch_title)
-                if not dryrun:
-                    rm.update_patch(patch_id, archived=True)
-                else:
-                    logger.info('  Dryrun: Not actually archiving')
+            seen.update([patch_id])
+            patch_title = entry.get('name')
+            logger.info('Archiving: %s', patch_title)
+            if not DRYRUN:
+                rm.update_patch(patch_id, archived=True)
+            else:
+                logger.info('  Dryrun: Not actually archiving')
 
         if not report:
-            continue
+            return
 
-        if 'summaryto' not in settings:
+        if 'summaryto' not in pconfig:
             logger.info('Report follows')
             logger.info('------------------------------')
             logger.info(report)
             logger.info('------------------------------')
             logger.debug('summaryto not set, not sending report')
-            continue
+            return
 
-        report += '\n-- \nDeet-doot-dot, I am a bot.\nhttps://korg.wiki.kernel.org/userdoc/pwbot\n'
+        report += '\n-- \n' + CONFIG['templates']['signature']
 
         msg = MIMEText(report, _charset='utf-8')
         msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-        msg['Subject'] = 'Patchwork housekeeping for: %s' % project
-        msg['From'] = settings['from']
-        msg['Message-Id'] = make_msgid('git-patchwork-housekeeping')
+        msg['Subject'] = 'Patchwork housekeeping for: %s' % pname
+        msg['From'] = pconfig['from']
+        msg['Message-Id'] = make_msgid('git-patchwork-housekeeping', domain=DOMAIN)
         msg['Date'] = formatdate(localtime=True)
 
-        targets = settings['summaryto'].split(',')
+        targets = listify(pconfig['summaryto'])
         msg['To'] = ', '.join(targets)
-        if 'alwayscc' in settings:
-            msg['Cc'] = settings['alwayscc']
-            targets.append(settings['alwayscc'])
-        if 'alwaysbcc' in settings:
-            targets.append(settings['alwaysbcc'])
+        if 'alwayscc' in pconfig:
+            msg['Cc'] = ', '.join(listify(pconfig['alwayscc']))
+            targets += listify(pconfig['alwayscc'])
+        if 'alwaysbcc' in pconfig:
+            targets += listify(pconfig['alwaysbcc'])
 
-        if not nomail:
+        if not NOMAIL:
             logger.debug('Message follows')
-            logger.debug(msg.as_string().decode('utf-8'))
+            logger.debug(msg.as_string())
             logger.info('Sending housekeeping summary to: %s', msg['To'])
 
-            smtp = smtplib.SMTP(settings['mailhost'])
-            smtp.sendmail(msg['From'], targets, msg.as_string())
+            smtp = smtplib.SMTP(MAILHOST)
+            smtp.sendmail(msg['From'], targets, msg.as_bytes())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
             logger.info('------------------------------')
-            logger.info(msg.as_string().decode('utf-8'))
+            logger.info(msg.as_string())
             logger.info('------------------------------')
 
 
-def pwrun(repo, cmdconfig, nomail, dryrun):
-    if dryrun:
-        nomail = True
-
+def pwrun(repo, rsettings):
     git_heads = git_get_repo_heads(repo)
     if not git_heads:
         logger.info('Could not get the latest ref in %s', repo)
@@ -1011,208 +1038,229 @@ def pwrun(repo, cmdconfig, nomail, dryrun):
         return
 
     db_heads = db_get_repo_heads(c)
+    committers = rsettings.get('committers', list())
 
-    newrevs = git_get_new_revs(repo, db_heads, git_heads, merges=True)
-    config = get_config_from_repo(repo, r'patchwork\..*', cmdconfig)
+    newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=committers, merges=True)
+    if not newrevs:
+        logger.debug('No new revs in %s', repo)
+        return
 
-    global _project_cache
+    rcdbpath = os.path.join(CACHEDIR, 'revcache.db')
+    rcdb_exists = os.path.isfile(rcdbpath)
+    rcdbconn = sqlite3.connect(rcdbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    rc = rcdbconn.cursor()
 
-    for server, settings in config.items():
-        _project_cache = None
-        logger.debug('Working on server %s', server)
-        logger.debug('Settings follow')
-        logger.debug(settings)
-        rm = Restmaker(server, settings)
-        if not newrevs and 'housekeeping' in settings:
-            housekeeping(rm, settings, nomail, dryrun)
-            return
+    if not rcdb_exists:
+        db_init_cache_sqlite_db(rc)
+    else:
+        rc.execute('''DELETE FROM revs WHERE created > datetime('now', ?)''', ('-30 days',))
 
-        url = '%s/xmlrpc/' % server
-
-        transport = Transport(url)
-        transport.set_credentials(settings['user'], settings['pass'])
-
-        try:
-            rpc = xmlrpclib.Server(url, transport=transport)
-        except (IOError, OSError):
-            logger.info('Unable to connect to %s', url)
-            continue
-
-        # Generate the state map
-        statemap = dict()
-        for pair in settings['statemap'].split(','):
-            try:
-                refname, params = pair.split(':')
-                statemap[refname] = params.split('/')
-            except ValueError:
-                logger.info('Invalid statemap entry: %s', pair)
-
-        logger.debug('statemap: %s', statemap)
-
+    count = 0
+    for pname, psettings in rsettings['projects'].items():
         rpwhashes = dict()
         rgithashes = dict()
+        wantstates = list()
         have_prs = False
         for refname, revlines in newrevs.items():
-            if refname not in statemap:
-                # We don't care about this ref
+            found = False
+            for wanthead, hsettings in psettings.items():
+                if refname.endswith(wanthead):
+                    found = True
+                    if 'fromstate' in hsettings:
+                        wantstates += hsettings['fromstate']
+                    break
+            if not found:
+                logger.debug('Skipping ref %s (not wanted)')
                 continue
 
-            rpwhashes[refname] = list()
+            rpwhashes[refname] = set()
             logger.debug('Looking at %s', refname)
             for rev, logline in revlines:
                 if logline.find('Merge') == 0 and logline.find('://') > 0:
                     have_prs = True
-                    rpwhashes[refname].append((rev, logline, None))
+                    rpwhashes[refname].add((rev, logline, None))
                     continue
-                diff = git_get_rev_diff(repo, rev)
-                pwhash = get_patchwork_hash(diff)
-                git_patch_id = git_get_patch_id(diff)
+
+                hits = rc.execute('SELECT patchwork_id, git_id FROM revs WHERE rev=?', (rev,)).fetchall()
+                if not hits:
+                    diff = git_get_rev_diff(repo, rev)
+                    pwhash = get_patchwork_hash(diff)
+                    git_patch_id = git_get_patch_id(diff)
+                    rc.execute('''INSERT INTO revs
+                                  VALUES (?, ?, ?, datetime('now'))''', (rev, pwhash, git_patch_id))
+                else:
+                    pwhash = hits[0][0]
+                    git_patch_id = hits[0][1]
+
                 rgithashes[git_patch_id] = rev
                 if pwhash:
-                    rpwhashes[refname].append((rev, logline, pwhash))
+                    rpwhashes[refname].add((rev, logline, pwhash))
 
-        if 'fromstate' in settings:
-            fromstate = settings['fromstate'].split(',')
+        rcdbconn.commit()
+        if not wantstates:
+            wantstates = ['new', 'under-review']
+
+        logger.debug('wantstates=%s', wantstates)
+
+        logger.info(' project : %s', pname)
+        project, rm, rpc, pconfig = project_by_name(pname)
+        project_id = project['id']
+
+        if have_prs:
+            logger.info('PR merge commit found, loading up pull requests')
+            # Find all from states we're interested in
+            prs = get_patchwork_pull_requests_by_project(rm, project_id, wantstates)
         else:
-            fromstate = ['new', 'under-review']
+            prs = set()
 
-        logger.debug('fromstate=%s', fromstate)
+        for refname, hashpairs in rpwhashes.items():
+            logger.info('Analyzing %d revisions in %s', len(hashpairs), refname)
+            # Get our settings
+            hsettings = None
+            for wanthead, hsettings in psettings.items():
+                if refname.endswith(wanthead):
+                    break
+            # Patchwork lowercases state name and replaces spaces with dashes
+            to_state = hsettings['tostate'].lower().replace(' ', '-')
+            fromstate = list()
+            for fs in hsettings.get('fromstate', list()):
+                fromstate.append(fs.lower().replace(' ', '-'))
+            if not fromstate:
+                fromstate = ['new', 'in-review']
 
-        for project in settings['projects'].split(','):
-            count = 0
-            project = project.strip()
-            logger.info('Processing "%s/%s"', server, project)
-            project_id = project_id_by_name(rpc, project)
-
-            if have_prs:
-                logger.info('PR merge commit found, loading up pull requests')
-                prs = get_patchwork_pull_requests_by_project(rm, project, fromstate)
-            else:
-                prs = list()
-
-            for refname, hashpairs in rpwhashes.items():
-                logger.info('Analyzing %d revisions', len(hashpairs))
-                # Patchwork lowercases state name and replaces spaces with dashes
-                to_state = statemap[refname][0].lower().replace(' ', '-')
-
-                # We create patch_id->rev mapping first
-                revs = dict()
-                for rev, logline, pwhash in hashpairs:
-                    if have_prs and pwhash is None:
-                        matches = re.search(r'Merge\s(\S+)\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
-                        if not matches:
-                            continue
-                        m_obj = matches.group(1)
-                        m_refname = matches.group(2)
-                        m_host = matches.group(3)
-
-                        logger.debug('Looking for %s %s %s', m_obj, m_refname, m_host)
-
-                        for pull_host, pull_refname, patch_id in prs:
-                            if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
-                                logger.debug('Found matching pull request in %s (id: %s)', logline, patch_id)
-                                revs[patch_id] = rev
-                                break
+            # We create patch_id->rev mapping first
+            revs = dict()
+            for rev, logline, pwhash in hashpairs:
+                if have_prs and pwhash is None:
+                    matches = re.search(r'Merge\s(\S+)\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
+                    if not matches:
                         continue
+                    m_obj = matches.group(1)
+                    m_refname = matches.group(2)
+                    m_host = matches.group(3)
 
-                    # Do we have a matching hash on the server?
-                    logger.info('Matching: %s', logline)
-                    # Theoretically, should only return one, but we play it safe and
-                    # handle for multiple matches.
-                    patch_ids = get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash)
-                    if not patch_ids:
-                        continue
+                    logger.debug('Looking for %s %s %s', m_obj, m_refname, m_host)
 
-                    for patch_id in patch_ids:
-                        pdata = rm.get_patch(patch_id)
-                        if pdata.get('state') not in fromstate:
-                            logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
-                            continue
-                        revs[patch_id] = rev
+                    for pull_host, pull_refname, patch_id in prs:
+                        if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
+                            logger.debug('Found matching pull request in %s (id: %s)', logline, patch_id)
+                            revs[patch_id] = rev
+                            break
+                    continue
 
-                # Now we iterate through it
-                updated_series = list()
-                done_patches = set()
-                for patch_id in revs.keys():
-                    if patch_id in done_patches:
-                        # we've already updated this series
-                        logger.debug('Already applied %d as part of previous series', patch_id)
-                        continue
+                # Do we have a matching hash on the server?
+                logger.info('Matching: %s', logline)
+                # Theoretically, should only return one, but we play it safe and
+                # handle for multiple matches.
+                patch_ids = get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash)
+                if not patch_ids:
+                    continue
+
+                for patch_id in patch_ids:
                     pdata = rm.get_patch(patch_id)
-                    serieslist = pdata.get('series', None)
-                    if not serieslist:
-                        # This is probably from the time before patchwork-2 migration.
-                        # We'll just ignore those.
-                        logger.debug('A patch without an associated series? Woah.')
+                    if pdata.get('state') not in fromstate:
+                        logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
                         continue
+                    revs[patch_id] = rev
 
-                    for series in serieslist:
-                        series_id = series.get('id')
-                        sdata = rm.get_series(series_id)
-                        if not sdata.get('received_all'):
-                            logger.debug('Series %d is incomplete, skipping', series_id)
-                            continue
-                        update_queue = list()
-                        for spatch in sdata.get('patches'):
-                            spatch_id = spatch.get('id')
-                            spdata = rm.get_patch(spatch_id)
+            # Now we iterate through it
+            updated_series = list()
+            done_patches = set()
+            for patch_id in list(revs.keys()):
+                if patch_id in done_patches:
+                    # we've already updated this series
+                    logger.debug('Already applied %d as part of previous series', patch_id)
+                    continue
+                pdata = rm.get_patch(patch_id)
+                serieslist = pdata.get('series', None)
+                if not serieslist:
+                    # This is probably from the time before patchwork-2 migration.
+                    # We'll just ignore those.
+                    logger.debug('A patch without an associated series? Woah.')
+                    continue
 
-                            rev = None
-                            if spatch_id in revs:
-                                rev = revs[spatch_id]
+                for series in serieslist:
+                    series_id = series.get('id')
+                    sdata = rm.get_series(series_id)
+                    if not sdata.get('received_all'):
+                        logger.debug('Series %d is incomplete, skipping', series_id)
+                        continue
+                    update_queue = list()
+                    for spatch in sdata.get('patches'):
+                        spatch_id = spatch.get('id')
+                        spdata = rm.get_patch(spatch_id)
+
+                        rev = None
+                        if spatch_id in revs:
+                            rev = revs[spatch_id]
+                        else:
+                            # try to use the more fuzzy git-patch-id matching
+                            spatch_hash = git_get_patch_id(spdata.get('diff'))
+                            if spatch_hash is not None and spatch_hash in rgithashes:
+                                logger.debug('Matched via git-patch-id')
+                                rev = rgithashes[spatch_hash]
+                                revs[spatch_id] = rev
+
+                        if rev is None:
+                            logger.debug('Could not produce precise match for %s', spatch_id)
+                            logger.debug('Will not update series: %s', sdata.get('name'))
+                            update_queue = list()
+                            break
+
+                        update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
+
+                    if update_queue:
+                        logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
+                        updated_series.append(sdata)
+                        for sname, spatch_id, to_state, rev in update_queue:
+                            count += 1
+                            done_patches.update([spatch_id])
+                            if not DRYRUN:
+                                logger.info('  Updating: %s', sname)
+                                rm.update_patch(spatch_id, state=to_state, commit_ref=rev)
                             else:
-                                # try to use the more fuzzy git-patch-id matching
-                                spatch_hash = git_get_patch_id(spdata.get('diff'))
-                                if spatch_hash is not None and spatch_hash in rgithashes:
-                                    logger.debug('Matched via git-patch-id')
-                                    rev = rgithashes[spatch_hash]
-                                    revs[spatch_id] = rev
+                                logger.info('  Updating (DRYRUN): %s', sname)
 
-                            if rev is None:
-                                logger.debug('Could not produce precise match for %s', spatch_id)
-                                logger.debug('Will not update series: %s', sdata.get('name'))
-                                update_queue = list()
-                                break
+            if len(updated_series) and hsettings.get('send_summary', False):
+                send_summary(updated_series, to_state, refname, pname, rsettings, hsettings)
+            if len(updated_series) and hsettings.get('notify_submitter', False):
+                notify_submitters(updated_series, refname, revs, pname, rsettings, hsettings)
 
-                            update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
+        if count:
+            logger.info('Updated %d patches on %s', count, rm.server)
+        else:
+            logger.info('No patches updated on %s', rm.server)
 
-                        if update_queue:
-                            logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
-                            updated_series.append(sdata)
-                            for name, spatch_id, to_state, rev in update_queue:
-                                count += 1
-                                done_patches.update([spatch_id])
-                                if not dryrun:
-                                    logger.info('  Updating: %s', name)
-                                    rm.update_patch(spatch_id, state=to_state, commit_ref=rev)
-                                else:
-                                    logger.info('  Updating (DRYRUN): %s', name)
-
-                if len(updated_series) and 'send_summary' in statemap[refname]:
-                    send_summary(updated_series, to_state, refname, settings, nomail)
-                if len(updated_series) and 'notify_submitter' in statemap[refname]:
-                    notify_submitters(rm, updated_series, refname, settings, revs, nomail)
-
-            if count:
-                logger.info('Updated %d patches on %s', count, server)
-            else:
-                logger.info('No patches updated on %s', server)
-
-    if not dryrun:
+    if not DRYRUN:
         db_save_repo_heads(c, git_heads)
         dbconn.commit()
 
 
+def check_repos():
+    # First, we run all repositories
+    for repo in CONFIG['repos']:
+        fullpath = os.path.join(cmdargs.reposdir, repo.lstrip('/'))
+        if not os.path.isdir(fullpath):
+            logger.info('Repository not found: %s', repo)
+            continue
+        settings = CONFIG['repos'][repo]
+        logger.info('Processing: %s', repo)
+        pwrun(fullpath, settings)
+
+
 if __name__ == '__main__':
+    # noinspection PyTypeChecker
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('-r', '--repository', dest='repo', required=True,
-                        help='Check the repository and auto-accept any applied patches.')
-    parser.add_argument('-c', '--config', dest='config', nargs='+', default=list(),
-                        help='Use these config values instead of those in the repo config')
+    parser.add_argument('-c', '--cfgfile', required=True,
+                        help='Config file with repository and project data.')
+    parser.add_argument('-r', '--reposdir', required=True,
+                        help='Directory with repositories to process')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
+    parser.add_argument('-m', '--mailhost', default='localhost',
+                        help='Mailhost to use when sending mail')
     parser.add_argument('-d', '--dry-run', dest='dryrun', action='store_true', default=False,
                         help='Do not mail or store anything, just do a dry run.')
     parser.add_argument('-n', '--no-mail', dest='nomail', action='store_true', default=False,
@@ -1221,6 +1269,12 @@ if __name__ == '__main__':
                         help='Only output errors to the stdout')
     parser.add_argument('-v', '--verbose', action='store_true', default=False,
                         help='Be more verbose in logging output')
+    parser.add_argument('-k', '--housekeeping', action='store_true', default=False,
+                        help='Perform a housekeeping run')
+    parser.add_argument('--cachedir', default=None,
+                        help='Cache directory to use instead of ~/.cache/git-patchwork-bot')
+    parser.add_argument('--domain', default=None,
+                        help='Domain to use when creating message-ids')
 
     cmdargs = parser.parse_args()
 
@@ -1244,9 +1298,31 @@ if __name__ == '__main__':
 
     if cmdargs.quiet:
         ch.setLevel(logging.CRITICAL)
+    elif cmdargs.verbose:
+        ch.setLevel(logging.DEBUG)
     else:
         ch.setLevel(logging.INFO)
 
     logger.addHandler(ch)
+    if cmdargs.nomail or cmdargs.dryrun:
+        logger.info('NOMAIL: ON')
+        NOMAIL = True
+    if cmdargs.dryrun:
+        logger.info('DRYRUN: ON')
+        DRYRUN = True
+    if cmdargs.cachedir:
+        CACHEDIR = cmdargs.cachedir
+    if cmdargs.domain:
+        DOMAIN = cmdargs.domain
+    MAILHOST = cmdargs.mailhost
 
-    pwrun(cmdargs.repo, cmdargs.config, cmdargs.nomail, cmdargs.dryrun)
+    with open(cmdargs.cfgfile, 'r') as fh:
+        cfgyaml = fh.read()
+    CONFIG = ruamel.yaml.safe_load(cfgyaml)
+
+    if cmdargs.housekeeping:
+        for _pserver, _sconfig in CONFIG['patchworks'].items():
+            for _pname in _sconfig['projects']:
+                housekeeping(_pname)
+    else:
+        check_repos()
