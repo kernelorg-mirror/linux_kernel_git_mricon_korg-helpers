@@ -6,12 +6,7 @@
 # additionally send mail notifications to the maintainers and to the
 # patch submitters.
 #
-# While we continue to support the 1.1 API, we must rely on
-# username/password authentication. To make that work, set up the
-# $HOME/.netrc file. Once we drop support for patchwork < 2.2, we'll
-# switch over to using the API keys entirely.
-#
-# It runs from a cronjob, but can be also run from post-update hooks with 
+# It runs from a cronjob, but can be also run from post-update hooks with
 # extra wrappers. For more details, consult:
 #
 # https://korg.wiki.kernel.org/userdoc/pwbot
@@ -94,11 +89,14 @@ class Transport(xmlrpclib.SafeTransport):
         self.host = host
         if self.proxy:
             host = self.proxy.split('://', 1)[-1].rstrip('/')
-        nc = netrc.netrc()
-        auths = nc.authenticators(host)
-        if auths:
-            login, account, password = auths
-            host = '{}:{}@{}'.format(login, password, host)
+        try:
+            nc = netrc.netrc()
+            auths = nc.authenticators(host)
+            if auths:
+                login, account, password = auths
+                host = f'{login}:{password}@{host}'
+        except FileNotFoundError:
+            pass
         if self.https:
             return xmlrpclib.SafeTransport.make_connection(self, host)
         else:
@@ -126,7 +124,13 @@ class Restmaker:
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
-        self.session.headers.update({'User-Agent': 'git-patchwork-bot/%s' % __VERSION__})
+        headers = {
+            'User-Agent': f'git-patchwork-bot/{__VERSION__}',
+        }
+        apitoken = CONFIG['patchworks'][server].get('apitoken', None)
+        if apitoken:
+            headers['Authorization'] = f'Token {apitoken}'
+        self.session.headers.update(headers)
 
     def get_cover(self, cover_id):
         try:
@@ -589,7 +593,7 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
     msg.replace_header('Content-Transfer-Encoding', '8bit')
 
     msg['Subject'] = Header('Patchwork summary for: %s' % pname)
-    msg['From'] = Header(pconfig['from'])
+    msg['From'] = Header(tweaks['from'])
     msg['Message-Id'] = make_msgid('git-patchwork-summary', domain=DOMAIN)
     msg['Date'] = formatdate(localtime=True)
 
@@ -607,7 +611,7 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
         logger.info('Sending summary to: %s', msg['To'])
 
         smtp = smtplib.SMTP(MAILHOST)
-        smtp.sendmail(msg['From'], targets, msg.as_bytes())
+        smtp.sendmail(tweaks['from'], targets, msg.as_bytes())
         smtp.close()
     else:
         logger.info('Would have sent the following:')
@@ -615,7 +619,7 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
         logger.info(msg.as_string())
         logger.info('------------------------------')
 
-    return msg['Message-Id']
+    return str(msg['Message-Id'])
 
 
 def get_tweaks(pconfig, hconfig):
@@ -770,7 +774,7 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
             logger.info('Notifying %s', submitter.get('email'))
 
             smtp = smtplib.SMTP(MAILHOST)
-            smtp.sendmail(msg['From'], targets, msg.as_bytes())
+            smtp.sendmail(tweaks['from'], targets, msg.as_bytes())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
@@ -1002,7 +1006,7 @@ def housekeeping(pname):
             logger.info('Sending housekeeping summary to: %s', msg['To'])
 
             smtp = smtplib.SMTP(MAILHOST)
-            smtp.sendmail(msg['From'], targets, msg.as_bytes())
+            smtp.sendmail(pconfig['from'], targets, msg.as_bytes())
             smtp.close()
         else:
             logger.info('Would have sent the following:')
@@ -1097,6 +1101,7 @@ def pwrun(repo, rsettings):
                     rpwhashes[refname].add((rev, logline, pwhash))
 
         rcdbconn.commit()
+        rcdbconn.close()
         if not wantstates:
             wantstates = ['new', 'under-review']
 

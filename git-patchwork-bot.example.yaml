@@ -1,0 +1,159 @@
+---
+patchworks:
+  # Entries are full URLs to the patchwork server toplevel
+  'https://patchwork.kernel.org':
+    # You can use an API token, or you can add username/password
+    # to the $HOME/.netrc file
+    apitoken: 'your-api-token'
+    projects:
+      # URL subpath name of the project
+      'linux-amlogic':
+        # Email will go out from this address
+        from: 'patchwork-bot+linux-amlogic@kernel.org'
+        # Any summaries will be sent to these addresses
+        summaryto:
+          - 'developer@example.com'
+          - 'developer@example.org'
+        # If this is set, all emails from the bot will be
+        # cc'd to the list
+        cclist: true
+        # When run with -k
+        housekeeping:
+          # Automatically supersede new series coming in from the same
+          # author and with the exact same subject (sans prefixes). This
+          # setting tells us how many days back we should look to find a
+          # matching series.
+          autosupersede: 30
+          # Archive any patches older than this number of days.
+          autoarchive: 90
+
+      'git':
+        from: 'patchwork-bot+git@kernel.org'
+        summaryto:
+          - 'developer@example.com'
+          - 'developer@example.org'
+        housekeeping:
+          autosupersede: 90
+          autoarchive: 180
+
+  'https://lore.kernel.org/patchwork':
+    apitoken: 'another-api-token'
+    projects:
+      'lkml':
+        from: 'notify+lkml@kernel.org'
+        summaryto:
+          - 'developer@example.net'
+        housekeeping:
+          autosupersede: 30
+          autoarchive: 180
+
+repos:
+  # Each entry is a subpath to a repo from the --reposdir toplevel
+  'pub/scm/linux/kernel/git/khilman/linux-amlogic.git':
+    # For the notification emails
+    treename: 'khilman/linux-amlogic.git'
+    # For the notification emails, must include %s
+    commitlink: 'https://git.kernel.org/khilman/linux-amlogic/c/%.12s'
+    # Only notify for commits where committer email exactly matches one
+    # of the emails listed below
+    committers:
+      - 'khilman@example.org'
+    # Which projects should be consulted on all new commits
+    projects:
+      # The project name MUST match one of the projects defined in patchworks:
+      # This necessarily means that the project name must be unique across all
+      # defined patchwork servers.
+      'linux-amlogic':
+        # entries are head names in the repository
+        # e.g. this one is for refs/heads/example
+        # They are matched with 'endswith' against the full refname
+        'example':
+          # Default "fromstate" is "new" or "in-review"
+          # This is the state we will set on all matching patches
+          tostate: 'Queued'
+          # Send summary about changes to the people defined in "summaryto"
+          send_summary: true
+        'for-next':
+          # If you add a new fromstate, you have to specify the default ones
+          fromstate:
+            - 'new'
+            - 'in-review'
+            - 'queued'
+          tostate: 'Accepted'
+          send_summary: true
+          # Notify submitters when their patches change state.
+          # The bot will send a single email per series.
+          notify_submitter: true
+          # CC the list on submitter notifications.
+          # Note, that summaries will be sent to the list as well, if 
+          # send_summary is true.
+          cclist: true
+        'fixes':
+          fromstate:
+            - 'new'
+            - 'in-review'
+            - 'queued'
+          tostate: 'Accepted'
+          send_summary: true
+          notify_submitter: true
+          cclist: true
+
+  'pub/scm/linux/kernel/git/torvalds/linux.git':
+    treename: 'torvalds/linux.git'
+    commitlink: 'https://git.kernel.org/torvalds/c/%.12s'
+    projects:
+      'lkml':
+        'master':
+          fromstate:
+            - 'new'
+            - 'in-next'
+          tostate: 'Accepted'
+          notify_submitter: true
+          # We only notify if the below address is in the cc list
+          onlyifcc:
+            - 'notify@kernel.org'
+
+  'pub/scm/linux/kernel/git/next/linux-next.git':
+    treename: 'next/linux-next.git'
+    commitlink: 'https://git.kernel.org/next/linux-next/c/%.12s'
+    projects:
+      'lkml':
+        'master':
+          tostate: 'In Next'
+          notify_submitter: true
+          # Single-value arrays can be defined as strings as well
+          onlyifcc: 'notify@kernel.org'
+
+# The below templates are self-explanatory
+# yamllint disable rule:line-length
+templates:
+  summary: |
+           Hello:
+
+           The following patches were marked "${newstate}", because they were applied to
+           ${treename} (${refname}):
+
+           ${summary}
+
+           Total patches: ${total}
+
+           --
+           ${signature}
+  submitter: |
+             Hello:
+
+             This ${reqtype} was applied to ${treename} (${refname}):
+
+             On ${sentdate} you wrote:
+             ${trimquote}
+
+             Here is the summary with links:
+             ${summary}
+
+             You are awesome, thank you!
+             --
+             ${signature}
+  signature: |
+             Deet-doot-dot, I am a bot.
+             https://korg.docs.kernel.org/patchwork/pwbot.html
+# yamllint enable
