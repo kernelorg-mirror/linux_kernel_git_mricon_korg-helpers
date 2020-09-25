@@ -1244,7 +1244,7 @@ def pwrun(repo, rsettings):
 def check_repos():
     # First, we run all repositories
     for repo in CONFIG['repos']:
-        fullpath = os.path.join(cmdargs.reposdir, repo.lstrip('/'))
+        fullpath = os.path.join(cmdargs.reposdir.rstrip('/'), repo.lstrip('/'))
         if not os.path.isdir(fullpath):
             logger.info('Repository not found: %s', repo)
             continue
@@ -1260,7 +1260,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('-c', '--cfgfile', required=True,
                         help='Config file with repository and project data.')
-    parser.add_argument('-r', '--reposdir', required=True,
+    parser.add_argument('-r', '--reposdir', default=None,
                         help='Directory with repositories to process')
     parser.add_argument('-l', '--logfile', default=None,
                         help='Log file for messages during quiet operation')
@@ -1330,4 +1330,7 @@ if __name__ == '__main__':
             for _pname in _sconfig['projects']:
                 housekeeping(_pname)
     else:
+        if not cmdargs.reposdir:
+            logger.critical('-r is required for this mode')
+            sys.exit(1)
         check_repos()
