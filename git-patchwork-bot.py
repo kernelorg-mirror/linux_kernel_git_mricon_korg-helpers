@@ -751,16 +751,6 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
         msg['References'] = Header(reference)
         msg['In-Reply-To'] = Header(reference)
 
-        ccaddrs = list()
-        if tweaks.get('alwayscc'):
-            ccaddrs += listify(tweaks['alwayscc'])
-        if tweaks.get('cclist'):
-            ccaddrs.append(project.get('list_email'))
-        if tweaks.get('ccall'):
-            for addr in tos + ccs:
-                if addr not in ccaddrs:
-                    ccaddrs.append(addr)
-
         if 'onlyto' in tweaks:
             targets = listify(tweaks['onlyto'])
             msg['To'] = '%s <%s>' % (submitter.get('name'), targets[0])
@@ -768,12 +758,24 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
             targets = [submitter.get('email')]
             msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email')))
 
-        targets += ccaddrs
-        if 'alwaysbcc' in tweaks:
-            targets += listify(tweaks['alwaysbcc'])
+            ccaddrs = list()
+            if tweaks.get('alwayscc'):
+                ccaddrs += listify(tweaks['alwayscc'])
+                targets += ccaddrs
+            if tweaks.get('cclist'):
+                ccaddrs.append(project.get('list_email'))
+                targets.append(project.get('list_email'))
+            if tweaks.get('ccall'):
+                for addr in tos + ccs:
+                    if addr not in targets:
+                        targets.append(addr)
+                        ccaddrs.append(addr)
 
-        if len(ccaddrs):
-            msg['Cc'] = ', '.join(ccaddrs)
+            if 'alwaysbcc' in tweaks:
+                targets += listify(tweaks['alwaysbcc'])
+
+            if len(ccaddrs):
+                msg['Cc'] = ', '.join(ccaddrs)
 
         if not NOMAIL:
             logger.debug('Message follows')
