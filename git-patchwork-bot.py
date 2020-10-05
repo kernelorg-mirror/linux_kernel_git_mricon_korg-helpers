@@ -597,7 +597,7 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
     msg['Message-Id'] = make_msgid('git-patchwork-summary', domain=DOMAIN)
     msg['Date'] = formatdate(localtime=True)
 
-    targets = listify(pconfig['summaryto'])
+    targets = listify(tweaks['summaryto'])
     msg['To'] = Header(', '.join(targets))
     if 'alwayscc' in tweaks:
         msg['Cc'] = Header(', '.join(listify(tweaks['alwayscc'])))
@@ -623,8 +623,8 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
 
 
 def get_tweaks(pconfig, hconfig):
-    fields = ['from', 'onlyto', 'neverto', 'onlyifto', 'neverifto', 'onlyifcc',
-              'neverifcc', 'alwayscc', 'alwaysbcc', 'cclist']
+    fields = ['from', 'summaryto', 'onlyto', 'neverto', 'onlyifcc', 'neverifcc',
+              'alwayscc', 'alwaysbcc', 'cclist', 'ccall']
     bubbled = dict()
     for field in fields:
         if field in hconfig:
@@ -649,12 +649,12 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
         if sdata.get('cover_letter'):
             reference = sdata.get('cover_letter').get('msgid')
             fullcover = rm.get_cover(sdata.get('cover_letter').get('id'))
-            headers = fullcover.get('headers')
+            headers = {k.lower(): v for k, v in fullcover.get('headers').items()}
             content = fullcover.get('content')
         else:
             reference = patches[0].get('msgid')
             fullpatch = rm.get_patch(patches[0].get('id'))
-            headers = fullpatch.get('headers')
+            headers = {k.lower(): v for k, v in fullpatch.get('headers').items()}
             content = fullpatch.get('content')
             if fullpatch.get('pull_url'):
                 is_pull_request = True
@@ -668,25 +668,24 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
 
-        xpb = headers.get('X-Patchwork-Bot')
+        ccs = list()
+        cchdr = headers.get('cc')
+        if cchdr:
+            ccs = [chunk[1] for chunk in getaddresses(listify(cchdr))]
+        tos = list()
+        tohdr = headers.get('to')
+        if tohdr:
+            tos = [chunk[1] for chunk in getaddresses(listify(tohdr))]
+
+        xpb = headers.get('x-patchwork-bot')
         logger.debug('X-Patchwork-Bot=%s', xpb)
         # If X-Patchwork-Bot header is set to "notify" we always notify
         if xpb != 'notify':
             # Use cc-based notification logic
-            ccs = list()
-            cchdr = headers.get('Cc')
-            if not cchdr:
-                cchdr = headers.get('cc')
-            if cchdr:
-                # Sometimes there are multiple cc headers returned
-                if not isinstance(cchdr, list):
-                    cchdr = [cchdr]
-                ccs = [chunk[1] for chunk in getaddresses(cchdr)]
-
             if 'onlyifcc' in tweaks:
                 match = None
                 for chunk in listify(tweaks['onlyifcc']):
-                    if chunk.strip() in ccs:
+                    if chunk in ccs:
                         match = chunk
                         break
                 if match is None:
@@ -696,7 +695,7 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
             if ccs and 'neverifcc' in tweaks:
                 match = None
                 for chunk in listify(tweaks['neverifcc']):
-                    if chunk.strip() in ccs:
+                    if chunk in ccs:
                         match = chunk
                         break
                 if match is not None:
@@ -734,7 +733,7 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
             'reqtype': reqtype,
             'treename': rs['treename'],
             'refname': refname,
-            'sentdate': str(headers.get('Date')),
+            'sentdate': str(headers.get('date')),
             'trimquote': '\n'.join(trimquote),
             'summary': '\n'.join(summary),
             'signature': CONFIG['templates']['signature'],
@@ -745,28 +744,36 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
         msg = MIMEText(body, _charset='utf-8')
         msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-        msg['Subject'] = Header('Re: %s' % headers.get('Subject'))
+        msg['Subject'] = Header('Re: %s' % headers.get('subject'))
         msg['From'] = Header(tweaks['from'])
         msg['Message-Id'] = make_msgid('git-patchwork-notify', domain=DOMAIN)
         msg['Date'] = formatdate(localtime=True)
         msg['References'] = Header(reference)
         msg['In-Reply-To'] = Header(reference)
 
+        ccaddrs = list()
+        if tweaks.get('alwayscc'):
+            ccaddrs += listify(tweaks['alwayscc'])
+        if tweaks.get('cclist'):
+            ccaddrs.append(project.get('list_email'))
+        if tweaks.get('ccall'):
+            for addr in tos + ccs:
+                if addr not in ccaddrs:
+                    ccaddrs.append(addr)
+
         if 'onlyto' in tweaks:
-            targets = [tweaks['onlyto']]
-            msg['To'] = '%s <%s>' % (submitter.get('name'), tweaks['onlyto'])
+            targets = listify(tweaks['onlyto'])
+            msg['To'] = '%s <%s>' % (submitter.get('name'), targets[0])
         else:
             targets = [submitter.get('email')]
             msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email')))
 
-            if 'alwayscc' in tweaks:
-                msg['Cc'] = ', '.join(listify(tweaks['alwayscc']))
-                targets += listify(tweaks['alwayscc'])
-            if 'alwaysbcc' in tweaks:
-                targets += listify(tweaks['alwaysbcc'])
-            if 'cclist' in tweaks and tweaks['cclist']:
-                targets.append(project.get('list_email'))
-                msg['Cc'] = project.get('list_email')
+        targets += ccaddrs
+        if 'alwaysbcc' in tweaks:
+            targets += listify(tweaks['alwaysbcc'])
+
+        if len(ccaddrs):
+            msg['Cc'] + ', '.join(ccaddrs)
 
         if not NOMAIL:
             logger.debug('Message follows')
@@ -887,6 +894,9 @@ def housekeeping(pname):
                 s_date = items[v]['date']
                 patch_id = items[v]['patches'][0]
                 patch = rm.get_patch(patch_id)
+                if not patch:
+                    # Huh, what happened?
+                    continue
                 state = patch.get('state')
                 if state != 'superseded':
                     logger.info('  Marking series as superseded: [v%s] %s (%s)', rev, subject, s_date)
@@ -1090,8 +1100,9 @@ def pwrun(repo, rsettings):
                     diff = git_get_rev_diff(repo, rev)
                     pwhash = get_patchwork_hash(diff)
                     git_patch_id = git_get_patch_id(diff)
-                    rc.execute('''INSERT INTO revs
-                                  VALUES (?, ?, ?, datetime('now'))''', (rev, pwhash, git_patch_id))
+                    if pwhash and git_patch_id:
+                        rc.execute('''INSERT INTO revs
+                                      VALUES (?, ?, ?, datetime('now'))''', (rev, pwhash, git_patch_id))
                 else:
                     pwhash = hits[0][0]
                     git_patch_id = hits[0][1]
@@ -1100,8 +1111,6 @@ def pwrun(repo, rsettings):
                 if pwhash:
                     rpwhashes[refname].add((rev, logline, pwhash))
 
-        rcdbconn.commit()
-        rcdbconn.close()
         if not wantstates:
             wantstates = ['new', 'under-review']
 
@@ -1236,6 +1245,8 @@ def pwrun(repo, rsettings):
         else:
             logger.info('No patches updated on %s', rm.server)
 
+    rcdbconn.commit()
+    rcdbconn.close()
     if not DRYRUN:
         db_save_repo_heads(c, git_heads)
         dbconn.commit()
