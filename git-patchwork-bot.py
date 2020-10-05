@@ -773,7 +773,7 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
             targets += listify(tweaks['alwaysbcc'])
 
         if len(ccaddrs):
-            msg['Cc'] + ', '.join(ccaddrs)
+            msg['Cc'] = ', '.join(ccaddrs)
 
         if not NOMAIL:
             logger.debug('Message follows')
