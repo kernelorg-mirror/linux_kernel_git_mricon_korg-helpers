@@ -52,7 +52,7 @@ DB_VERSION = 1
 REST_API_VERSION = '1.1'
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
-REST_PER_PAGE = 50
+REST_PER_PAGE = 100
 
 CONFIG = None
 
@@ -937,8 +937,12 @@ def housekeeping(pname):
         page = 0
         seen = set()
         pagedata = list()
+        lastpage = False
+        archived = 0
         while True:
-            if not pagedata:
+            if not pagedata and not lastpage:
+                if archived:
+                    logger.info('Archived %d patches, grabbing next page', archived)
                 params = [
                     ('project', project_id),
                     ('archived', 'false'),
@@ -964,8 +968,9 @@ def housekeeping(pname):
             # Did we go too far forward?
             patch_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
             if patch_date >= cutoffdate:
-                logger.debug('Reached the cutoff date, stopping at %s', patch_date)
-                break
+                # mark that we're on the last page
+                lastpage = True
+                continue
 
             patch_id = entry.get('id')
             if patch_id in seen:
@@ -975,13 +980,15 @@ def housekeeping(pname):
                 logger.info('Setting to archived is not working, exiting loop.')
                 break
 
-            seen.update([patch_id])
-            patch_title = entry.get('name')
-            logger.info('Archiving: %s', patch_title)
+            seen.add(patch_id)
+            archived += 1
             if not DRYRUN:
                 rm.update_patch(patch_id, archived=True)
             else:
                 logger.info('  Dryrun: Not actually archiving')
+
+        if archived:
+            logger.info('Archived %d total patches', archived)
 
         if not report:
             return
