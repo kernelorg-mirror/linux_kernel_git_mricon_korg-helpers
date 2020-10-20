@@ -25,9 +25,14 @@ import os
 import sys
 import mailbox
 import email.utils
-import time
-import re
+import email.policy
 import fnmatch
+
+from email import charset
+charset.add_charset('utf-8', charset.SHORTEST, '8bit') # noqa
+
+# Set our own policy
+EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 
 # Only retain the headers that are important to us
 # must be lowercase for matching purposes.
@@ -55,8 +60,10 @@ WANTHDRS = {'return-path',
             'resent-to',
             }
 
+__VERSION__ = '2.0'
 
-def main(sources, outdir, msgids, listids, rejectsfile):
+
+def process_archives(sources, outdir, msgids, listids, rejectsfile):
     outboxes = {}
     writecount = {}
     seenids = []
@@ -77,58 +84,15 @@ def main(sources, outdir, msgids, listids, rejectsfile):
         rejectsbox = mailbox.mbox(rejectsfile)
 
     for sourcefile in sources:
-        is_pipermail = False
-        is_nntp = False
-
-        # do you have a '://' in you?
-        if sourcefile.find('://') > 0:
-            if sourcefile.find('nntp://') == 0:
-                is_nntp = True
-            else:
-                is_pipermail = True
-
-        if is_nntp:
-            # Expect in format nntp://news.gmane.org/gmane.linux.network
-            sys.stdout.write('Connecting to %s...' % sourcefile)
-            chunks = sourcefile.split('/')
-            server, group = chunks[-2:]
-            import nntplib
-            nntplib._MAXLINE = 1 << 20
-            server = nntplib.NNTP(server)
-            resp, count, first, last, name = server.group(group)
-            total = int(last)
-
-            def nntp_msg_gen(last):
-                aid = 1
-                while aid <= last:
-                    try:
-                        resp, ainfo = server.article(aid)
-                        message = email.message_from_bytes(b'\n'.join(ainfo[2]))
-                        yield message
-                    except nntplib.NNTPTemporaryError:
-                        # Ignore one-off article failures -- probably deletes
-                        pass
-                    finally:
-                        aid += 1
-
-            inbox = nntp_msg_gen(total)
-
+        sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
+        sys.stdout.flush()
+        # If the filename ends with /, we treat as maildir
+        if sourcefile[-1] == '/':
+            inbox = mailbox.Maildir(sourcefile)
         else:
-            if is_pipermail:
-                sourcefile = grab_pipermail_archive(sourcefile, outdir)
-                sys.stdout.write('parsing...')
-                sys.stdout.flush()
-                inbox = mailbox.mbox(sourcefile)
-            else:
-                sys.stdout.write('Opening %s...' % os.path.basename(sourcefile))
-                sys.stdout.flush()
-                # If the filename ends with /, we treat as maildir
-                if sourcefile[-1] == '/':
-                    inbox = mailbox.Maildir(sourcefile)
-                else:
-                    inbox = mailbox.mbox(sourcefile)
+            inbox = mailbox.mbox(sourcefile)
 
-            total = len(inbox)
+        total = len(inbox)
 
         sys.stdout.write('%s messages\n' % total)
         sys.stdout.flush()
@@ -153,7 +117,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 # Huh, no message-id? Most likely, FOLDER-INTERNAL DATA marker or some other
                 # system message.
                 if rejectsfile:
-                    msg._headers.append(('X-Import-Rejected-Reason', 'No Message-ID'))
+                    msg._headers.append(('X-Import-Rejected-Reason', 'No Message-ID')) # noqa
                     rejectsbox.add(msg)
                 skipped += 1
                 nomsgid += 1
@@ -166,7 +130,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 # latter condition, so we just assume they got delivered multiple times and
                 # use the first one found.
                 if rejectsfile:
-                    msg._headers.append(('X-Import-Rejected-Reason', 'Duplicate Message-ID'))
+                    msg._headers.append(('X-Import-Rejected-Reason', 'Duplicate Message-ID')) # noqa
                     rejectsbox.add(msg)
                 skipped += 1
                 dupmsgid += 1
@@ -179,12 +143,8 @@ def main(sources, outdir, msgids, listids, rejectsfile):
             cc = ''
             recvtime = None
             is_our_list = False
-            for hdrname, hdrval in list(msg._headers):
+            for hdrname, hdrval in list(msg._headers): # noqa
                 lhdrname = hdrname.lower()
-                if is_nntp and lhdrname.find('original-') == 0:
-                    lhdrname = lhdrname.replace('original-', '')
-                    hdrname = hdrname.replace('Original-', '')
-
                 lhdrval = hdrval.lower()
                 wanthdr = False
                 for hdrmatch in WANTHDRS:
@@ -212,20 +172,20 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                         pass
 
                 elif lhdrname == 'list-id':
-                        for listid in listids:
-                            if lhdrval.find(listid) >= 0:
-                                newhdrs.append((hdrname, hdrval))
-                                is_our_list = True
-                                break
+                    for listid in listids:
+                        if lhdrval.find(listid) >= 0:
+                            newhdrs.append((hdrname, hdrval))
+                            is_our_list = True
+                            break
 
                 elif lhdrname == 'x-mailing-list':
-                        for listid in listids:
-                            if lhdrval.find(listid) >= 0:
-                                # Stick the list-id that's first in our collection,
-                                # since we assume that it's the canonical one
-                                newhdrs.append(('List-Id', listids[0]))
-                                is_our_list = True
-                                break
+                    for listid in listids:
+                        if lhdrval.find(listid) >= 0:
+                            # Stick the list-id that's first in our collection,
+                            # since we assume that it's the canonical one
+                            newhdrs.append(('List-Id', listids[0]))
+                            is_our_list = True
+                            break
 
                 # Malformed emails can have multiple to: and cc: fields.  Merge
                 # so there's one field for each header type.
@@ -271,31 +231,20 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 # LKML list-id, the archive may only contain the copy that arrived to
                 # linux-mm. We try to hedge for this by looking in the "To" and "Cc"
                 # fields for any indication that this was intended for our mailing list.
-                if is_pipermail:
-                    # Pipermail doesn't preserve the List-Id nor "To" headers,
-                    # so put them back in place
-                    newhdrs.append(('To', eaddrs[0]))
-                    newhdrs.append(('List-Id', listids[0]))
-                    is_our_list = True
-                elif is_nntp:
-                    # We assume everything in the newsgroup matches our first list-id
-                    newhdrs.append(('List-Id', listids[0]))
-                    is_our_list = True
-                else:
-                    for eaddr in eaddrs:
-                        if (str(msg.get('to', '')).lower().find(eaddr) >= 0 or
-                                str(msg.get('cc', '')).lower().find(eaddr) >= 0 or
-                                str(msg.get('resent-to', '')).lower().find(eaddr) >= 0):
-                            # insert the list-id header
-                            # (assuming the first one in the list to be the canonical one)
-                            newhdrs.append(('List-ID', '<%s>' % listids[0]))
-                            is_our_list = True
-                            break
+                for eaddr in eaddrs:
+                    if (str(msg.get('to', '')).lower().find(eaddr) >= 0 or
+                            str(msg.get('cc', '')).lower().find(eaddr) >= 0 or
+                            str(msg.get('resent-to', '')).lower().find(eaddr) >= 0):
+                        # insert the list-id header
+                        # (assuming the first one in the list to be the canonical one)
+                        newhdrs.append(('List-ID', '<%s>' % listids[0]))
+                        is_our_list = True
+                        break
 
                 if not is_our_list:
                     # Well, we tried everything
                     if rejectsfile:
-                        msg._headers.append(('X-Import-Rejected-Reason', 'No matching List-ID'))
+                        msg._headers.append(('X-Import-Rejected-Reason', 'No matching List-ID')) # noqa
                         rejectsbox.add(msg)
                     skipped += 1
                     notourlist += 1
@@ -309,8 +258,6 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 msgdate = email.utils.parsedate_tz(str(msg['Date']))
 
             mboxname = '%04d-%02d.mbx' % (msgdate[0], msgdate[1])
-            if is_nntp:
-                msg.set_unixfrom('From nntp@import %s' % time.strftime('%c', msgdate[:9]))
 
             # do we have this mbox open already?
             if mboxname in outboxes:
@@ -321,14 +268,11 @@ def main(sources, outdir, msgids, listids, rejectsfile):
                 outboxes[mboxname] = outbox
                 writecount[mboxname] = 1
 
-            outbox.add(msg)
+            outbox.add(msg.as_string(policy=EMLPOLICY).encode())
             seenids.append(msgid)
             knownset.add(msgid)
 
         inbox.close()
-        if is_pipermail:
-            os.unlink(sourcefile)
-
         sys.stdout.write('  %s/%s (%s skipped: %s dupmsgid, %s nomsgid, %s notourlist)\n' %
                          (counter, total, skipped, dupmsgid, nomsgid, notourlist))
 
@@ -347,99 +291,7 @@ def main(sources, outdir, msgids, listids, rejectsfile):
         return None
 
 
-def parse_pipermail_index(pipermail_url):
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError as ex:
-        print('You need to install python-beautifulsoup4 to parse pipermail URLs')
-        print(ex)
-        sys.exit(1)
-
-    print('Grabbing the pipermail index from %s' % pipermail_url)
-    with urllib_request.urlopen(pipermail_url) as response:
-        index = response.read()
-        response.close()
-
-    soup = BeautifulSoup(index, features='lxml')
-
-    mboxes = []
-    for tag in soup.find_all('a'):
-        # we are looking for a href that ends with .txt.gz
-        if 'href' in tag.attrs and tag.attrs['href'][-7:] == '.txt.gz':
-            mboxes.append(os.path.join(pipermail_url, tag.attrs['href']))
-
-    return mboxes
-
-
-def grab_pipermail_archive(pipermail_url, outdir):
-    import gzip
-
-    chunks = pipermail_url.split('/')
-
-    sys.stdout.write('Grabbing %s...' % chunks[-1])
-    sys.stdout.flush()
-    # stick it into outdir/_tmp_pipermail_%last-chunk
-    local_file = os.path.join(outdir, '_tmp_pipermail_%s' % chunks[-1])
-
-    with urllib_request.urlopen(pipermail_url) as response:
-        with gzip.GzipFile(fileobj=response) as uncompressed:
-            # XXX: this can be horribly large
-            mboxdata = uncompressed.read().decode('utf-8', errors='replace')
-            uncompressed.close()
-        response.close()
-
-    # Pipermail does a nasty thing where it doesn't properly handle
-    # lines in the body that start with "From ". First, we add ">" to
-    # all lines starting with "From " and then fix some of them in the
-    # next step.
-    sys.stdout.write('demangling...')
-    sys.stdout.flush()
-    regex = r'^From '
-    subst = '>From '
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
-    # Fix pipermail mangling where it changes some email addresses
-    # to be ' at ' instead of '@'. This is easiest to do with a
-    # handful of regexes than via actual message body manipulation
-    # as parf of the python's email.message object
-    regex = r'(<[^>]+) at ([^>]+>)'
-    subst = '\\1@\\2'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
-    regex = r'^>?(From:? \S+) at (\S+\..*)'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
-
-    with open(local_file, 'wb') as out_fh:
-        out_fh.write(mboxdata.encode('utf-8'))
-
-    out_fh.close()
-    return local_file
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Make a mbox of LKML messages we haven't yet archived",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument('-source', nargs='+',
-                        help=('Mbox file with archives, can be multiple. '
-                              'Paths with trailing "/" will be treated as maildirs.'))
-    parser.add_argument('-pipermail',
-                        help='Download mailman pipermail archives from this URL')
-    parser.add_argument('-nntp',
-                        help=('Download full archives from a NNTP server, '
-                              'e.g. -n nntp://news.gmane.com/gmane.linux.kernel'))
-    parser.add_argument('-exportdir', required=True, default='list-archives',
-                        help='Export dir where to put sanitized archives')
-    parser.add_argument('-knownids',
-                        help='File with known Message-IDs (one per line)')
-    parser.add_argument('-listids', required=True, nargs='+',
-                        help='List ID to match, can be multiple')
-    parser.add_argument('-rejected',
-                        help='Mailbox file where to save messages that were rejected '
-                             '(adds X-Import-Rejected-Reason header)')
-
-    args = parser.parse_args()
-
+def main(args):
     if not os.path.isdir(args.exportdir):
         os.mkdir(args.exportdir)
 
@@ -453,29 +305,14 @@ if __name__ == '__main__':
         # right now we're just appending to them, which is probably not expected behaviour.
         knownids = []
 
-    # are you asking for a pipermail grab?
-    mboxes = []
-    if args.pipermail is not None:
-        import urllib.request as urllib_request
-        mboxes = parse_pipermail_index(args.pipermail)
-        if not mboxes:
-            print('Could not find any .txt.gz files listed at %s' % args.pipermail)
-            sys.exit(1)
-
-    if args.nntp:
-        mboxes.append(args.nntp)
-
-    if args.source:
-        mboxes += args.source
-
-    if not mboxes:
-        print('You have to specify at least one source (-s, -p, or -n)')
+    if not args.source:
+        print('You have to specify at least one source')
         sys.exit(1)
 
     # Make list ID matching case insensitive to match more mail
     listids = [listid.lower() for listid in args.listids]
 
-    newids = main(mboxes, args.exportdir, knownids, listids, args.rejected)
+    newids = process_archives(args.source, args.exportdir, knownids, listids, args.rejected)
 
     if newids is None or not args.knownids:
         sys.exit(0)
@@ -485,3 +322,27 @@ if __name__ == '__main__':
     with open(args.knownids, 'w') as fh:
         fh.write('\n'.join(new_idlist))
         fh.close()
+
+
+if __name__ == '__main__':
+    import argparse
+
+    # noinspection PyTypeChecker
+    parser = argparse.ArgumentParser(
+        description="Make a mbox of LKML messages we haven't yet archived",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('-source', nargs='+',
+                        help=('Mbox file with archives, can be multiple. '
+                              'Paths with trailing "/" will be treated as maildirs.'))
+    parser.add_argument('-exportdir', required=True, default='list-archives',
+                        help='Export dir where to put sanitized archives')
+    parser.add_argument('-knownids',
+                        help='File with known Message-IDs (one per line)')
+    parser.add_argument('-listids', required=True, nargs='+',
+                        help='List ID to match, can be multiple')
+    parser.add_argument('-rejected',
+                        help='Mailbox file where to save messages that were rejected '
+                             '(adds X-Import-Rejected-Reason header)')
+
+    main(parser.parse_args())
