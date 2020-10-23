@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# This is the post-receive git hook used to generate the activity feed
+# public-inbox repository. It requires that ezpi is installed
+# https://sr.ht/~monsieuricon/ezpi/
+#
+# Copyright (C) 2020 by The Linux Foundation
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+__author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
+
+import os
+import sys
+import ezpi
+import hashlib
+import base64
+
+from email.message import EmailMessage
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+from typing import Optional
+
+
+def get_config_from_git(regexp: str, defaults: Optional[dict] = None) -> dict:
+    gitconfig = defaults if defaults else dict()
+
+    args = ['config', '-z', '--get-regexp', regexp]
+    ee, out, err = ezpi.git_run_command('', args)
+    if ee > 0 or not len(out):
+        return gitconfig
+
+    for line in out.decode().split('\x00'):
+        if not line:
+            continue
+        key, value = line.split('\n', 1)
+        try:
+            chunks = key.split('.')
+            cfgkey = chunks[-1]
+            gitconfig[cfgkey.lower()] = value
+        except ValueError:
+            pass
+
+    return gitconfig
+
+
+def run_hook(feedrepo: str, fromhdr: str, domain: str):
+    # Look if we have a GL_USER and GL_REPO in the env
+    user = os.getenv('GL_USER')
+    if not user:
+        user = os.getenv('USER')
+    repo = os.getenv('GL_REPO')
+    if not repo:
+        repo = os.getcwd()
+    ll = list()
+    attachments = list()
+    ll.append('---')
+    ll.append('service: git-receive-pack')
+    ll.append(f'repo: {repo}')
+    ll.append(f'user: {user}')
+    # Do we have a ~/.activity-feed-secret?
+    secret = None
+    secretf = os.path.expanduser('~/.activity-feed-secret')
+    # The idea is to rotate it frequently, with the value logged in syslog.
+    # This allows us to see if a push is coming from the same remote IP address,
+    # but only within the same calendar day.
+    try:
+        with open(secretf) as fh:
+            secret = fh.read().strip()
+    except (FileNotFoundError, IOError):
+        pass
+
+    if secret:
+        conn_info = os.getenv('SSH_CONNECTION')
+        if conn_info:
+            remote_ip = conn_info.split()[0]
+            ipline = f'{secret}{user}{remote_ip}'
+            iph = hashlib.sha1()
+            iph.update(ipline.encode())
+            hashed = base64.b64encode(iph.digest()).decode()
+            ll.append(f'remote_ip: {hashed}')
+
+    # Do we have a push cert?
+    cert = os.getenv('GIT_PUSH_CERT')
+    if cert:
+        gpcstatus = os.getenv('GIT_PUSH_CERT_STATUS')
+        ll.append(f'git_push_cert_status: {gpcstatus}')
+        args = ['cat-file', 'blob', cert]
+        ee, out, err = ezpi.git_run_command('', args)
+        if ee == 0 and out:
+            attachments.append(('git-push-certificate.txt', out.decode()))
+
+    ll.append('changes:')
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        oldrev, newrev, ref = line.strip().split()
+        ll.append(f'  - ref: {ref}')
+        ll.append(f'    old: {oldrev}')
+        ll.append(f'    new: {newrev}')
+
+        args = ['rev-list', '--max-count=1024', '--reverse', '--pretty=oneline', newrev]
+        if set(oldrev) != {0}:
+            args += [f'^{oldrev}']
+
+        ee, out, err = ezpi.git_run_command('', args)
+        if ee > 0 or not len(out):
+            continue
+
+        if len(out) > 1024:
+            # Add it as attachment
+            filename = f'revlist-{oldrev[:12]}-{newrev[:12]}.txt'
+            attachments.append((filename, out.decode()))
+            ll.append(f'    log: {filename}')
+            continue
+
+        ll.append('    log: |')
+        for pretty in out.decode().split('\n'):
+            ll.append(f'         {pretty}')
+
+    body = '\n'.join(ll) + '\n'
+
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, 'plain'))
+        for attfilename, attbody in attachments:
+            att = MIMEText(attbody, 'plain')
+            att.add_header('Content-Disposition', f'attachment; filename={attfilename}')
+            msg.attach(att)
+    else:
+        msg = EmailMessage()
+        msg.set_payload(body)
+
+    msg['From'] = fromhdr
+    msg['Subject'] = f'post-receive: {repo}'
+
+    try:
+        ezpi.add_rfc822(feedrepo, msg, domain)
+        sys.stderr.write('Recorded in the activity feed\n')
+        ezpi.run_hook(feedrepo)
+    except RuntimeError:
+        # Could not add it to the feed, complain
+        sys.stderr.write('FAILED writing to the activity feed!\n')
+
+
+if __name__ == '__main__':
+    if sys.stdin.isatty():
+        # Nothing passed via stdin, so nothing to add to the feed
+        sys.exit(0)
+    config = get_config_from_git(r'activityfeed\..*')
+    _feedrepo = config.get('repo')
+    if not config.get('repo'):
+        # The audit repo is not defined in gitconfig, so nothing for us to do.
+        sys.exit(0)
+    _fromhdr = config.get('from')
+    _domain = config.get('domain')
+    if not _domain:
+        _domain = 'localhost'
+
+    if not _fromhdr:
+        _fromhdr = f'Post-Receive Hook <post-receive@{_domain}>'
+
+    run_hook(_feedrepo, _fromhdr, _domain)
