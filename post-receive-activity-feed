@@ -12,7 +12,7 @@ __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
 import os
 import sys
-import ezpi
+import ezpi # noqa
 import hashlib
 import base64
 
@@ -54,7 +54,7 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
     if not repo:
         repo = os.getcwd()
     ll = list()
-    attachments = list()
+    attachments = dict()
     ll.append('---')
     ll.append('service: git-receive-pack')
     ll.append(f'repo: {repo}')
@@ -89,9 +89,11 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
         args = ['cat-file', 'blob', cert]
         ee, out, err = ezpi.git_run_command('', args)
         if ee == 0 and out:
-            attachments.append(('git-push-certificate.txt', out.decode()))
+            attachments['git-push-certificate.txt'] = out.decode()
 
     ll.append('changes:')
+
+    seenranges = dict()
     while True:
         line = sys.stdin.readline()
         if not line:
@@ -101,18 +103,22 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
         ll.append(f'    old: {oldrev}')
         ll.append(f'    new: {newrev}')
 
-        args = ['rev-list', '--max-count=1024', '--reverse', '--pretty=oneline', newrev]
-        if set(oldrev) != {0}:
-            args += [f'^{oldrev}']
-
-        ee, out, err = ezpi.git_run_command('', args)
-        if ee > 0 or not len(out):
-            continue
+        if (oldrev, newrev) not in seenranges:
+            args = ['rev-list', '--max-count=1024', '--reverse', '--pretty=oneline', newrev]
+            if set(oldrev) != {0}:
+                args += [f'^{oldrev}']
+            ee, out, err = ezpi.git_run_command('', args)
+            if ee > 0 or not len(out):
+                continue
+            seenranges[(oldrev, newrev)] = out
+        else:
+            out = seenranges[(oldrev, newrev)]
 
         if len(out) > 1024:
-            # Add it as attachment
+            # Add it as attachment, unless we already have one with this name
             filename = f'revlist-{oldrev[:12]}-{newrev[:12]}.txt'
-            attachments.append((filename, out.decode()))
+            if filename not in attachments:
+                attachments[filename] = out.decode()
             ll.append(f'    log: {filename}')
             continue
 
@@ -125,7 +131,7 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
     if attachments:
         msg = MIMEMultipart()
         msg.attach(MIMEText(body, 'plain'))
-        for attfilename, attbody in attachments:
+        for attfilename, attbody in attachments.items():
             att = MIMEText(attbody, 'plain')
             att.add_header('Content-Disposition', f'attachment; filename={attfilename}')
             msg.attach(att)
@@ -138,11 +144,11 @@ def run_hook(feedrepo: str, fromhdr: str, domain: str):
 
     try:
         ezpi.add_rfc822(feedrepo, msg, domain)
-        sys.stderr.write('Recorded in the activity feed\n')
+        sys.stderr.write('Recorded in the transparency log\n')
         ezpi.run_hook(feedrepo)
     except RuntimeError:
         # Could not add it to the feed, complain
-        sys.stderr.write('FAILED writing to the activity feed!\n')
+        sys.stderr.write('FAILED writing to the transparency log!\n')
 
 
 if __name__ == '__main__':
