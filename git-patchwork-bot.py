@@ -1149,7 +1149,7 @@ def pwrun(repo, rsettings):
             for fs in hsettings.get('fromstate', list()):
                 fromstate.append(fs.lower().replace(' ', '-'))
             if not fromstate:
-                fromstate = ['new', 'in-review']
+                fromstate = list(wantstates)
 
             # We create patch_id->rev mapping first
             revs = dict()
