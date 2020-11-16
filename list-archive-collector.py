@@ -23,6 +23,7 @@ import re
 import quopri
 import base64
 import gzip
+import io
 import nntplib
 import requests
 import logging
@@ -298,7 +299,7 @@ def parse_pipermail_index(pipermail_url):
     mboxes = []
     for tag in soup.find_all('a'):
         # we are looking for a href that ends with .txt.gz
-        if 'href' in tag.attrs and tag.attrs['href'][-7:] == '.txt.gz':
+        if 'href' in tag.attrs and tag.attrs['href'].find('.txt') > 1:
             mboxes.append(os.path.join(pipermail_url, tag.attrs['href']))
 
     return mboxes
@@ -310,11 +311,13 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
 
     logger.info('  grabbing %s', chunks[-1])
     rses = get_requests_session()
+    # XXX: this can be horribly large
     resp = rses.get(pipermail_url, stream=True)
-
-    with gzip.GzipFile(fileobj=resp.raw) as uncompressed:
-        # XXX: this can be horribly large
-        mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+    if resp.content.startswith(b'\x1f\x8b'):
+        with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as uncompressed:
+            mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+    else:
+        mboxdata = resp.content.decode('utf-8', errors='replace')
 
     resp.close()
 
@@ -342,7 +345,7 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     # Open it now as a mailbox
     tmpmbx = mailbox.mbox(tmpfile)
     for msg in tmpmbx:
-        logger.info('  processing: %s', msg.get('Message-Id'))
+        logger.info('    processing: %s', msg.get('Message-Id'))
         # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
         fromline = msg.get('From')
         matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
