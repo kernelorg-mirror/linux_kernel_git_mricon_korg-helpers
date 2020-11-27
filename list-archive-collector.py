@@ -329,19 +329,21 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     regex = r'^From '
     subst = '>From '
     mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-    # Fix pipermail mangling where it changes some email addresses
-    # to be ' at ' instead of '@'. This is easiest to do with a
-    # handful of regexes than via actual message body manipulation
-    # as part of the python's email.message object
     regex = r'(<[^>]+) at ([^>]+>)'
-    subst = r'\1@\2'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-    regex = r'^>?(From:? \S+) at (\S+\..*)'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-    # Fix any remaining false From escapes
-    regex = r'^>(From\s+\S+@\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
-    subst = r'\1'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    if re.search(regex, mboxdata):
+        # Fix pipermail mangling where it changes some email addresses
+        # to be ' at ' instead of '@'. This is easiest to do with a
+        # handful of regexes than via actual message body manipulation
+        # as part of the python's email.message object
+        subst = r'\1@\2'
+        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+        regex = r'^>?(From:? \S+) at (\S+\..*)'
+        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    else:
+        # Fix any remaining false From escapes
+        regex = r'^>(From\s+\S+@\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
+        subst = r'\1'
+        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
 
     with open(tmpfile, 'wb') as out_fh:
         out_fh.write(mboxdata.encode())
@@ -350,7 +352,7 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     tmpmbx = mailbox.mbox(tmpfile)
     for msg in tmpmbx:
         logger.info('    processing: %s', msg.get('Message-Id'))
-        fromline = msg.get('From')
+        fromline = str(msg.get('From', ''))
         if fromline and fromline.find('(') > 0:
             # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
             matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
