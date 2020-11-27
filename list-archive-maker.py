@@ -268,9 +268,13 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
                 outboxes[mboxname] = outbox
                 writecount[mboxname] = 1
 
-            outbox.add(msg.as_string(policy=EMLPOLICY).encode())
-            seenids.append(msgid)
-            knownset.add(msgid)
+            try:
+                outbox.add(msg.as_string(policy=EMLPOLICY).encode())
+                seenids.append(msgid)
+                knownset.add(msgid)
+            except:
+                # Oh well, toss it
+                pass
 
         inbox.close()
         sys.stdout.write('  %s/%s (%s skipped: %s dupmsgid, %s nomsgid, %s notourlist)\n' %
