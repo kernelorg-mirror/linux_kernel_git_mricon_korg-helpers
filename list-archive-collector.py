@@ -328,16 +328,20 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     logger.info('  demangling %s', chunks[-1])
     regex = r'^From '
     subst = '>From '
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
     # Fix pipermail mangling where it changes some email addresses
     # to be ' at ' instead of '@'. This is easiest to do with a
     # handful of regexes than via actual message body manipulation
-    # as parf of the python's email.message object
+    # as part of the python's email.message object
     regex = r'(<[^>]+) at ([^>]+>)'
-    subst = '\\1@\\2'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
+    subst = r'\1@\2'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
     regex = r'^>?(From:? \S+) at (\S+\..*)'
-    mboxdata = re.sub(regex, subst, mboxdata, 0, re.MULTILINE)
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    # Fix any remaining false From escapes
+    regex = r'^>(From\s+\S+@\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
+    subst = r'\1'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
 
     with open(tmpfile, 'wb') as out_fh:
         out_fh.write(mboxdata.encode())
