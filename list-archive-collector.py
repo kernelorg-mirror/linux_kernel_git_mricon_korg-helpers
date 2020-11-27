@@ -350,12 +350,13 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     tmpmbx = mailbox.mbox(tmpfile)
     for msg in tmpmbx:
         logger.info('    processing: %s', msg.get('Message-Id'))
-        # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
-        fromline = msg.get('From', '')
-        matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
-        if matches:
-            gr = matches.groups()
-            msg.replace_header('From', f'{gr[1]} <{gr[0]}>')
+        fromline = msg.get('From')
+        if fromline and fromline.find('(') > 0:
+            # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
+            matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
+            if matches:
+                gr = matches.groups()
+                msg.replace_header('From', f'{gr[1]} <{gr[0]}>')
 
         if listid:
             msg['List-Id'] = f'<{listid}>'
