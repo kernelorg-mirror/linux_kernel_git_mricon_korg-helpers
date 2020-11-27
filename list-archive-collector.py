@@ -351,7 +351,7 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     for msg in tmpmbx:
         logger.info('    processing: %s', msg.get('Message-Id'))
         # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
-        fromline = msg.get('From')
+        fromline = msg.get('From', '')
         matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
         if matches:
             gr = matches.groups()
