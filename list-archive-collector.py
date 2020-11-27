@@ -339,11 +339,10 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
         mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
         regex = r'^>?(From:? \S+) at (\S+\..*)'
         mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-    else:
-        # Fix any remaining false From escapes
-        regex = r'^>(From\s+\S+@\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
-        subst = r'\1'
-        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    # Fix any remaining false From escapes
+    regex = r'^>(From\s+\S+@\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
+    subst = r'\1'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
 
     with open(tmpfile, 'wb') as out_fh:
         out_fh.write(mboxdata.encode())
