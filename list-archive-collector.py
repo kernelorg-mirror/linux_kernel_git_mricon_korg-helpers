@@ -126,7 +126,7 @@ def lookaside_fillin(msg):
         'User-Agent',
         'X-Mailer',
     ]
-    msgid = msg.get('Message-Id').strip('<>')
+    msgid = str(msg.get('Message-Id')).strip('<>')
     lmsg = lore_get_message(msgid)
     if not lmsg:
         return False
