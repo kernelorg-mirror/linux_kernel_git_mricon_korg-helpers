@@ -25,9 +25,9 @@ CHECKOUT=${3:-master}
 #
 # NOTICE: Pick the tree that's likely to have most of the objects you want
 #         We have mainline, stable, and linux-next bundles for you to choose
-#CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/stable/linux/clone.bundle"
-#CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/next/linux-next/clone.bundle"
-CDNBUNDLE="https://cdn.kernel.org/pub/scm/.bundles/pub/scm/linux/kernel/git/torvalds/linux/clone.bundle"
+#CDNBUNDLE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/clone.bundle"
+#CDNBUNDLE="https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git/clone.bundle"
+CDNBUNDLE="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/clone.bundle"
 
 # We'll put the bundle into a safe temp location, but WARNING -- it's a
 # 1Gb+ file, so if you have limited space in /tmp, you should consider
