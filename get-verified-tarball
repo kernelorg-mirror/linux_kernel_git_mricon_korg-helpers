@@ -146,7 +146,7 @@ ${GPGBIN} --batch \
 # Now that we know we can verify them, grab the contents
 TXZ="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VER}.tar.xz"
 SIG="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VER}.tar.sign"
-SHA="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
+SHA="https://www.kernel.org/pub/linux/kernel/v${MAJOR}.x/sha256sums.asc"
 
 # Before we verify the developer signature, we make sure that the
 # tarball matches what is on the kernel.org master. This avoids
