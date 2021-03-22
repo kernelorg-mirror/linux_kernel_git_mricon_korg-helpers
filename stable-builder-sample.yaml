@@ -1,0 +1,57 @@
+#cloud-config
+# yamllint disable rule:line-length rule:document-start rule:comments
+users:
+  - name: '${username}'
+    shell: '/bin/bash'
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    groups: 'sudo'
+    lock_passwd: true
+    ssh_authorized_keys:
+      - '${pubkey}'
+
+package_update: true
+packages:
+  - htop
+  - ccache
+  - gcc
+  - make
+  - binutils
+  - bison
+  - flex
+  - libelf-dev
+  - openssl
+  - libssl-dev
+  - mutt
+  - msmtp-mta
+  - git
+  - git-email
+
+write_files:
+  - path: /etc/msmtprc
+    content: |
+      defaults
+      port 587
+      tls on
+      tls_trust_file /etc/ssl/certs/ca-certificates.crt
+
+      account korg
+      host mail.kernel.org
+      domain kernel.org
+      from ${username}@kernel.org
+      auth on
+      user ${msmtp_user}
+      password ${msmtp_password}
+
+      account default : korg
+
+  - path: /etc/ccache.conf
+    content: |
+      max_size = 15.0G
+      cache_dir = /dev/shm/ccache/
+
+runcmd:
+  - 'curl -s -L -o /var/lib/git/clone.bundle https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/clone.bundle'
+  - 'git clone --mirror /var/lib/git/clone.bundle /var/lib/git/stable.git'
+  - 'git --git-dir /var/lib/git/stable.git remote set-url origin git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git'
+  - 'git --git-dir /var/lib/git/stable.git remote update origin'
+  - 'echo "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${username}@$$(hostname -I | cut -f1 -d\ )" | mail -s "$$(hostname) ready" ${username}@kernel.org'
