@@ -329,16 +329,15 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     regex = r'^From '
     subst = '>From '
     mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    # Fix pipermail mangling where it changes some email addresses
+    # to be ' at ' instead of '@'. This is easiest to do with a
+    # handful of regexes than via actual message body manipulation
+    # as part of the python's email.message object
     regex = r'(<[^>]+) at ([^>]+>)'
-    if re.search(regex, mboxdata):
-        # Fix pipermail mangling where it changes some email addresses
-        # to be ' at ' instead of '@'. This is easiest to do with a
-        # handful of regexes than via actual message body manipulation
-        # as part of the python's email.message object
-        subst = r'\1@\2'
-        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-        regex = r'^>?(From:? \S+) at (\S+\..*)'
-        mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    subst = r'\1@\2'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    regex = r'^>?(From:? \S+) at (\S+\..*)'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
     # Fix any remaining false From escapes
     regex = r'^>(From\s+\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
     subst = r'\1'
