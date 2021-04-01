@@ -261,7 +261,7 @@ def report_badness(config, furl, errors):
     mailhost = config.get('mailhost', 'localhost')
 
     try:
-        server = smtplib.SMTP(config['mailhost'])
+        server = smtplib.SMTP(mailhost)
         if config.getboolean('mailtls'):
             server.starttls()
 
