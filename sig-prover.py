@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+#
 # This script will check random content published on www.kernel.org/pub against
 # authorized signatures to identify when corruption or substitution happens. The name
 # comes from the Russian word /proveryat/, meaning "to verify".
 #
-# The script it supposed to be fire-and-forget, running in a screen session or as a
-# systemd service, with reports sent to admin@kernel.org.
+# The script it supposed to be fire-and-forget, running in a screen session, as
+# a background task, or as a systemd service, with reports sent to admin@kernel.org.
+#
+# E.g. (after you play with it to verify that it's doing the right thing):
+# ./sig-prover -c sig-prover.conf -q &
 #
 # CAUTION:
 #    This script is not a guaranteed mechanism to detect intrusion -- an
@@ -14,7 +18,7 @@
 #    adding random delays between retrieving the tarball and the detached
 #    signature, setting a referrer value, etc. However, even with added
 #    measures, it will always act fairly predictably, so there will always
-#    remain a way to defeat it.
+#    remain a way to detect and defeat it.
 #
 #    If you download tarballs from kernel.org for any purpose, you should
 #    always run your own verification on each downloaded file.
