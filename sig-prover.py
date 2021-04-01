@@ -129,7 +129,7 @@ def get_random_target(config, rsect):
         resp.raise_for_status()
 
         keyring = os.path.join(config[rsect].get('keyringdir'), config[rsect].get('dirsigner_keyring'))
-        logger.info('    verifying')
+        logger.info('    verifying with %s', keyring)
         gpgargs = ['--verify', '--status-fd=2', '-']
         ecode, out, err = gpg_run_command(gpgargs, keyring, stdin=resp.content)
         if ecode == 0:
@@ -316,16 +316,16 @@ def verify_tarball(config, turl):
                 cfh.write(chunk)
         resp.close()
         if zext:
-            logger.info('    uncompressing')
+            logger.info('    uncompressing %s', zext)
             cmdargs = [zbin, contentfile]
             ecode, out, err = _run_command(cmdargs)
             if ecode > 0:
                 logger.critical('Error uncompressing %s', turl)
                 sys.exit(1)
             contentfile = os.path.join(td, 'content')
-        logger.info('    verifying')
         gpgargs = ['--verify', '--status-fd=2', signfile, contentfile]
         keyring = os.path.join(config.get('keyringdir'), config.get('keyring'))
+        logger.info('    verifying with %s', keyring)
         ecode, out, err = gpg_run_command(gpgargs, keyring=keyring)
         if ecode == 0:
             good, valid, created, errors = validate_gpg_signature(err.decode())
