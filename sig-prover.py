@@ -6,6 +6,20 @@
 # The script it supposed to be fire-and-forget, running in a screen session or as a
 # systemd service, with reports sent to admin@kernel.org.
 #
+# CAUTION:
+#    This script is not a guaranteed mechanism to detect intrusion -- an
+#    attacker can defeat it by analyzing access patterns/IPs and serving
+#    different content when it suspects that someone is running an automated
+#    signature verification check. The script can probably be improved by
+#    adding random delays between retrieving the tarball and the detached
+#    signature, setting a referrer value, etc. However, even with added
+#    measures, it will always act fairly predictably, so there will always
+#    remain a way to defeat it.
+#
+#    If you download tarballs from kernel.org for any purpose, you should
+#    always run your own verification on each downloaded file.
+#    https://www.kernel.org/signature.html
+#
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # -*- coding: utf-8 -*-
