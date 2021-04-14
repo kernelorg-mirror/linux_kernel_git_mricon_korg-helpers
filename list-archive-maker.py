@@ -62,6 +62,13 @@ WANTHDRS = {'return-path',
 
 __VERSION__ = '2.0'
 
+def formataddr(pair):
+    try:
+        return email.utils.formataddr(pair)
+    except UnicodeEncodeError:
+        # This might happen if the realname is encoded in a broken way; just
+        # drop the real name then.
+        return email.utils.formataddr((None, pair[1]))
 
 def process_archives(sources, outdir, msgids, listids, rejectsfile):
     outboxes = {}
@@ -199,14 +206,14 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
                         if pair[1] in cc:
                             # already in Cc, so no need to add it to To
                             continue
-                        to.append(email.utils.formataddr(pair))
+                        to.append(formataddr(pair))
 
                 elif lhdrname == 'cc':
                     for pair in email.utils.getaddresses([hdrval]):
                         if pair[1] in to:
                             # already in To, so no need to add it to CCs
                             continue
-                        cc.append(email.utils.formataddr(pair))
+                        cc.append(formataddr(pair))
 
                 else:
                     newhdrs.append((hdrname, hdrval))
