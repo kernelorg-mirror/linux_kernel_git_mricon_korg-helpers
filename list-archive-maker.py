@@ -139,8 +139,8 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
             # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
             newhdrs = []
-            to = ''
-            cc = ''
+            to = []
+            cc = []
             recvtime = None
             is_our_list = False
             for hdrname, hdrval in list(msg._headers): # noqa
@@ -196,32 +196,26 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
 
                 elif lhdrname == 'to':
                     for pair in email.utils.getaddresses([hdrval]):
-                        if cc.find(pair[1]) >= 0:
+                        if pair[1] in cc:
                             # already in Cc, so no need to add it to To
                             continue
-                        if len(to) and to.find(pair[1]) < 0:
-                            to += ', %s' % email.utils.formataddr(pair)
-                        else:
-                            to += email.utils.formataddr(pair)
+                        to.append(email.utils.formataddr(pair))
 
                 elif lhdrname == 'cc':
                     for pair in email.utils.getaddresses([hdrval]):
-                        if to.find(pair[1]) >= 0:
+                        if pair[1] in to:
                             # already in To, so no need to add it to CCs
                             continue
-                        if len(cc) and cc.find(pair[1]) < 0:
-                            cc += ', %s' % email.utils.formataddr(pair)
-                        else:
-                            cc += email.utils.formataddr(pair)
+                        cc.append(email.utils.formataddr(pair))
 
                 else:
                     newhdrs.append((hdrname, hdrval))
 
             if len(to):
-                newhdrs.append(('To', to))
+                newhdrs.append(('To', ', '.join(to)))
 
             if len(cc):
-                newhdrs.append(('Cc', cc))
+                newhdrs.append(('Cc', ', '.join(cc)))
 
             if not is_our_list:
                 # Sometimes a message is cc'd to multiple mailing lists and the
