@@ -3,6 +3,15 @@ Purpose
 This is a collection of various helper scripts that may help when working with
 kernel.org infrastructure.
 
+Contributing
+------------
+Please send any contributions in the form of patches to the following address:
+ - tools@linux.kernel.org
+
+Submissions must be made under the terms of the Linux Foundation certificate of
+contribution and should include a Signed-off-by: line. Please read the DCO
+file for full legal definition of what that implies.
+
 Support
 -------
-Please send patches and support requests to tools@linux.kernel.org.
+Please send support requests to tools@linux.kernel.org.
