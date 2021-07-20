@@ -348,6 +348,7 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
 
     # Open it now as a mailbox
     tmpmbx = mailbox.mbox(tmpfile)
+    logger.debug('    %s messages in the archive', len(tmpmbx))
     for mkey in tmpmbx.keys():
         try:
             msg = tmpmbx.get_message(mkey)
