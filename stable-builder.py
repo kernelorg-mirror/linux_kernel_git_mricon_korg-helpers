@@ -196,6 +196,20 @@ def extend_builder(config, user):
         logger.info('Sorry, no such device: %s', hostname)
 
 
+def print_help():
+    logger.info('Command summary:')
+    logger.info('---------------+------------------------------------------------')
+    logger.info('create         | create a builder system')
+    logger.info('               | email will be sent once the system is started')
+    logger.info('---------------+------------------------------------------------')
+    logger.info('destroy        | shut down a running builder system')
+    logger.info('---------------+------------------------------------------------')
+    logger.info('check          | print out information about any running systems')
+    logger.info('---------------+------------------------------------------------')
+    logger.info('extend         | add 1 hour to the current build system lifetime')
+    logger.info('---------------+------------------------------------------------')
+
+
 def read_config(cfgfile):
     from configparser import ConfigParser, ExtendedInterpolation
     if not os.path.exists(cfgfile):
@@ -264,6 +278,8 @@ if __name__ == '__main__':
         rip_builder(_config, cmdargs.user)
     elif cmdargs.action == 'extend':
         extend_builder(_config, cmdargs.user)
+    elif cmdargs.action == 'help':
+        print_help()
     else:
         logger.critical('Unknown action: %s', cmdargs.action)
         sys.exit(1)
