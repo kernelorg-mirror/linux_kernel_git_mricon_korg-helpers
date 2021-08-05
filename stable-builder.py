@@ -39,7 +39,7 @@ def print_ips(device, user):
 
 
 def get_builder(manager, project_id, hostname):
-    for device in manager.list_devices(project_id=project_id):
+    for device in manager.list_all_devices(project_id=project_id):
         if device.hostname == hostname:
             return device
 
