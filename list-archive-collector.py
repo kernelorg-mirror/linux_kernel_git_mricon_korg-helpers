@@ -18,6 +18,7 @@ import sys
 import mailbox
 import email.utils
 import email.policy
+import email.header
 import time
 import re
 import quopri
@@ -56,6 +57,25 @@ MARCNICE = 1
 EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 
 logger = logging.getLogger(__name__)
+
+
+def clean_header(hdrval):
+    if hdrval is None:
+        return ''
+
+    decoded = ''
+    for hstr, hcs in email.header.decode_header(hdrval):
+        if hcs is None:
+            hcs = 'utf-8'
+        try:
+            decoded += hstr.decode(hcs, errors='replace')
+        except LookupError:
+            # Try as utf-u
+            decoded += hstr.decode('utf-8', errors='replace')
+        except (UnicodeDecodeError, AttributeError):
+            decoded += hstr
+    new_hdrval = re.sub(r'\n?\s+', ' ', decoded)
+    return new_hdrval.strip()
 
 
 def get_requests_session():
@@ -296,30 +316,70 @@ def parse_pipermail_index(pipermail_url):
 
     soup = BeautifulSoup(index, features='lxml')
 
-    mboxes = []
+    mboxes = set()
     for tag in soup.find_all('a'):
         # we are looking for a href that ends with .txt.gz
         if 'href' in tag.attrs and tag.attrs['href'].find('.txt') > 1:
-            mboxes.append(os.path.join(pipermail_url, tag.attrs['href']))
+            mboxes.add(os.path.join(pipermail_url, tag.attrs['href']))
 
+    return mboxes
+
+
+def parse_hyperkitty_index(hyperkitty_url):
+    logger.info('Grabbing hyperkitty index from %s', hyperkitty_url)
+    rses = get_requests_session()
+    resp = rses.get(hyperkitty_url)
+    index = resp.content
+
+    soup = BeautifulSoup(index, features='lxml')
+
+    mboxes = set()
+    for tag in soup.find_all('a'):
+        # we are looking for a href that has year/month notation
+        if 'href' in tag.attrs:
+            matches = re.search(r'.*/(\d{4})/(\d{1,2})/', tag.attrs['href'])
+            if matches:
+                year, month = matches.groups()
+                year = int(year)
+                month = int(month)
+                fromdate = '%d-%02d-01' % (year, month)
+                if month == 12:
+                    todate = '%d-01-01' % (year+1)
+                else:
+                    todate = '%d-%02d-01' % (year, month+1)
+                archurl = '%s/export/export.mbox.gz?start=%s&end=%s' % (hyperkitty_url.rstrip('/'), fromdate, todate)
+                mboxes.add(archurl)
+
+    # return {f'{hyperkitty_url}/export/export.mbox.gz?start=2021-09-01&end=2021-10-01'}
     return mboxes
 
 
 def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checkspam):
     tmpfile = mkstemp('pipermail')[1]
     chunks = pipermail_url.split('/')
-
-    logger.info('  grabbing %s', chunks[-1])
-    rses = get_requests_session()
-    # XXX: this can be horribly large
-    resp = rses.get(pipermail_url, stream=True)
-    if resp.content.startswith(b'\x1f\x8b'):
-        with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as uncompressed:
-            mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+    if pipermail_url[0] == '/':
+        with open(pipermail_url, 'rb') as fh:
+            if pipermail_url[-3:] == '.gz':
+                with gzip.GzipFile(fileobj=fh) as uncompressed:
+                    mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+            else:
+                mboxdata = fh.read().decode('utf-8', errors='replace')
     else:
-        mboxdata = resp.content.decode('utf-8', errors='replace')
+        logger.info('  grabbing %s', chunks[-1])
+        rses = get_requests_session()
+        # XXX: this can be horribly large
+        try:
+            resp = rses.get(pipermail_url, stream=True)
+            if resp.content.startswith(b'\x1f\x8b'):
+                with gzip.GzipFile(fileobj=io.BytesIO(resp.content)) as uncompressed:
+                    mboxdata = uncompressed.read().decode('utf-8', errors='replace')
+            else:
+                mboxdata = resp.content.decode('utf-8', errors='replace')
 
-    resp.close()
+            resp.close()
+        except EOFError:
+            logger.info('  corrupted month: %s, skipped', chunks[-1])
+            return
 
     # Pipermail does a nasty thing where it doesn't properly handle
     # lines in the body that start with "From ". First, we add ">" to
@@ -336,10 +396,13 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
     regex = r'(<[^>]+) at ([^>]+>)'
     subst = r'\1@\2'
     mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
-    regex = r'^>?(From:? \S+) at (\S+\..*)'
+    regex = r'(<[^>]+)\(a\)([^>]+>)'
+    subst = r'\1@\2'
+    mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
+    regex = r'^>?((?:From|To):? \S+) at (\S+\..*)'
     mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
     # Fix any remaining false From escapes
-    regex = r'^>(From\s+\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
+    regex = r'^>(From\s+\S+[@-]\S+\s+\w+\s+\w+\s+\d+\s+\d+:\d+:\d+\s+\d{4})'
     subst = r'\1'
     mboxdata = re.sub(regex, subst, mboxdata, 0, flags=re.M)
 
@@ -356,13 +419,18 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
             logger.info('    error parsing message %d, skipped', mkey)
             continue
 
-        fromline = str(msg.get('From', ''))
-        if fromline and fromline.find('(') > 0:
+        oldfrom = str(msg.get('From', ''))
+        if oldfrom:
+            newfrom = clean_header(oldfrom)
+            # Fix any leftover at-escaping
+            newfrom = newfrom.replace(' at ', '@')
             # Fix bogus From: foo@bar.baz (Foo Barski) -> Foo Barski <foo@bar.baz>
-            matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', fromline)
+            matches = re.search(r'(\S+@\S+\.\S+) \((.*)\)$', newfrom)
             if matches:
                 gr = matches.groups()
-                msg.replace_header('From', f'{gr[1]} <{gr[0]}>')
+                newfrom = f'{gr[1]} <{gr[0]}>'
+            if newfrom != oldfrom:
+                msg.replace_header('From', newfrom)
 
         if listid:
             msg['List-Id'] = f'<{listid}>'
@@ -372,7 +440,10 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
 
         if not msg.get('To'):
             msg['To'] = toaddr
-
+        # Fix in-reply-to
+        irt = msg.get('in-reply-to')
+        if irt and irt[0] != '<':
+            msg.replace_header('In-Reply-To', f'<{irt}>')
         add_msg_to_mbx(msg, mbx, checkspam)
 
     tmpmbx.close()
@@ -488,13 +559,19 @@ def get_mailman(args):
     if not args.to:
         args.to = args.listid.replace('.', '@', 1)
 
-    months = parse_pipermail_index(args.url)
-    if not months:
-        print('Could not find any .txt.gz files listed at %s' % args.url)
-        sys.exit(1)
     mbx = mailbox.mbox(args.out)
-    for month in months:
-        grab_pipermail_archive(month, mbx, args.listid, args.to, args.lookaside, args.checkspam)
+    if args.url[0] == '/':
+        grab_pipermail_archive(args.url, mbx, args.listid, args.to, args.lookaside, args.checkspam)
+    else:
+        if args.mailman3:
+            months = parse_hyperkitty_index(args.url)
+        else:
+            months = parse_pipermail_index(args.url)
+        if not months:
+            print('Could not find any .txt.gz files listed at %s' % args.url)
+            sys.exit(1)
+        for month in months:
+            grab_pipermail_archive(month, mbx, args.listid, args.to, args.lookaside, args.checkspam)
 
 
 def get_nntp(args):
@@ -565,6 +642,8 @@ if __name__ == '__main__':
                                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     sp_mm.add_argument('-u', '--url', required=True,
                        help='Mailman archive index URL')
+    sp_mm.add_argument('-3', '--mailman3', action='store_true', default=False,
+                       help='This is a mailman3 site')
     sp_mm.set_defaults(func=get_mailman)
 
     sp_marc = subparsers.add_parser('marcinfo', help='Collect marc.info archives',
