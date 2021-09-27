@@ -49,7 +49,7 @@ charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__ = '2.0'
 DB_VERSION = 1
-REST_API_VERSION = '1.1'
+REST_API_VERSION = '1.2'
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE = 100
@@ -532,9 +532,9 @@ def get_patchwork_hash(diff):
 
 
 def listify(obj):
-    if isinstance(obj, str):
-        return [obj]
-    return obj
+    if isinstance(obj, list):
+        return list(obj)
+    return [obj]
 
 
 def send_summary(serieslist, to_state, refname, pname, rs, hs):
@@ -816,8 +816,9 @@ def housekeeping(pname):
         series = dict()
         page = 0
         pagedata = list()
+        lastpage = False
         while True:
-            if not pagedata:
+            if not pagedata and not lastpage:
                 page += 1
                 logger.debug('  grabbing page %d', page)
                 params = [
@@ -838,8 +839,9 @@ def housekeeping(pname):
             s_date = entry.get('date')
             series_date = datetime.datetime.strptime(s_date, "%Y-%m-%dT%H:%M:%S")
             if series_date < cutoffdate:
+                lastpage = True
                 logger.debug('Went too far back, stopping at %s', series_date)
-                break
+                continue
 
             s_id = entry.get('id')
             s_name = entry.get('name')
@@ -1172,7 +1174,7 @@ def pwrun(repo, rsettings):
                     continue
 
                 # Do we have a matching hash on the server?
-                logger.info('Matching: %s', logline)
+                logger.debug('Matching: %s', logline)
                 # Theoretically, should only return one, but we play it safe and
                 # handle for multiple matches.
                 patch_ids = get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash)
@@ -1181,6 +1183,9 @@ def pwrun(repo, rsettings):
 
                 for patch_id in patch_ids:
                     pdata = rm.get_patch(patch_id)
+                    if not pdata:
+                        logger.debug('Ignoring patch_id=%d due to REST error', patch_id)
+                        continue
                     if pdata.get('state') not in fromstate:
                         logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
                         continue
