@@ -1052,13 +1052,6 @@ def pwrun(repo, rsettings):
         logger.info('Could not get the latest ref in %s', repo)
         sys.exit(1)
 
-    try:
-        lockfh = open(os.path.join(repo, '.pwrun.lock'), 'w')
-        lockf(lockfh, LOCK_EX | LOCK_NB)
-    except IOError:
-        logger.debug('Could not obtain an exclusive lock, assuming another process is running.')
-        return
-
     # Do we have a pw.db there yet?
     dbpath = os.path.join(repo, 'pw.db')
     db_exists = os.path.isfile(dbpath)
@@ -1288,7 +1281,14 @@ def pwrun(repo, rsettings):
 
 
 def check_repos():
-    # First, we run all repositories
+    # Use a global lock to make sure only a single process is running
+    try:
+        lockfh = open(os.path.join(CACHEDIR, 'patchwork-bot.global.lock'), 'w')
+        lockf(lockfh, LOCK_EX | LOCK_NB)
+    except IOError:
+        logger.info('Could not obtain an exclusive lock, assuming another process is running.')
+        sys.exit(0)
+
     for repo in CONFIG['repos']:
         fullpath = os.path.join(cmdargs.reposdir.rstrip('/'), repo.lstrip('/'))
         if not os.path.isdir(fullpath):
