@@ -269,7 +269,7 @@ def get_patchwork_pull_requests_by_project(rm, project, fromstate):
         pull_url = entry.get('pull_url')
         if pull_url:
             patch_id = entry.get('id')
-            logger.debug('Found pull request: %s (%s)', pull_url, patch_id)
+            logger.info('Found pull request: %s (%s)', pull_url, patch_id)
             chunks = pull_url.split()
             pull_host = chunks[0]
             if len(chunks) > 1:
@@ -1157,18 +1157,26 @@ def pwrun(repo, rsettings):
             revs = dict()
             for rev, logline, pwhash in hashpairs:
                 if have_prs and pwhash is None:
-                    matches = re.search(r'Merge\s(\S+)\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
-                    if not matches:
+                    if logline.contains(' of '):
+                        matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
+                        if not matches:
+                            continue
+                        m_refname = matches.group(1)
+                        m_host = matches.group(2)
+                    elif logline.contains('://'):
+                        matches = re.search(r'Merge\s(\w+://\S+)', logline)
+                        if not matches:
+                            continue
+                        m_refname = 'master'
+                        m_host = matches.group(1)
+                    else:
                         continue
-                    m_obj = matches.group(1)
-                    m_refname = matches.group(2)
-                    m_host = matches.group(3)
 
-                    logger.debug('Looking for %s %s %s', m_obj, m_refname, m_host)
+                    logger.debug('Looking for ref %s host %s', m_refname, m_host)
 
                     for pull_host, pull_refname, patch_id in prs:
                         if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
-                            logger.debug('Found matching pull request in %s (id: %s)', logline, patch_id)
+                            logger.info('Found matching pull request in %s (id: %s)', logline, patch_id)
                             revs[patch_id] = rev
                             break
                     continue
