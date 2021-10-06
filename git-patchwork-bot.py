@@ -445,7 +445,7 @@ def git_get_new_revs(gitdir, db_heads, git_heads, committers, merges=False):
             continue
 
         rev_range = '%s..%s' % (db_commit_id, git_commit_id)
-        args = ['log', '--pretty=%H:%ce:%s', '--reverse']
+        args = ['log', '--pretty=%H:%cn:%ce:%s', '--reverse']
         if not merges:
             args += ['--no-merges']
 
@@ -458,12 +458,16 @@ def git_get_new_revs(gitdir, db_heads, git_heads, committers, merges=False):
         revs = list()
 
         for line in lines:
-            (commit_id, committer, logmsg) = line.split(':', 2)
-            if committers and committer not in committers:
-                logger.debug('Skipping %s, committer=%s', commit_id, committer)
+            (commit_id, cn, ce, logmsg) = line.split(':', 3)
+            if committers and ce not in committers:
+                logger.debug('Skipping %s, ce=%s', commit_id, ce)
                 continue
+            if len(cn):
+                committer = '%s <%s>' % (cn, ce)
+            else:
+                committer = ce
             logger.debug('commit_id=%s, committer=%s, subject=%s', commit_id, committer, logmsg)
-            revs.append((commit_id, logmsg))
+            revs.append((commit_id, logmsg, committer))
 
         if revs:
             newrevs[refname] = revs
@@ -537,7 +541,7 @@ def listify(obj):
     return [obj]
 
 
-def send_summary(serieslist, to_state, refname, pname, rs, hs):
+def send_summary(serieslist, committers, to_state, refname, pname, rs, hs):
     logger.info('Preparing summary')
     # we send summaries by project, so the project name is going to be all the same
 
@@ -559,6 +563,9 @@ def send_summary(serieslist, to_state, refname, pname, rs, hs):
             summary.append('Series: %s' % sdata.get('name'))
 
         summary.append('  Submitter: %s <%s>' % (submitter.get('name'), submitter.get('email')))
+        pid = sdata.get('id')
+        if pid in committers:
+            summary.append('  Committer: %s' % committers[pid])
         summary.append('  Patchwork: %s' % sdata.get('web_url'))
 
         if sdata.get('cover_letter'):
@@ -635,7 +642,7 @@ def get_tweaks(pconfig, hconfig):
     return bubbled
 
 
-def notify_submitters(serieslist, refname, revs, pname, rs, hs):
+def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
     logger.info('Sending submitter notifications')
     project, rm, rpc, pconfig = project_by_name(pname)
 
@@ -725,8 +732,11 @@ def notify_submitters(serieslist, refname, revs, pname, rs, hs):
         summary = list()
         for patch in sdata.get('patches'):
             summary.append('  - %s' % patch.get('name'))
+            pid = patch.get('id')
+            if pid in committers:
+                summary.append('    applied by %s' % committers[pid])
             if 'commitlink' in rs:
-                summary.append('    %s' % (rs['commitlink'] % revs[patch.get('id')]))
+                summary.append('    %s' % (rs['commitlink'] % revs[pid]))
 
         bodytpt = Template(CONFIG['templates']['submitter'])
         params = {
@@ -1100,10 +1110,10 @@ def pwrun(repo, rsettings):
 
             rpwhashes[refname] = set()
             logger.debug('Looking at %s', refname)
-            for rev, logline in revlines:
+            for rev, logline, committer in revlines:
                 if logline.find('Merge') == 0 and logline.find('://') > 0:
                     have_prs = True
-                    rpwhashes[refname].add((rev, logline, None))
+                    rpwhashes[refname].add((rev, logline, committer, None))
                     continue
 
                 hits = rc.execute('SELECT patchwork_id, git_id FROM revs WHERE rev=?', (rev,)).fetchall()
@@ -1120,7 +1130,7 @@ def pwrun(repo, rsettings):
 
                 rgithashes[git_patch_id] = rev
                 if pwhash:
-                    rpwhashes[refname].add((rev, logline, pwhash))
+                    rpwhashes[refname].add((rev, logline, committer, pwhash))
 
         if not wantstates:
             wantstates = ['new', 'under-review']
@@ -1155,7 +1165,8 @@ def pwrun(repo, rsettings):
 
             # We create patch_id->rev mapping first
             revs = dict()
-            for rev, logline, pwhash in hashpairs:
+            committers = dict()
+            for rev, logline, committer, pwhash in hashpairs:
                 if have_prs and pwhash is None:
                     if logline.contains(' of '):
                         matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
@@ -1178,6 +1189,7 @@ def pwrun(repo, rsettings):
                         if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
                             logger.info('Found matching pull request in %s (id: %s)', logline, patch_id)
                             revs[patch_id] = rev
+                            committers[patch_id] = committer
                             break
                     continue
 
@@ -1198,6 +1210,7 @@ def pwrun(repo, rsettings):
                         logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
                         continue
                     revs[patch_id] = rev
+                    committers[patch_id] = committer
 
             # Now we iterate through it
             updated_series = list()
@@ -1258,9 +1271,9 @@ def pwrun(repo, rsettings):
                                 logger.info('  Updating (DRYRUN): %s', sname)
 
             if len(updated_series) and hsettings.get('send_summary', False):
-                send_summary(updated_series, to_state, refname, pname, rsettings, hsettings)
+                send_summary(updated_series, committers, to_state, refname, pname, rsettings, hsettings)
             if len(updated_series) and hsettings.get('notify_submitter', False):
-                notify_submitters(updated_series, refname, revs, pname, rsettings, hsettings)
+                notify_submitters(updated_series, committers, refname, revs, pname, rsettings, hsettings)
 
         if count:
             logger.info('Updated %d patches on %s', count, rm.server)
