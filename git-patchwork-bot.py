@@ -563,7 +563,7 @@ def send_summary(serieslist, committers, to_state, refname, pname, rs, hs):
             summary.append('Series: %s' % sdata.get('name'))
 
         summary.append('  Submitter: %s <%s>' % (submitter.get('name'), submitter.get('email')))
-        pid = sdata.get('id')
+        pid = patches[0].get('id')
         if pid in committers:
             summary.append('  Committer: %s' % committers[pid])
         summary.append('  Patchwork: %s' % sdata.get('web_url'))
@@ -581,6 +581,7 @@ def send_summary(serieslist, committers, to_state, refname, pname, rs, hs):
             for patch in patches[1:]:
                 count += 1
                 summary.append('             %s' % patch.get('name'))
+        summary.append('')
 
     bodytpt = Template(CONFIG['templates']['summary'])
     params = {
@@ -730,11 +731,11 @@ def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
                 qcount += 1
 
         summary = list()
-        for patch in sdata.get('patches'):
+        committer = 'unknown committer'
+        for patch in patches:
             summary.append('  - %s' % patch.get('name'))
             pid = patch.get('id')
-            if pid in committers:
-                summary.append('    applied by %s' % committers[pid])
+            committer = committers.get(pid, 'unknown committer')
             if 'commitlink' in rs:
                 summary.append('    %s' % (rs['commitlink'] % revs[pid]))
 
@@ -743,6 +744,7 @@ def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
             'reqtype': reqtype,
             'treename': rs['treename'],
             'refname': refname,
+            'committer': committer,
             'sentdate': str(headers.get('date')),
             'trimquote': '\n'.join(trimquote),
             'summary': '\n'.join(summary),
@@ -1161,13 +1163,13 @@ def pwrun(repo, rsettings):
             committers = dict()
             for rev, logline, committer, pwhash in hashpairs:
                 if have_prs and pwhash is None:
-                    if logline.contains(' of '):
+                    if logline.find(' of ') > 0:
                         matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
                         if not matches:
                             continue
                         m_refname = matches.group(1)
                         m_host = matches.group(2)
-                    elif logline.contains('://'):
+                    elif logline.find('://') > 0:
                         matches = re.search(r'Merge\s(\w+://\S+)', logline)
                         if not matches:
                             continue
@@ -1242,6 +1244,8 @@ def pwrun(repo, rsettings):
                                 logger.debug('Matched via git-patch-id')
                                 rev = rgithashes[spatch_hash]
                                 revs[spatch_id] = rev
+                                # same committer
+                                committers[spatch_id] = committers[patch_id]
 
                         if rev is None:
                             logger.debug('Could not produce precise match for %s', spatch_id)

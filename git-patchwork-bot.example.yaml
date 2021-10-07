@@ -142,7 +142,8 @@ templates:
   submitter: |
              Hello:
 
-             This ${reqtype} was applied to ${treename} (${refname}):
+             This ${reqtype} was applied to ${treename} (${refname})
+             by ${committer}:
 
              On ${sentdate} you wrote:
              ${trimquote}
