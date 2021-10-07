@@ -587,7 +587,7 @@ def send_summary(serieslist, committers, to_state, refname, pname, rs, hs):
     params = {
         'newstate': to_state,
         'treename': rs['treename'],
-        'refname': refname,
+        'refname': refname.replace('refs/heads/', '', 1),
         'summary': '\n'.join(summary),
         'total': count,
         'signature': CONFIG['templates']['signature'],
@@ -743,7 +743,7 @@ def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
         params = {
             'reqtype': reqtype,
             'treename': rs['treename'],
-            'refname': refname,
+            'refname': refname.replace('refs/heads/', '', 1),
             'committer': committer,
             'sentdate': str(headers.get('date')),
             'trimquote': '\n'.join(trimquote),
