@@ -1325,7 +1325,7 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--verbose', action='store_true', default=False,
                         help='Be more verbose in logging output')
     parser.add_argument('-k', '--housekeeping', action='store_true', default=False,
-                        help='Perform a housekeeping run')
+                        help='Perform a housekeeping run (supersede, archive)')
     parser.add_argument('--cachedir', default=None,
                         help='Cache directory to use instead of ~/.cache/git-patchwork-bot')
     parser.add_argument('--domain', default=None,
