@@ -1375,6 +1375,9 @@ if __name__ == '__main__':
         cfgyaml = fh.read()
     CONFIG = ruamel.yaml.safe_load(cfgyaml)
 
+    if not os.path.isdir(CACHEDIR):
+        os.makedirs(CACHEDIR, exist_ok=True)
+
     if cmdargs.housekeeping:
         for _pserver, _sconfig in CONFIG['patchworks'].items():
             for _pname in _sconfig['projects']:
