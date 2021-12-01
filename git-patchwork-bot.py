@@ -1054,8 +1054,28 @@ def pwrun(repo, rsettings):
         logger.info('Could not get the latest ref in %s', repo)
         sys.exit(1)
 
+    dbpath = repo
+    # If we're aimed at a worktree, move up from the ".git" file to
+    # the worktree directory.
+    if not os.path.isdir(dbpath):
+        gitdir = open(dbpath).readline().strip()
+        if not gitdir.startswith('gitdir: '):
+            logger.info('Could not find git tree in %s', dbpath)
+            sys.exit(1)
+        gitdir = gitdir.split(' ', 1)[1]
+        gitdir, worktree = os.path.split(gitdir)
+        gitdir, category = os.path.split(gitdir)
+        if category != "worktrees":
+            logger.info('Could not find git worktree in %s', dbpath)
+            sys.exit(1)
+        # To store multiple pw.db files in a single .git directory,
+        # add a suffix based on the repo treename.
+        treename = rsettings.get('treename').replace('/', '_')
+        dbpath = os.path.join(gitdir, f'pw-{treename}.db')
+    else:
+        dbpath = os.path.join(dbpath, 'pw.db')
+
     # Do we have a pw.db there yet?
-    dbpath = os.path.join(repo, 'pw.db')
     db_exists = os.path.isfile(dbpath)
     dbconn = sqlite3.connect(dbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
     c = dbconn.cursor()
@@ -1295,10 +1315,13 @@ def check_repos():
 
     for repo in CONFIG['repos']:
         fullpath = os.path.join(cmdargs.reposdir.rstrip('/'), repo.lstrip('/'))
-        if not os.path.isdir(fullpath):
+        if not os.path.exists(fullpath):
             logger.info('Repository not found: %s', repo)
             continue
         settings = CONFIG['repos'][repo]
+        if not os.path.isdir(fullpath) and settings.get('branch', None) == None:
+            logger.info('Worktree must specify "branch" setting: %s', repo)
+            continue
         logger.info('Processing: %s', repo)
         pwrun(fullpath, settings)
 
