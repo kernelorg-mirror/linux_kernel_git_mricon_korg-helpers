@@ -52,6 +52,8 @@ repos:
   'pub/scm/linux/kernel/git/khilman/linux-amlogic.git':
     # For the notification emails
     treename: 'khilman/linux-amlogic.git'
+    # Optional: limit checking to a single branch (instead of --heads)
+    #branch: 'origin/master'
     # For the notification emails, must include %s
     commitlink: 'https://git.kernel.org/khilman/linux-amlogic/c/%.12s'
     # Only notify for commits where committer email exactly matches one

@@ -409,9 +409,9 @@ def git_run_command(gitdir, args, stdin=None):
     return output
 
 
-def git_get_repo_heads(gitdir):
+def git_get_repo_heads(gitdir, branch):
     refs = list()
-    lines = git_get_command_lines(gitdir, ['show-ref', '--heads'])
+    lines = git_get_command_lines(gitdir, ['show-ref', branch])
     if lines is not None:
         for line in lines:
             (commit_id, refname) = line.split()
@@ -1049,7 +1049,7 @@ def housekeeping(pname):
 
 
 def pwrun(repo, rsettings):
-    git_heads = git_get_repo_heads(repo)
+    git_heads = git_get_repo_heads(repo, branch=rsettings.get('branch', '--heads'))
     if not git_heads:
         logger.info('Could not get the latest ref in %s', repo)
         sys.exit(1)
