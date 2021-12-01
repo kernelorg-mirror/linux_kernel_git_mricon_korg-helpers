@@ -409,13 +409,17 @@ def git_run_command(gitdir, args, stdin=None):
     return output
 
 
-def git_get_repo_heads(gitdir, branch):
+def git_get_repo_heads(gitdir, branch, ancestry=None):
     refs = list()
     lines = git_get_command_lines(gitdir, ['show-ref', branch])
+    if ancestry == None:
+        ancestry = ''
+    else:
+        ancestry = f'~{ancestry}'
     if lines is not None:
         for line in lines:
             (commit_id, refname) = line.split()
-            refs.append((refname, commit_id))
+            refs.append((refname, commit_id + ancestry))
     return refs
 
 
@@ -1082,7 +1086,9 @@ def pwrun(repo, rsettings):
 
     if not db_exists:
         db_init_pw_sqlite_db(c)
-        db_save_repo_heads(c, git_heads)
+        initial_git_heads = git_get_repo_heads(repo, branch=rsettings.get('branch', '--heads'),
+                                               ancestry=cmdargs.ancestors)
+        db_save_repo_heads(c, initial_git_heads)
         # Exit early
         dbconn.commit()
         return
@@ -1353,6 +1359,8 @@ if __name__ == '__main__':
                         help='Cache directory to use instead of ~/.cache/git-patchwork-bot')
     parser.add_argument('--domain', default=None,
                         help='Domain to use when creating message-ids')
+    parser.add_argument('--ancestors', default=None,
+                        help='During initial database creation, consider this many ancestor commits as fresh')
 
     cmdargs = parser.parse_args()
 
