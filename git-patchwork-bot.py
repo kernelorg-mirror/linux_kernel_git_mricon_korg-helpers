@@ -528,7 +528,9 @@ def get_patchwork_hash(diff):
             line_nos = list(map(fn, hunk_match.groups()))
             line = '@@ -%d +%d @@' % tuple(line_nos)
         elif line[0] in prefixes:
-            # if we have a +, - or context line, leave as-is
+            # if we have a +, - or context line, leave as-is, except blank lines
+            if line == ' ':
+                continue
             pass
         else:
             # other lines are ignored
