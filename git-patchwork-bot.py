@@ -1363,6 +1363,8 @@ if __name__ == '__main__':
                         help='Domain to use when creating message-ids')
     parser.add_argument('--ancestors', default=None,
                         help='During initial database creation, consider this many ancestor commits as fresh')
+    parser.add_argument('--pwhash', default=None, type=int, metavar='PATCH-ID',
+                        help='Debug pwhash mismatches. Compare patchwork hash of diff from stdin to patch id')
 
     cmdargs = parser.parse_args()
 
@@ -1410,6 +1412,24 @@ if __name__ == '__main__':
 
     if not os.path.isdir(CACHEDIR):
         os.makedirs(CACHEDIR, exist_ok=True)
+
+    if cmdargs.pwhash:
+        diff = sys.stdin.read()
+        pwhash = get_patchwork_hash(diff)
+        print(pwhash)
+        for pw in CONFIG['patchworks']:
+            print(f"Patchwork: {pw}")
+            for pname, psettings in CONFIG['patchworks'][pw]['projects'].items():
+                print(f"Project: {pname}")
+                project, rm, rpc, pconfig = project_by_name(pname)
+                project_id = project['id']
+                print(get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash))
+                print('-------')
+                p = rm.get_patch(cmdargs.pwhash)
+                pwdiff = p.get('diff')
+                print(pwdiff)
+                print(get_patchwork_hash(pwdiff))
+        sys.exit(0)
 
     if cmdargs.housekeeping:
         for _pserver, _sconfig in CONFIG['patchworks'].items():
