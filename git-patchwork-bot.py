@@ -26,7 +26,6 @@ import hashlib
 import re
 import requests
 import datetime
-import netrc
 
 import ruamel.yaml # noqa
 
@@ -40,8 +39,6 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
 from string import Template
-
-import xmlrpc.client as xmlrpclib
 
 # Send all email 8-bit, this is not 1999
 from email import charset
@@ -68,45 +65,6 @@ _server_cache = dict()
 logger = logging.getLogger('gitpwcron')
 
 
-# Lifted from patchwork pwclient
-class Transport(xmlrpclib.SafeTransport):
-
-    def __init__(self, url):
-        xmlrpclib.SafeTransport.__init__(self)
-        self.credentials = None
-        self.host = None
-        self.proxy = None
-        self.scheme = url.split('://', 1)[0]
-        self.https = url.startswith('https')
-        if self.https:
-            self.proxy = os.environ.get('https_proxy')
-        else:
-            self.proxy = os.environ.get('http_proxy')
-        if self.proxy:
-            self.https = self.proxy.startswith('https')
-
-    def make_connection(self, host):
-        self.host = host
-        if self.proxy:
-            host = self.proxy.split('://', 1)[-1].rstrip('/')
-        try:
-            nc = netrc.netrc()
-            auths = nc.authenticators(host)
-            if auths:
-                login, account, password = auths
-                host = f'{login}:{password}@{host}'
-        except FileNotFoundError:
-            pass
-        if self.https:
-            return xmlrpclib.SafeTransport.make_connection(self, host)
-        else:
-            return xmlrpclib.Transport.make_connection(self, host)
-
-    def send_request(self, host, handler, request_body, debug):
-        handler = '%s://%s%s' % (self.scheme, host, handler)
-        return xmlrpclib.Transport.send_request(self, host, handler, request_body, debug)
-
-
 class Restmaker:
     def __init__(self, server):
         self.server = server
@@ -115,6 +73,7 @@ class Restmaker:
         self.series_url = '/'.join((self.url, 'series'))
         self.patches_url = '/'.join((self.url, 'patches'))
         self.covers_url = '/'.join((self.url, 'covers'))
+        self.projects_url = '/'.join((self.url, 'projects'))
 
         # Simple local cache
         self._patches = dict()
@@ -131,6 +90,28 @@ class Restmaker:
         if apitoken:
             headers['Authorization'] = f'Token {apitoken}'
         self.session.headers.update(headers)
+
+    def get_unpaginated(self, url, params):
+        # Caller should catch RequestException
+        page = 0
+        results = list()
+        params.append(('per_page', REST_PER_PAGE))
+        _page_params = list(params)
+        while True:
+            page += 1
+            logger.debug('Processing page %s', page)
+            _params = list(params) + [('page', page)]
+            logger.debug('Performing query: url=%s, params=%s', url, _params)
+            rsp = self.session.get(url, params=_params, stream=False)
+            rsp.raise_for_status()
+            pagedata = rsp.json()
+            if not pagedata:
+                break
+            results.extend(pagedata)
+            if len(pagedata) < REST_PER_PAGE:
+                break
+
+        return results
 
     def get_cover(self, cover_id):
         try:
@@ -172,27 +153,39 @@ class Restmaker:
 
         return rsp.json()
 
-    def get_patch_list(self, params):
+    def get_patches_list(self, params, unpaginated=True):
         try:
-            logger.debug('Grabbing patch list with params=%s', params)
-            rsp = self.session.get(self.patches_url, params=params, stream=False)
-            rsp.raise_for_status()
+            if unpaginated:
+                return self.get_unpaginated(self.patches_url, params)
+            else:
+                rsp = self.session.get(self.patches_url, params=params, stream=False)
+                rsp.raise_for_status()
+                return rsp.json()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
-            return None
 
-        return rsp.json()
+        return None
 
-    def get_series_list(self, params):
+    def get_series_list(self, params, unpaginated=True):
         try:
-            logger.debug('Grabbing series with params=%s', params)
-            rsp = self.session.get(self.series_url, params=params, stream=False)
-            rsp.raise_for_status()
+            if unpaginated:
+                return self.get_unpaginated(self.series_url, params)
+            else:
+                rsp = self.session.get(self.series_url, params=params, stream=False)
+                rsp.raise_for_status()
+                return rsp.json()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
-            return None
 
-        return rsp.json()
+        return None
+
+    def get_projects_list(self, params):
+        try:
+            return self.get_unpaginated(self.projects_url, params)
+        except requests.exceptions.RequestException as ex:
+            logger.info('REST error: %s', ex)
+
+        return None
 
     def update_patch(self, patch_id, state=None, archived=False, commit_ref=None):
         # Clear it out of the cache
@@ -223,14 +216,14 @@ class Restmaker:
         return rsp.json()
 
 
-def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
+def get_patchwork_patches_by_project_hash(rm, project, pwhash):
     logger.debug('Looking up %s', pwhash)
-    try:
-        patches = rpc.patch_list({'project_id': project_id, 'hash': pwhash, 'archived': False})
-    except xmlrpclib.Fault as ex:
-        logger.debug('Got a Fault: %s', ex.faultString)
-        return None
-
+    params = [
+        ('project', project),
+        ('archived', 'false'),
+        ('hash', pwhash),
+    ]
+    patches = rm.get_patches_list(params)
     if not patches:
         logger.debug('No match for hash=%s', pwhash)
         return None
@@ -239,33 +232,18 @@ def get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash):
 
 
 def get_patchwork_pull_requests_by_project(rm, project, fromstate):
-    page = 0
-    pagedata = list()
+    params = [
+        ('project', project),
+        ('archived', 'false'),
+        ('state', fromstate),
+        ('order', '-date'),
+        ('q', 'PULL'),
+    ]
     prs = set()
-    more = True
-    while True:
-        if not pagedata and more:
-            page += 1
-            params = [
-                ('project', project),
-                ('archived', 'false'),
-                ('state', fromstate),
-                ('order', '-date'),
-                ('page', page),
-                ('q', 'PULL'),
-                ('per_page', REST_PER_PAGE),
-            ]
-            logger.debug('Processing page %s', page)
-
-            pagedata = rm.get_patch_list(params)
-            if not pagedata or len(pagedata) < REST_PER_PAGE:
-                more = False
-
-        if not pagedata:
-            logger.debug('Finished processing all patches')
-            break
-
-        entry = pagedata.pop()
+    results = rm.get_patches_list(params)
+    if not results:
+        return prs
+    for entry in results:
         pull_url = entry.get('pull_url')
         if pull_url:
             patch_id = entry.get('id')
@@ -305,25 +283,21 @@ def project_by_name(pname):
         if server not in _server_cache:
             rm = Restmaker(server)
             _project_cache[server] = dict()
-            url = '%s/xmlrpc/' % server
-            transport = Transport(url)
-
-            try:
-                rpc = xmlrpclib.Server(url, transport=transport)
-            except (IOError, OSError):
-                logger.info('Unable to connect to %s', url)
+            params = list()
+            plist = rm.get_projects_list(params)
+            if not plist:
+                logger.info('Unable to get project list on %s', server)
                 sys.exit(1)
 
-            plist = rpc.project_list('', 0)
-            _server_cache[server] = (rm, rpc, plist)
+            _server_cache[server] = (rm, plist)
         else:
-            rm, rpc, plist = _server_cache[server]
+            rm, plist = _server_cache[server]
 
         found = False
         for project in plist:
-            if project['linkname'].lower().startswith(pname.lower()):
+            if project['link_name'].lower().startswith(pname.lower()):
                 logger.debug('project lookup: linkname=%s, server=%s, id=%d', pname, server, project['id'])
-                _project_cache[pname] = (project, rm, rpc, pconfig)
+                _project_cache[pname] = (project, rm, pconfig)
                 found = True
                 break
         if not found:
@@ -412,7 +386,7 @@ def git_run_command(gitdir, args, stdin=None):
 def git_get_repo_heads(gitdir, branch, ancestry=None):
     refs = list()
     lines = git_get_command_lines(gitdir, ['show-ref', branch])
-    if ancestry == None:
+    if ancestry is None:
         ancestry = ''
     else:
         ancestry = f'~{ancestry}'
@@ -600,7 +574,7 @@ def send_summary(serieslist, committers, to_state, refname, pname, rs, hs):
     }
     body = bodytpt.safe_substitute(params)
 
-    project, rm, rpc, pconfig = project_by_name(pname)
+    project, rm, pconfig = project_by_name(pname)
     tweaks = get_tweaks(pconfig, hs)
 
     msg = MIMEText(body, _charset='utf-8')
@@ -651,7 +625,7 @@ def get_tweaks(pconfig, hconfig):
 
 def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
     logger.info('Sending submitter notifications')
-    project, rm, rpc, pconfig = project_by_name(pname)
+    project, rm, pconfig = project_by_name(pname)
 
     tweaks = get_tweaks(pconfig, hs)
 
@@ -811,7 +785,7 @@ def notify_submitters(serieslist, committers, refname, revs, pname, rs, hs):
 
 
 def housekeeping(pname):
-    project, rm, rpc, pconfig = project_by_name(pname)
+    project, rm, pconfig = project_by_name(pname)
     if 'housekeeping' not in pconfig:
         return
 
@@ -845,7 +819,8 @@ def housekeeping(pname):
                     ('page', page),
                     ('per_page', REST_PER_PAGE)
                 ]
-                pagedata = rm.get_series_list(params)
+                # we do our own pagination
+                pagedata = rm.get_series_list(params, unpaginated=False)
 
             if not pagedata:
                 # Got them all?
@@ -974,11 +949,12 @@ def housekeeping(pname):
                 if DRYRUN:
                     # We don't need pagination if we're not in dryrun, because
                     # once we archive the patches, they don't show up in this
-                    # query any more.
+                    # query any longer.
                     page += 1
                     params.append(('page', page))
 
-                pagedata = rm.get_patch_list(params)
+                # we do our own pagination
+                pagedata = rm.get_patches_list(params, unpaginated=False)
 
             if not pagedata:
                 logger.debug('Finished processing all patches')
@@ -1161,7 +1137,7 @@ def pwrun(repo, rsettings):
         logger.debug('wantstates=%s', wantstates)
 
         logger.info(' project : %s', pname)
-        project, rm, rpc, pconfig = project_by_name(pname)
+        project, rm, pconfig = project_by_name(pname)
         project_id = project['id']
 
         if have_prs:
@@ -1220,7 +1196,7 @@ def pwrun(repo, rsettings):
                 logger.debug('Matching: %s', logline)
                 # Theoretically, should only return one, but we play it safe and
                 # handle for multiple matches.
-                patch_ids = get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash)
+                patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, pwhash)
                 if not patch_ids:
                     continue
 
@@ -1327,11 +1303,29 @@ def check_repos():
             logger.info('Repository not found: %s', repo)
             continue
         settings = CONFIG['repos'][repo]
-        if not os.path.isdir(fullpath) and settings.get('branch', None) == None:
+        if not os.path.isdir(fullpath) and not settings.get('branch'):
             logger.info('Worktree must specify "branch" setting: %s', repo)
             continue
         logger.info('Processing: %s', repo)
         pwrun(fullpath, settings)
+
+
+def pwhash_differ():
+    diff = sys.stdin.read()
+    pwhash = get_patchwork_hash(diff)
+    print(pwhash)
+    for pw in CONFIG['patchworks']:
+        print(f"Patchwork: {pw}")
+        for pname, psettings in CONFIG['patchworks'][pw]['projects'].items():
+            print(f"Project: {pname}")
+            project, rm, pconfig = project_by_name(pname)
+            project_id = project['id']
+            print(get_patchwork_patches_by_project_hash(rm, project_id, pwhash))
+            print('-------')
+            p = rm.get_patch(cmdargs.pwhash)
+            pwdiff = p.get('diff')
+            print(pwdiff)
+            print(get_patchwork_hash(pwdiff))
 
 
 if __name__ == '__main__':
@@ -1414,21 +1408,7 @@ if __name__ == '__main__':
         os.makedirs(CACHEDIR, exist_ok=True)
 
     if cmdargs.pwhash:
-        diff = sys.stdin.read()
-        pwhash = get_patchwork_hash(diff)
-        print(pwhash)
-        for pw in CONFIG['patchworks']:
-            print(f"Patchwork: {pw}")
-            for pname, psettings in CONFIG['patchworks'][pw]['projects'].items():
-                print(f"Project: {pname}")
-                project, rm, rpc, pconfig = project_by_name(pname)
-                project_id = project['id']
-                print(get_patchwork_patches_by_project_id_hash(rpc, project_id, pwhash))
-                print('-------')
-                p = rm.get_patch(cmdargs.pwhash)
-                pwdiff = p.get('diff')
-                print(pwdiff)
-                print(get_patchwork_hash(pwdiff))
+        pwhash_differ()
         sys.exit(0)
 
     if cmdargs.housekeeping:
