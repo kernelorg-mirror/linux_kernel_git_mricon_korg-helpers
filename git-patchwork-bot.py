@@ -96,8 +96,10 @@ class Restmaker:
             'User-Agent': f'git-patchwork-bot/{__VERSION__}',
         }
         apitoken = CONFIG['patchworks'][server].get('apitoken', None)
-        if apitoken:
-            headers['Authorization'] = f'Token {apitoken}'
+        if not apitoken:
+            logger.critical('We require an apitoken for anything to work')
+            sys.exit(1)
+        headers['Authorization'] = f'Token {apitoken}'
         self.session.headers.update(headers)
 
     def get_unpaginated(self, url: str, params: list) -> List[dict]:
@@ -1377,6 +1379,8 @@ if __name__ == '__main__':
                         help='During initial database creation, consider this many ancestor commits as fresh')
     parser.add_argument('--pwhash', default=None, type=int, metavar='PATCH-ID',
                         help='Debug pwhash mismatches. Compare patchwork hash of diff from stdin to patch id')
+    parser.add_argument('--tokens-file', default=None,
+                        help='Separate configuration file containing just API tokens')
 
     cmdargs = parser.parse_args()
 
@@ -1421,6 +1425,15 @@ if __name__ == '__main__':
     with open(cmdargs.cfgfile, 'r') as fh:
         cfgyaml = fh.read()
     CONFIG = ruamel.yaml.safe_load(cfgyaml)
+
+    if cmdargs.tokens_file:
+        with open(cmdargs.tokens_file, 'r') as fh:
+            tkyaml = fh.read()
+        tks = ruamel.yaml.safe_load(tkyaml)
+        for _pserver, _sconfig in tks['patchworks'].items():
+            if _pserver in CONFIG['patchworks']:
+                logger.debug('Taking apitoken info for %s from %s', _pserver, cmdargs.tokens_file)
+                CONFIG['patchworks'][_pserver]['apitoken'] = _sconfig.get('apitoken')
 
     if not os.path.isdir(CACHEDIR):
         os.makedirs(CACHEDIR, exist_ok=True)

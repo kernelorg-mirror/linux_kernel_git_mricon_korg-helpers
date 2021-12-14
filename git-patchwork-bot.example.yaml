@@ -2,8 +2,10 @@
 patchworks:
   # Entries are full URLs to the patchwork server toplevel
   'https://patchwork.kernel.org':
-    # You can use an API token, or you can add username/password
-    # to the $HOME/.netrc file
+    # You can comment 'apitoken' out and pass a --tokens-file option, which is a separate yaml file
+    # containing just the api tokens. The format is the same as this file, but everything other
+    # than patchworks->[url]->apitoken is ignored. This allows splitting secrets from logic
+    # in order to share configuration with others.
     apitoken: 'your-api-token'
     projects:
       # URL subpath name of the project
