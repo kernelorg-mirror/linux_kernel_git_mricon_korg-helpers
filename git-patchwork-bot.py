@@ -48,6 +48,7 @@ charset.add_charset('utf-8', charset.SHORTEST)
 __VERSION__ = '2.0'
 DB_VERSION = 1
 REST_API_VERSION = '1.2'
+LORE_RE = re.compile(r'^\s*Link:\s+\S+://(?:lore|lkml)\.kernel\.org\S*/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
 HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE = 100
@@ -62,6 +63,7 @@ CACHEDIR = os.path.expanduser('~/.cache/git-patchwork-bot')
 
 _project_cache = dict()
 _server_cache = dict()
+_rev_cache = dict()
 
 logger = logging.getLogger('gitpwcron')
 
@@ -226,7 +228,7 @@ class Restmaker:
 
 
 def get_patchwork_patches_by_project_hash(rm: Restmaker, project: int, pwhash: str) -> List[int]:
-    logger.debug('Looking up %s', pwhash)
+    logger.debug('Looking up hash=%s', pwhash)
     params = [
         ('project', project),
         ('archived', 'false'),
@@ -235,6 +237,21 @@ def get_patchwork_patches_by_project_hash(rm: Restmaker, project: int, pwhash: s
     patches = rm.get_patches_list(params)
     if not patches:
         logger.debug('No match for hash=%s', pwhash)
+        return list()
+
+    return [patch['id'] for patch in patches]
+
+
+def get_patchwork_patches_by_project_msgid(rm: Restmaker, project: int, msgid: str) -> List[int]:
+    logger.debug('Looking up msgid=%s', msgid)
+    params = [
+        ('project', project),
+        ('archived', 'false'),
+        ('msgid', msgid),
+    ]
+    patches = rm.get_patches_list(params)
+    if not patches:
+        logger.debug('No match for msgid=%s', msgid)
         return list()
 
     return [patch['id'] for patch in patches]
@@ -336,19 +353,6 @@ def db_init_common_sqlite_db(c: sqlite3.Cursor) -> None:
             version INTEGER
         )''')
     db_save_meta(c)
-
-
-def db_init_cache_sqlite_db(c: sqlite3.Cursor) -> None:
-    logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
-    db_init_common_sqlite_db(c)
-    c.execute('''
-        CREATE TABLE revs (
-            rev TEXT NOT NULL,
-            patchwork_id TEXT NOT NULL,
-            git_id TEXT NOT NULL,
-            created DATE
-        )''')
-    c.execute('''CREATE UNIQUE INDEX idx_rev ON revs(rev)''')
 
 
 def db_init_pw_sqlite_db(c: sqlite3.Cursor) -> None:
@@ -462,8 +466,8 @@ def git_get_new_revs(gitdir: str, db_heads: List[Tuple[str, str]], git_heads: Li
     return newrevs
 
 
-def git_get_rev_diff(gitdir: str, rev: str) -> str:
-    args = ['diff', '%s~..%s' % (rev, rev)]
+def git_get_rev_info(gitdir: str, rev: str) -> str:
+    args = ['show', rev]
     return git_run_command(gitdir, args)
 
 
@@ -528,8 +532,8 @@ def listify(obj: Union[str, list, None]) -> list:
     return [obj]
 
 
-def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: str, refname: str, pname: str,
-                 rs: Dict[str, str], hs: Dict[str, str]) -> str:
+def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: str, refname: str, revs: Dict[int, str],
+                 pname: str, rs: Dict[str, str], hs: Dict[str, str]) -> str:
     logger.info('Preparing summary')
     # we send summaries by project, so the project name is going to be all the same
 
@@ -567,8 +571,10 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
         if len(patches) > 1:
             summary.append('    Patches: %s' % patches[0].get('name'))
             for patch in patches[1:]:
-                count += 1
-                summary.append('             %s' % patch.get('name'))
+                pid = patch.get('id')
+                if pid in revs:
+                    count += 1
+                    summary.append('             %s' % patch.get('name'))
         summary.append('')
 
     bodytpt = Template(CONFIG['templates']['summary'])
@@ -733,9 +739,12 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
         for patch in patches:
             summary.append('  - %s' % patch.get('name'))
             pid = patch.get('id')
-            committer = committers.get(pid, 'unknown committer')
-            if 'commitlink' in rs:
-                summary.append('    %s' % (rs['commitlink'] % revs[pid]))
+            if pid in revs:
+                committer = committers.get(pid, 'unknown committer')
+                if 'commitlink' in rs:
+                    summary.append('    %s' % (rs['commitlink'] % revs[pid]))
+            else:
+                summary.append('    (no matching commit)')
 
         bodytpt = Template(CONFIG['templates']['submitter'])
         params = {
@@ -1049,6 +1058,8 @@ def housekeeping(pname: str) -> None:
 
 
 def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
+    global _rev_cache
+
     git_heads = git_get_repo_heads(repo, branch=rsettings.get('branch', '--heads'))
     if not git_heads:
         logger.info('Could not get the latest ref in %s', repo)
@@ -1097,20 +1108,11 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
         logger.debug('No new revs in %s', repo)
         return
 
-    rcdbpath = os.path.join(CACHEDIR, 'revcache.db')
-    rcdb_exists = os.path.isfile(rcdbpath)
-    rcdbconn = sqlite3.connect(rcdbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-    rc = rcdbconn.cursor()
-
-    if not rcdb_exists:
-        db_init_cache_sqlite_db(rc)
-    else:
-        rc.execute('''DELETE FROM revs WHERE created > datetime('now', ?)''', ('-30 days',))
+    logger.info('Processing: %s', repo)
 
     count = 0
     for pname, psettings in rsettings['projects'].items():
         rpwhashes = dict()
-        rgithashes = dict()
         wantstates = list()
         have_prs = False
         for refname, revlines in newrevs.items():
@@ -1126,28 +1128,28 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
                 continue
 
             rpwhashes[refname] = set()
-            logger.debug('Looking at %s', refname)
             for rev, logline, committer in revlines:
                 if logline.find('Merge') == 0 and logline.find('://') > 0:
                     have_prs = True
-                    rpwhashes[refname].add((rev, logline, committer, None))
+                    rpwhashes[refname].add((rev, logline, committer, None, None))
                     continue
 
-                hits = rc.execute('SELECT patchwork_id, git_id FROM revs WHERE rev=?', (rev,)).fetchall()
-                if not hits:
-                    diff = git_get_rev_diff(repo, rev)
-                    pwhash = get_patchwork_hash(diff)
-                    git_patch_id = git_get_patch_id(diff)
-                    if pwhash and git_patch_id:
-                        rc.execute('''INSERT INTO revs
-                                      VALUES (?, ?, ?, datetime('now'))''', (rev, pwhash, git_patch_id))
-                else:
-                    pwhash = hits[0][0]
-                    git_patch_id = hits[0][1]
+                if rev not in _rev_cache:
+                    info = git_get_rev_info(repo, rev)
+                    pwhash = get_patchwork_hash(info)
+                    if not pwhash:
+                        # Theoretically, should never happen?
+                        logger.debug('Skipping %s (no pwhash)', rev)
+                        continue
+                    msgid = None
+                    if info.find('Link:') > 0:
+                        lore_match = LORE_RE.search(info)
+                        if lore_match:
+                            msgid = lore_match.group(1)
+                            logger.debug('Msgid for %s: %s', rev, msgid)
+                    _rev_cache[rev] = (rev, logline, committer, pwhash, msgid)
 
-                rgithashes[git_patch_id] = rev
-                if pwhash:
-                    rpwhashes[refname].add((rev, logline, committer, pwhash))
+                rpwhashes[refname].add(_rev_cache[rev])
 
         if not wantstates:
             wantstates = ['new', 'under-review']
@@ -1159,14 +1161,14 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
         project_id = project['id']
 
         if have_prs:
-            logger.info('PR merge commit found, loading up pull requests')
+            logger.info('  PR merge commit found, loading up pull requests')
             # Find all from states we're interested in
             prs = get_patchwork_pull_requests_by_project(rm, project_id, wantstates)
         else:
             prs = set()
 
         for refname, hashpairs in rpwhashes.items():
-            logger.info('Analyzing %d revisions in %s', len(hashpairs), refname)
+            logger.info('  Analyzing %d revisions in %s', len(hashpairs), refname)
             # Get our settings
             hsettings = None
             for wanthead, hsettings in psettings.items():
@@ -1183,7 +1185,7 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
             # We create patch_id->rev mapping first
             revs = dict()
             committers = dict()
-            for rev, logline, committer, pwhash in hashpairs:
+            for rev, logline, committer, pwhash, msgid in hashpairs:
                 if have_prs and pwhash is None:
                     if logline.find(' of ') > 0:
                         matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
@@ -1204,27 +1206,31 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
 
                     for pull_host, pull_refname, patch_id in prs:
                         if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
-                            logger.info('Found matching pull request in %s (id: %s)', logline, patch_id)
+                            logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
                             revs[patch_id] = rev
                             committers[patch_id] = committer
                             break
                     continue
 
                 # Do we have a matching hash on the server?
-                logger.debug('Matching: %s', logline)
-                # Theoretically, should only return one, but we play it safe and
-                # handle for multiple matches.
+                logger.info('  Matching by hash: %s (%s)', pwhash, logline)
                 patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, pwhash)
+                if not patch_ids and msgid:
+                    # Match by message-id, if we have it
+                    logger.info('  Matching by msgid: %s (%s)', msgid, logline)
+                    patch_ids = get_patchwork_patches_by_project_msgid(rm, project_id, msgid)
                 if not patch_ids:
+                    logger.info('    No match for: %s', logline)
                     continue
 
                 for patch_id in patch_ids:
+                    logger.info('   Matched: %s', patch_id)
                     pdata = rm.get_patch(patch_id)
                     if not pdata:
-                        logger.debug('Ignoring patch_id=%d due to REST error', patch_id)
+                        logger.info('   Ignoring due to REST error')
                         continue
                     if pdata.get('state') not in fromstate:
-                        logger.debug('Ignoring patch_id=%d due to state=%s', patch_id, pdata.get('state'))
+                        logger.info('   Ignoring due to state=%s', pdata.get('state'))
                         continue
                     revs[patch_id] = rev
                     committers[patch_id] = committer
@@ -1233,49 +1239,29 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
             updated_series = list()
             done_patches = set()
             for patch_id in list(revs.keys()):
+                logger.info('   Processing: %s', patch_id)
                 if patch_id in done_patches:
                     # we've already updated this series
-                    logger.debug('Already applied %d as part of previous series', patch_id)
+                    logger.info('    Already applied as part of previous series')
                     continue
                 pdata = rm.get_patch(patch_id)
                 serieslist = pdata.get('series', None)
                 if not serieslist:
                     # This is probably from the time before patchwork-2 migration.
                     # We'll just ignore those.
-                    logger.debug('A patch without an associated series? Woah.')
+                    logger.info('    A patch without an associated series? Woah.')
                     continue
 
                 for series in serieslist:
                     series_id = series.get('id')
                     sdata = rm.get_series(series_id)
-                    if not sdata.get('received_all'):
-                        logger.debug('Series %d is incomplete, skipping', series_id)
-                        continue
                     update_queue = list()
                     for spatch in sdata.get('patches'):
                         spatch_id = spatch.get('id')
-                        spdata = rm.get_patch(spatch_id)
 
-                        rev = None
                         if spatch_id in revs:
                             rev = revs[spatch_id]
-                        else:
-                            # try to use the more fuzzy git-patch-id matching
-                            spatch_hash = git_get_patch_id(spdata.get('diff'))
-                            if spatch_hash is not None and spatch_hash in rgithashes:
-                                logger.debug('Matched via git-patch-id')
-                                rev = rgithashes[spatch_hash]
-                                revs[spatch_id] = rev
-                                # same committer
-                                committers[spatch_id] = committers[patch_id]
-
-                        if rev is None:
-                            logger.debug('Could not produce precise match for %s', spatch_id)
-                            logger.debug('Will not update series: %s', sdata.get('name'))
-                            update_queue = list()
-                            break
-
-                        update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
+                            update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
 
                     if update_queue:
                         logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
@@ -1290,7 +1276,7 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
                                 logger.info('  Updating (DRYRUN): %s', sname)
 
             if len(updated_series) and hsettings.get('send_summary', False):
-                send_summary(updated_series, committers, to_state, refname, pname, rsettings, hsettings)
+                send_summary(updated_series, committers, to_state, refname, revs, pname, rsettings, hsettings)
             if len(updated_series) and hsettings.get('notify_submitter', False):
                 notify_submitters(updated_series, committers, refname, revs, pname, rsettings, hsettings)
 
@@ -1299,8 +1285,6 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
         else:
             logger.info('No patches updated on %s', rm.server)
 
-    rcdbconn.commit()
-    rcdbconn.close()
     if not DRYRUN:
         db_save_repo_heads(c, git_heads)
         dbconn.commit()
@@ -1324,7 +1308,6 @@ def check_repos() -> None:
         if not os.path.isdir(fullpath) and not settings.get('branch'):
             logger.info('Worktree must specify "branch" setting: %s', repo)
             continue
-        logger.info('Processing: %s', repo)
         pwrun(fullpath, settings)
 
 
