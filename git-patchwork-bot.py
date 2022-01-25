@@ -481,7 +481,7 @@ def git_get_patch_id(diff: str) -> Optional[str]:
 
 
 def get_patchwork_hash(diff: str) -> str:
-    """Generate a hash from a diff. Lifted verbatim from patchwork."""
+    """Generate a hash from a diff. Lifted near verbatim from patchwork."""
 
     # normalise spaces
     diff = diff.replace('\r', '')
@@ -490,9 +490,15 @@ def get_patchwork_hash(diff: str) -> str:
     prefixes = ['-', '+', ' ']
     hashed = hashlib.sha1()
 
+    inpatch = False
     for line in diff.split('\n'):
         if len(line) <= 0:
             continue
+        # Ignore any content before "^diff "
+        if not inpatch and not line.startswith('diff '):
+            continue
+
+        inpatch = True
 
         hunk_match = HUNK_RE.match(line)
         filename_match = FILENAME_RE.match(line)
@@ -1142,11 +1148,10 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
                         logger.debug('Skipping %s (no pwhash)', rev)
                         continue
                     msgid = None
-                    if info.find('Link:') > 0:
-                        lore_match = LORE_RE.search(info)
-                        if lore_match:
-                            msgid = lore_match.group(1)
-                            logger.debug('Msgid for %s: %s', rev, msgid)
+                    lore_match = LORE_RE.search(info)
+                    if lore_match:
+                        msgid = lore_match.group(1)
+                        logger.debug('Msgid for %s: %s', rev, msgid)
                     _rev_cache[rev] = (rev, logline, committer, pwhash, msgid)
 
                 rpwhashes[refname].add(_rev_cache[rev])
@@ -1313,20 +1318,21 @@ def check_repos() -> None:
 
 def pwhash_differ() -> None:
     diff = sys.stdin.read()
-    pwhash = get_patchwork_hash(diff)
-    print(pwhash)
+    inhash = get_patchwork_hash(diff)
+    logger.info('stdin hash: %s', inhash)
+    check_patch_id = cmdargs.pwhash
     for pw in CONFIG['patchworks']:
-        print(f"Patchwork: {pw}")
+        logger.info('Patchwork: %s', pw)
         for pname, psettings in CONFIG['patchworks'][pw]['projects'].items():
-            print(f"Project: {pname}")
             project, rm, pconfig = project_by_name(pname)
-            project_id = project['id']
-            print(get_patchwork_patches_by_project_hash(rm, project_id, pwhash))
-            print('-------')
-            p = rm.get_patch(cmdargs.pwhash)
-            pwdiff = p.get('diff')
-            print(pwdiff)
-            print(get_patchwork_hash(pwdiff))
+            patch = rm.get_patch(check_patch_id)
+            if patch.get('hash') != inhash:
+                logger.info('--- patchwork diff ---')
+                logger.info(patch.get('diff'))
+                logger.info('--- hash: %s ---', patch.get('hash'))
+                sys.exit(1)
+    logger.info('No mismatches found')
+    sys.exit(0)
 
 
 if __name__ == '__main__':
