@@ -11,10 +11,9 @@ __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 import argparse
 import requests
 import datetime
+import logging
 import json
 import sys
-
-from packaging import version  # noqa
 
 RELEASES_JSON = 'https://www.kernel.org/releases.json'
 WINDOW_DAYS = 14
@@ -22,33 +21,51 @@ RC_COUNT = 7
 CYCLE_DAYS = WINDOW_DAYS + (RC_COUNT * 7)
 VERSION = '1.0'
 
+logger = logging.getLogger('mainline-when')
 
-def main(estnext=3, forcever=None):
-    rses = requests.session()
-    headers = {'User-Agent': f'mainline-when/{VERSION}'}
-    rses.headers.update(headers)
-    resp = rses.get(RELEASES_JSON)
-    resp.raise_for_status()
-    rels = json.loads(resp.content)
+
+def parse_version(ver):
+    rcn = None
+    if ver.find('-') > 0:
+        ver, rc = ver.split('-')
+        rcn = int(rc[2:])
+    jv, nv = ver.split('.')
+    majver = int(jv)
+    minver = int(nv)
+
+    return majver, minver, rcn
+
+
+def main(estnext=3, forcever=None, rjson=None):
+    if rjson is None:
+        rses = requests.session()
+        headers = {'User-Agent': f'mainline-when/{VERSION}'}
+        rses.headers.update(headers)
+        resp = rses.get(RELEASES_JSON)
+        resp.raise_for_status()
+        rels = json.loads(resp.content)
+    else:
+        with open(rjson, 'r') as fh:
+            content = fh.read()
+        rels = json.loads(content)
+
     release = None
     for release in rels['releases']:
         if release['moniker'] != 'mainline':
             continue
         break
     if release is None:
-        sys.stdout.write('Could not find mainline release info\n')
+        logger.critical('Could not find mainline release info in %s', RELEASES_JSON)
         sys.exit(1)
 
+    ics = list()
     if forcever:
-        mver = version.parse(forcever)
+        majver, minver, rcn = parse_version(forcever)
     else:
-        mver = version.parse(release.get('version'))
-    majver, minver = mver.release
+        majver, minver, rcn = parse_version(release.get('version'))
     crel = datetime.datetime.strptime(release['released']['isodate'], '%Y-%m-%d')
-    rcn = None
-    if mver.is_prerelease:
-        rcn = mver.pre[1]
-        print(f'current status: {majver}.{minver}-rc{rcn}')
+    if rcn:
+        logger.info(f'current status: {majver}.{minver}-rc{rcn}')
         mrel = crel - datetime.timedelta(days=(7*rcn)+7)
         if rcn < 8:
             frel = mrel + datetime.timedelta(days=CYCLE_DAYS)
@@ -58,39 +75,105 @@ def main(estnext=3, forcever=None):
     else:
         # We're currently in a merge window
         minver += 1
-        print(f'current status:\t{majver}.{minver} merge window')
+        logger.info(f'current status: {majver}.{minver} merge window')
         mrel = crel
         frel = crel + datetime.timedelta(days=CYCLE_DAYS)
-    print('---')
-    rcrel = mrel + datetime.timedelta(days=WINDOW_DAYS)
+    logger.info('---')
+    wo = mrel + datetime.timedelta(days=1)
+    wc = mrel + datetime.timedelta(days=WINDOW_DAYS)
+    ics.append((majver, minver, wo, wc, frel))
     if rcn:
-        print(f'{majver}.{minver} window open: {mrel.strftime("%Y-%m-%d")}')
-        if rcn == 1:
-            print(f'{majver}.{minver}-rc1 release: {rcrel.strftime("%Y-%m-%d")}  <-- you are here')
-        else:
-            print(f'{majver}.{minver}-rc1 release: {rcrel.strftime("%Y-%m-%d")}')
-            print(f'{majver}.{minver}-rc{rcn} release: {crel.strftime("%Y-%m-%d")}  <-- you are here')
+        logger.info(f'{majver}.{minver} window open : {wo.strftime("%Y-%m-%d")}')
+        logger.info(f'{majver}.{minver} window close: {wc.strftime("%Y-%m-%d")}')
+        logger.info(f'{majver}.{minver} rc{rcn}         : {crel.strftime("%Y-%m-%d")}  <-- you are here')
     else:
-        print(f'{majver}.{minver} window open: {mrel.strftime("%Y-%m-%d")}  <-- you are here')
-        print(f'{majver}.{minver}-rc1 release: {rcrel.strftime("%Y-%m-%d")}')
+        logger.info(f'{majver}.{minver} window open : {wo.strftime("%Y-%m-%d")}  <-- you are here')
+        logger.info(f'{majver}.{minver} window close: {wc.strftime("%Y-%m-%d")}')
 
-    print(f'{majver}.{minver} final      : {frel.strftime("%Y-%m-%d")}')
+    logger.info(f'{majver}.{minver} final       : {frel.strftime("%Y-%m-%d")}')
 
     # Estimate next versions
     for nextver in range(minver+1, minver+estnext+1):
-        print('---')
-        print(f'{majver}.{nextver} window open: {frel.strftime("%Y-%m-%d")}')
-        rcrel = frel + datetime.timedelta(days=WINDOW_DAYS)
-        print(f'{majver}.{nextver}-rc1 release: {rcrel.strftime("%Y-%m-%d")}')
+        logger.info('---')
+        wo = frel + datetime.timedelta(days=1)
+        wc = frel + datetime.timedelta(days=WINDOW_DAYS)
+        logger.info(f'{majver}.{nextver} window open : {wo.strftime("%Y-%m-%d")}')
+        logger.info(f'{majver}.{nextver} window close: {wc.strftime("%Y-%m-%d")}')
         frel = frel + datetime.timedelta(days=CYCLE_DAYS)
-        print(f'{majver}.{nextver} final      : {frel.strftime("%Y-%m-%d")}')
-    print('---')
-    print('NB: all dates are estimates')
+        logger.info(f'{majver}.{nextver} final       : {frel.strftime("%Y-%m-%d")}')
+        ics.append((majver, nextver, wo, wc, frel))
+    logger.info('---')
+    logger.info('NB: all dates are estimates')
+    return ics
+
+
+def write_ics(contents, outfile, domain):
+    if not domain:
+        domain = 'mainline-when.local'
+    now = datetime.datetime.now()
+    admonition = 'NOTE: all dates set in the future are automatically generated guesstimates.'
+    with open(outfile, 'w') as fh:
+        fh.write('BEGIN:VCALENDAR\r\n')
+        fh.write('VERSION:2.0\r\n')
+        fh.write(f'PRODID:{domain}\r\n')
+        fh.write('METHOD:PUBLISH\r\n')
+        for majver, minver, wo, wc, frel in ics:
+            # Merge window
+            fh.write('BEGIN:VEVENT\r\n')
+            fh.write(f'UID:kernel-v{majver}.{minver}-merge-window@{domain}\r\n')
+            fh.write(f'SUMMARY:Kernel v{majver}.{minver} merge window\r\n')
+            if wo > now:
+                fh.write(f'DESCRIPTION:{admonition}\r\n')
+            fh.write('CLASS:PUBLIC\r\n')
+            fh.write(f'DTSTART;VALUE=DATE:{wo.strftime("%Y%m%d")}\r\n')
+            fh.write(f'DTEND;VALUE=DATE:{wc.strftime("%Y%m%d")}\r\n')
+            fh.write(f'CREATED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write(f'LAST-MODIFIED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write('END:VEVENT\r\n')
+            # rc1
+            fh.write('BEGIN:VEVENT\r\n')
+            fh.write(f'UID:kernel-v{majver}.{minver}-rc1@{domain}\r\n')
+            fh.write(f'SUMMARY:Kernel v{majver}.{minver}-rc1 release\r\n')
+            if wc > now:
+                fh.write(f'DESCRIPTION:{admonition}\r\n')
+            fh.write('CLASS:PUBLIC\r\n')
+            fh.write(f'DTSTART;VALUE=DATE:{wc.strftime("%Y%m%d")}\r\n')
+            fh.write(f'CREATED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write(f'LAST-MODIFIED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write('END:VEVENT\r\n')
+            # final
+            fh.write('BEGIN:VEVENT\r\n')
+            fh.write(f'UID:kernel-v{majver}.{minver}-final@{domain}\r\n')
+            fh.write(f'SUMMARY:Kernel v{majver}.{minver} final release\r\n')
+            if frel > now:
+                fh.write(f'DESCRIPTION:{admonition}\r\n')
+            fh.write('CLASS:PUBLIC\r\n')
+            fh.write(f'DTSTART;VALUE=DATE:{frel.strftime("%Y%m%d")}\r\n')
+            fh.write(f'CREATED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write(f'LAST-MODIFIED:{now.strftime("%Y%m%d")}\r\n')
+            fh.write('END:VEVENT\r\n')
+        fh.write('END:VCALENDAR\r\n')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-n', '--next', type=int, default=3, help='How many versions to estimate')
+    parser.add_argument('-i', '--ics-out', help='Write an .ics file instead')
+    parser.add_argument('-d', '--ics-domain', help='Domain to use for ics generation')
+    parser.add_argument('-r', '--releases-json', help='Use this local copy of releases.json')
     parser.add_argument('--force-version', help='Force version to be this (testing only)')
     cmdargs = parser.parse_args()
-    main(estnext=cmdargs.next, forcever=cmdargs.force_version)
+
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter('%(message)s')
+    ch.setFormatter(formatter)
+    if cmdargs.ics_out:
+        ch.setLevel(logging.CRITICAL)
+    else:
+        ch.setLevel(logging.INFO)
+    logger.addHandler(ch)
+
+    ics = main(estnext=cmdargs.next, forcever=cmdargs.force_version, rjson=cmdargs.releases_json)
+    if cmdargs.ics_out:
+        write_ics(ics, cmdargs.ics_out, cmdargs.ics_domain)
