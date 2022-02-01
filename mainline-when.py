@@ -107,7 +107,7 @@ def main(estnext=3, forcever=None, rjson=None):
     return ics
 
 
-def write_ics(contents, outfile, domain):
+def write_ics(ics, outfile, domain):
     if not domain:
         domain = 'mainline-when.local'
     now = datetime.datetime.now()
@@ -174,6 +174,6 @@ if __name__ == '__main__':
         ch.setLevel(logging.INFO)
     logger.addHandler(ch)
 
-    ics = main(estnext=cmdargs.next, forcever=cmdargs.force_version, rjson=cmdargs.releases_json)
+    icsdata = main(estnext=cmdargs.next, forcever=cmdargs.force_version, rjson=cmdargs.releases_json)
     if cmdargs.ics_out:
-        write_ics(ics, cmdargs.ics_out, cmdargs.ics_domain)
+        write_ics(icsdata, cmdargs.ics_out, cmdargs.ics_domain)
