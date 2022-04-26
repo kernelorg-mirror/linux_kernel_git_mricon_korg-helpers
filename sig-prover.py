@@ -320,8 +320,12 @@ def verify_tarball(config, turl):
             cmdargs = [zbin, contentfile]
             ecode, out, err = _run_command(cmdargs)
             if ecode > 0:
-                logger.critical('Error uncompressing %s', turl)
-                sys.exit(1)
+                # Failure to uncompress is not a critical failure, because
+                # this could be the result of any number of things: bad cache,
+                # errors during transmission, etc. We don't care for such
+                # situations -- we are looking specifically at bad signatures.
+                logger.info('Failed uncompressing %s')
+                return
             contentfile = os.path.join(td, 'content')
         gpgargs = ['--verify', '--status-fd=2', signfile, contentfile]
         keyring = os.path.join(config.get('keyringdir'), config.get('keyring'))
