@@ -103,7 +103,9 @@ def main(estnext=3, forcever=None, rjson=None):
         logger.info(f'{majver}.{nextver} final       : {frel.strftime("%Y-%m-%d")}')
         ics.append((majver, nextver, wo, wc, frel))
     logger.info('---')
-    logger.info('NB: all dates are estimates')
+    logger.info('NB: All dates set in the future are estimates.')
+    if minver > 16:
+        logger.info('NB: Major version number means nothing and can go up at any time.')
     return ics
 
 
@@ -111,7 +113,7 @@ def write_ics(ics, outfile, domain):
     if not domain:
         domain = 'mainline-when.local'
     now = datetime.datetime.now()
-    admonition = 'NOTE: all dates set in the future are automatically generated guesstimates.'
+    admonition = 'NOTE: all dates set in the future are estimates.'
     with open(outfile, 'w') as fh:
         fh.write('BEGIN:VCALENDAR\r\n')
         fh.write('VERSION:2.0\r\n')
@@ -146,7 +148,11 @@ def write_ics(ics, outfile, domain):
             fh.write(f'UID:kernel-v{majver}.{minver}-final@{domain}\r\n')
             fh.write(f'SUMMARY:Kernel v{majver}.{minver} final release\r\n')
             if frel > now:
-                fh.write(f'DESCRIPTION:{admonition}\r\n')
+                fh.write(f'DESCRIPTION:{admonition} If deemed necessary, this may end up being another -rc release.')
+                if minver > 16:
+                    fw.write(' Major version number means nothing and can go up at any time.')
+                fh.write('\r\n')
+
             fh.write('CLASS:PUBLIC\r\n')
             fh.write(f'DTSTART;VALUE=DATE:{frel.strftime("%Y%m%d")}\r\n')
             fh.write(f'CREATED:{now.strftime("%Y%m%d")}\r\n')
