@@ -185,7 +185,7 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
 
                 elif lhdrname == 'list-id':
                     for listid in listids:
-                        if lhdrval.find(listid) >= 0:
+                        if lhdrval.find(listid) >= 0 or fnmatch.fnmatch(lhdrval, listid):
                             newhdrs.append((hdrname, hdrval))
                             is_our_list = True
                             break
