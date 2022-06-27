@@ -70,11 +70,16 @@ def formataddr(pair):
         # drop the real name then.
         return email.utils.formataddr((None, pair[1]))
 
-def process_archives(sources, outdir, msgids, listids, rejectsfile):
+def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
     outboxes = {}
     writecount = {}
     seenids = []
     knownset = set(msgids)
+
+    if asmaildir:
+        outbox = mailbox.Maildir(outdir)
+        outboxes[outdir] = outbox
+        writecount[outdir] = 1
 
     # convert listids into email addresses by replacing the first '.' to '@'.
     # if you're working with a mailing list that has a non-standard list-id, you
@@ -258,12 +263,14 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
                 # fine, use the date in the message, even if it's bogus
                 msgdate = email.utils.parsedate_tz(str(msg['Date']))
 
-            mboxname = '%04d-%02d.mbx' % (msgdate[0], msgdate[1])
+            if asmaildir:
+                mboxname = outdir
+            else:
+                mboxname = '%04d-%02d.mbx' % (msgdate[0], msgdate[1])
 
             # do we have this mbox open already?
             if mboxname in outboxes:
                 outbox = outboxes[mboxname]
-                writecount[mboxname] += 1
             else:
                 outbox = mailbox.mbox('%s/%s' % (outdir, mboxname))
                 outboxes[mboxname] = outbox
@@ -273,6 +280,7 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
                 outbox.add(msg.as_string(policy=EMLPOLICY).encode())
                 seenids.append(msgid)
                 knownset.add(msgid)
+                writecount[mboxname] += 1
             except:
                 # Oh well, toss it
                 pass
@@ -297,7 +305,7 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile):
 
 
 def main(args):
-    if not os.path.isdir(args.exportdir):
+    if not args.asmaildir and not os.path.isdir(args.exportdir):
         os.mkdir(args.exportdir)
 
     if args.knownids and os.path.exists(args.knownids):
@@ -317,7 +325,7 @@ def main(args):
     # Make list ID matching case insensitive to match more mail
     listids = [listid.lower() for listid in args.listids]
 
-    newids = process_archives(args.source, args.exportdir, knownids, listids, args.rejected)
+    newids = process_archives(args.source, args.exportdir, knownids, listids, args.rejected, args.asmaildir)
 
     if newids is None or not args.knownids:
         sys.exit(0)
@@ -342,6 +350,8 @@ if __name__ == '__main__':
                               'Paths with trailing "/" will be treated as maildirs.'))
     parser.add_argument('-exportdir', required=True, default='list-archives',
                         help='Export dir where to put sanitized archives')
+    parser.add_argument('-asmaildir', action='store_true', default=False,
+                        help='Export as maildir instead of mailboxes')
     parser.add_argument('-knownids',
                         help='File with known Message-IDs (one per line)')
     parser.add_argument('-listids', required=True, nargs='+',
