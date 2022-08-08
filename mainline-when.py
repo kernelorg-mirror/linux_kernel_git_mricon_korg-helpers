@@ -20,6 +20,12 @@ WINDOW_DAYS = 14
 RC_COUNT = 7
 CYCLE_DAYS = WINDOW_DAYS + (RC_COUNT * 7)
 VERSION = '1.0'
+# This is where the minor version number starts looking "too big" and
+# we go to the "next major version dot-zero" -- Linus says that it will
+# likely always be after 19. The only time this went to 20 was for
+# 4.20, and the only explanation we can give is that everyone was too
+# high at the time to notice.
+TOOBIG = 19
 
 logger = logging.getLogger('mainline-when')
 
@@ -75,6 +81,9 @@ def main(estnext=3, forcever=None, rjson=None):
     else:
         # We're currently in a merge window
         minver += 1
+        if minver > TOOBIG:
+            majver += 1
+            minver = 0
         logger.info(f'current status: {majver}.{minver} merge window')
         mrel = crel
         frel = crel + datetime.timedelta(days=CYCLE_DAYS)
@@ -94,18 +103,22 @@ def main(estnext=3, forcever=None, rjson=None):
 
     # Estimate next versions
     for nextver in range(minver+1, minver+estnext+1):
+        if nextver > TOOBIG:
+            estmaj = majver + 1
+            estmin = nextver - (TOOBIG + 1)
+        else:
+            estmaj = majver
+            estmin = nextver
         logger.info('---')
         wo = frel + datetime.timedelta(days=1)
         wc = frel + datetime.timedelta(days=WINDOW_DAYS)
-        logger.info(f'{majver}.{nextver} window open : {wo.strftime("%Y-%m-%d")}')
-        logger.info(f'{majver}.{nextver} window close: {wc.strftime("%Y-%m-%d")}')
+        logger.info(f'{estmaj}.{estmin} window open : {wo.strftime("%Y-%m-%d")}')
+        logger.info(f'{estmaj}.{estmin} window close: {wc.strftime("%Y-%m-%d")}')
         frel = frel + datetime.timedelta(days=CYCLE_DAYS)
-        logger.info(f'{majver}.{nextver} final       : {frel.strftime("%Y-%m-%d")}')
-        ics.append((majver, nextver, wo, wc, frel))
+        logger.info(f'{estmaj}.{estmin} final       : {frel.strftime("%Y-%m-%d")}')
+        ics.append((estmaj, estmin, wo, wc, frel))
     logger.info('---')
     logger.info('NB: All dates set in the future are estimates.')
-    if minver > 16:
-        logger.info('NB: Major version number means nothing and can go up at any time.')
     return ics
 
 
@@ -149,8 +162,6 @@ def write_ics(ics, outfile, domain):
             fh.write(f'SUMMARY:Kernel v{majver}.{minver} final release\r\n')
             if frel > now:
                 fh.write(f'DESCRIPTION:{admonition} If deemed necessary, this may end up being another -rc release.')
-                if minver > 16:
-                    fw.write(' Major version number means nothing and can go up at any time.')
                 fh.write('\r\n')
 
             fh.write('CLASS:PUBLIC\r\n')
