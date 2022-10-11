@@ -18,6 +18,7 @@ import os
 import sys
 import logging
 import logging.handlers
+import datetime
 
 from configparser import ConfigParser, ExtendedInterpolation
 
@@ -121,6 +122,7 @@ class GroupsioListener(object):
         try:
             import ezpi
             ezpi.add_rfc822(pirepo, msg)
+            ezpi.run_hook(pirepo)
             logger.info('Wrote to public-inbox at %s', pirepo)
             success = True
         except Exception as ex:
@@ -167,6 +169,17 @@ class GroupsioListener(object):
                 resp.status = falcon.HTTP_401
                 resp.body = 'HMAC signature verification failed\n'
                 return
+
+        if self._config['main'].get('loglevel', 'info') == 'debug':
+            # In debug mode, we save all json submissions in the emerg dir
+            emerg_dir = self._config['main'].get('emerg_dir')
+            if emerg_dir and os.path.isdir(emerg_dir):
+                dt = datetime.datetime.now()
+                fname = dt.strftime('%Y%m%d-%H%M%S-%f')
+                efile = os.path.join(emerg_dir, f'{fname}.js')
+                with open(efile, 'w') as fh:
+                    fh.write(raw)
+                    logger.debug('Wrote raw json into %s', efile)
 
         try:
             doc = json.loads(raw)
