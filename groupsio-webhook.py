@@ -12,6 +12,7 @@ import socket
 import email
 import email.utils
 import email.header
+import email.policy
 import hmac
 import smtplib
 import os
@@ -24,6 +25,8 @@ from configparser import ConfigParser, ExtendedInterpolation
 
 logger = logging.getLogger('groupsio-webhook')
 logger.setLevel(logging.DEBUG)
+
+emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
 
 
 # noinspection PyBroadException, PyMethodMayBeStatic
@@ -108,12 +111,8 @@ class GroupsioListener(object):
         except Exception as ex:
             logger.critical('Failed processing message %s:', msgnum)
             logger.critical(str(ex))
-            emerg_dir = self._config['main'].get('emerg_dir')
-            if emerg_dir and os.path.isdir(emerg_dir):
-                efile = os.path.join(emerg_dir, f'{groupaddr}-{msgnum}.txt')
-                with open(efile, 'w') as fh:
-                    fh.write(doc['message'])
-                    logger.critical('Saved message as %s', efile)
+            filen = f'{groupaddr}-{msgnum}.txt'
+            self._save_emerg(filen, doc['message'].encode())
 
         return success
 
@@ -134,14 +133,18 @@ class GroupsioListener(object):
     def _send_smtp(self, msg: email.message.Message, mailfrom: str) -> bool:
         mailhost = self._config['main'].get('mailhost', 'localhost')
         mailto = self._config['main'].get('mailto', 'webhook@archiver.kernel.org')
+        bdata = msg.as_string(policy=emlpolicy).encode()
         try:
             smtp = smtplib.SMTP(mailhost)
-            smtp.sendmail(mailfrom, [mailto], msg.as_bytes())
+            smtp.sendmail(mailfrom, [mailto], bdata)
             smtp.close()
             logger.info('Successfully sent via SMTP to <%s>', mailto)
         except Exception as ex:
             logger.critical('Could not send SMTP')
             logger.critical(str(ex))
+            dt = datetime.datetime.now()
+            fname = dt.strftime('%Y%m%d-%H%M%S-%f') + '.eml'
+            self._save_emerg(fname, bdata)
             return False
 
         return True
@@ -150,6 +153,15 @@ class GroupsioListener(object):
         hm = hmac.new(psk.encode(), digestmod='sha256')
         hm.update(raw)
         return hmac.compare_digest(vdigest, hm.hexdigest())
+
+    def _save_emerg(self, filen: str, bdata: bytes):
+        emerg_dir = self._config['main'].get('emerg_dir')
+        if not (emerg_dir or os.path.isdir(emerg_dir)):
+            return
+        efile = os.path.join(emerg_dir, filen)
+        with open(efile, 'wb') as fh:
+            fh.write(bdata)
+            logger.debug('Wrote emergency content into %s', efile)
 
     def on_post(self, req, resp):
         if not req.content_length:
@@ -172,14 +184,9 @@ class GroupsioListener(object):
 
         if self._config['main'].get('loglevel', 'info') == 'debug':
             # In debug mode, we save all json submissions in the emerg dir
-            emerg_dir = self._config['main'].get('emerg_dir')
-            if emerg_dir and os.path.isdir(emerg_dir):
-                dt = datetime.datetime.now()
-                fname = dt.strftime('%Y%m%d-%H%M%S-%f')
-                efile = os.path.join(emerg_dir, f'{fname}.js')
-                with open(efile, 'w') as fh:
-                    fh.write(raw)
-                    logger.debug('Wrote raw json into %s', efile)
+            dt = datetime.datetime.now()
+            fname = dt.strftime('%Y%m%d-%H%M%S-%f') + '.js'
+            self._save_emerg(fname, raw)
 
         try:
             doc = json.loads(raw)
