@@ -27,9 +27,12 @@ import mailbox
 import email.utils
 import email.policy
 import fnmatch
+import argparse
+
+from typing import Tuple, List, Set
 
 from email import charset
-charset.add_charset('utf-8', charset.SHORTEST, '8bit') # noqa
+charset.add_charset('utf-8', None)
 
 # Set our own policy
 EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
@@ -62,7 +65,8 @@ WANTHDRS = {'return-path',
 
 __VERSION__ = '2.0'
 
-def formataddr(pair):
+
+def formataddr(pair: Tuple[str, str]) -> str:
     try:
         return email.utils.formataddr(pair)
     except UnicodeEncodeError:
@@ -70,11 +74,12 @@ def formataddr(pair):
         # drop the real name then.
         return email.utils.formataddr((None, pair[1]))
 
-def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
-    outboxes = {}
-    writecount = {}
-    seenids = []
-    knownset = set(msgids)
+
+def process_archives(sources: List[str], outdir: str, knownset: Set[str], listids: List[str],
+                     rejectsfile: str, asmaildir: bool, extrahdrs: List[Tuple[str, str]]) -> Set[str]:
+    outboxes = dict()
+    writecount = dict()
+    seenids = set()
 
     if asmaildir:
         outbox = mailbox.Maildir(outdir)
@@ -84,7 +89,7 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
     # convert listids into email addresses by replacing the first '.' to '@'.
     # if you're working with a mailing list that has a non-standard list-id, you
     # can specify the list email address as part of the listids to satisfy this check.
-    eaddrs = []
+    eaddrs = list()
     for listid in listids:
         if listid.find('@') < 0:
             eaddrs.append(listid.replace('.', '@', 1))
@@ -150,9 +155,9 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
 
             # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
-            newhdrs = []
-            to = []
-            cc = []
+            newhdrs = list()
+            to = list()
+            cc = list()
             recvtime = None
             is_our_list = False
             for hdrname, hdrval in list(msg._headers): # noqa
@@ -203,13 +208,13 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
                 # so there's one field for each header type.
                 #
                 # Save the place in newhdrs where the first to or cc list would
-                # have appeared so we can insert the merged list there rather
+                # have appeared, so we can insert the merged list there rather
                 # than strangely at the end.
 
                 elif lhdrname == 'to':
                     for pair in email.utils.getaddresses([hdrval]):
                         if pair[1] in cc:
-                            # already in Cc, so no need to add it to To
+                            # already in Cc, so no need to add it to "To"
                             continue
                         to.append(formataddr(pair))
 
@@ -256,6 +261,9 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
                     notourlist += 1
                     continue
 
+            if extrahdrs:
+                newhdrs += extrahdrs
+
             msg._headers = newhdrs
 
             msgdate = recvtime
@@ -278,10 +286,10 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
 
             try:
                 outbox.add(msg.as_string(policy=EMLPOLICY).encode())
-                seenids.append(msgid)
+                seenids.add(msgid)
                 knownset.add(msgid)
                 writecount[mboxname] += 1
-            except:
+            except:  # noqa
                 # Oh well, toss it
                 pass
 
@@ -298,66 +306,84 @@ def process_archives(sources, outdir, msgids, listids, rejectsfile, asmaildir):
             print('  %s: %s new (%s total)' %
                   (os.path.join(outdir, mboxname), writecount[mboxname], len(outboxes[mboxname])))
             outboxes[mboxname].close()
-        return seenids
     else:
         print('No new messages found.')
-        return None
+
+    return seenids
 
 
-def main(args):
-    if not args.asmaildir and not os.path.isdir(args.exportdir):
+def main(args: argparse.Namespace):
+    if not args.as_maildir and not os.path.isdir(args.exportdir):
         os.mkdir(args.exportdir)
 
-    if args.knownids and os.path.exists(args.knownids):
-        with open(args.knownids, 'r') as fh:
-            knownids = fh.read().splitlines()
-            fh.close()
-        print('Loaded %s message-ids from "%s"' % (len(knownids), args.knownids))
+    if args.known_ids and os.path.exists(args.known_ids):
+        if args.known_ids.endswith('.sqlite3'):
+            import sqlite3
+            dbconn = sqlite3.connect(args.known_ids, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+            cur = dbconn.cursor()
+            rows = cur.execute('SELECT mid FROM msgmap').fetchall()
+            knownids = {x[0] for x in rows}
+        else:
+            with open(args.known_ids, 'r') as fh:
+                knownids = set(fh.read().splitlines())
+                fh.close()
+        print('Loaded %s message-ids from "%s"' % (len(knownids), args.known_ids))
     else:
         # should we load message-ids from existing mailboxes found in the export dir?
         # right now we're just appending to them, which is probably not expected behaviour.
-        knownids = []
+        knownids = set()
 
     if not args.source:
         print('You have to specify at least one source')
         sys.exit(1)
 
-    # Make list ID matching case insensitive to match more mail
-    listids = [listid.lower() for listid in args.listids]
+    # Make list ID matching case-insensitive to match more mail
+    if args.list_ids:
+        listids = [listid.lower() for listid in args.list_ids]
+    else:
+        listids = ['*']
 
-    newids = process_archives(args.source, args.exportdir, knownids, listids, args.rejected, args.asmaildir)
+    extrahdrs = list()
+    if args.extrahdrs:
+        for hdr in args.extrahdrs:
+            name, val = hdr.split(':', maxsplit=1)
+            if val.strip():
+                extrahdrs.append((name.strip(), val.strip()))
 
-    if newids is None or not args.knownids:
+    newids = process_archives(args.source, args.exportdir, knownids, listids, args.rejected, args.as_maildir,
+                              extrahdrs)
+
+    if newids is None or not args.known_ids or args.known_ids.endswith('.sqlite3'):
         sys.exit(0)
 
-    new_idlist = knownids + newids
-    print('Wrote %s msgids into %s (%s new)' % (len(new_idlist), args.knownids, len(newids)))
-    with open(args.knownids, 'w') as fh:
-        fh.write('\n'.join(new_idlist))
+    knownids.update(newids)
+    print('Wrote %s msgids into %s (%s new)' % (len(knownids), args.known_ids, len(newids)))
+    with open(args.known_ids, 'w') as fh:
+        fh.write('\n'.join(knownids))
         fh.close()
 
 
 if __name__ == '__main__':
-    import argparse
-
     # noinspection PyTypeChecker
     parser = argparse.ArgumentParser(
         description="Make a mbox of LKML messages we haven't yet archived",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('-source', nargs='+',
+    parser.add_argument('-s', '--source', nargs='+',
                         help=('Mbox file with archives, can be multiple. '
                               'Paths with trailing "/" will be treated as maildirs.'))
-    parser.add_argument('-exportdir', required=True, default='list-archives',
+    parser.add_argument('-e', '--exportdir', required=True, default='list-archives',
                         help='Export dir where to put sanitized archives')
-    parser.add_argument('-asmaildir', action='store_true', default=False,
+    parser.add_argument('-m', '--as-maildir', action='store_true', default=False,
                         help='Export as maildir instead of mailboxes')
-    parser.add_argument('-knownids',
-                        help='File with known Message-IDs (one per line)')
-    parser.add_argument('-listids', required=True, nargs='+',
-                        help='List ID to match, can be multiple')
-    parser.add_argument('-rejected',
+    parser.add_argument('-k', '--known-ids',
+                        help='File with known Message-IDs (one per line, or msgmap.sqlite3)')
+    parser.add_argument('-l', '--list-ids', nargs='+',
+                        help='Limit to just these list-ids (can be multiple)')
+    parser.add_argument('-r', '--rejected',
                         help='Mailbox file where to save messages that were rejected '
                              '(adds X-Import-Rejected-Reason header)')
+    parser.add_argument('-x', '--extrahdrs', nargs='+', metavar='FULLHDR',
+                        help='Extra headers to inject into each message')
 
     main(parser.parse_args())

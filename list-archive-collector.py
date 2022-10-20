@@ -25,23 +25,25 @@ import quopri
 import base64
 import gzip
 import io
-import nntplib
 import requests
 import logging
 import subprocess
+import argparse
 
 try:
-    import cchardet as chardet # noqa
+    import cchardet as chardet  # noqa
 except ImportError:
-    import chardet
+    import chardet  # noqa
 
 from tempfile import mkstemp
 from bs4 import BeautifulSoup # noqa
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3 import Retry
+
+from typing import Optional, Union, List, Set
 
 from email import charset
-charset.add_charset('utf-8', charset.SHORTEST, '8bit') # noqa
+charset.add_charset('utf-8', None)
 
 # Used for our requests session
 REQSESSION = None
@@ -59,7 +61,7 @@ EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length
 logger = logging.getLogger(__name__)
 
 
-def clean_header(hdrval):
+def clean_header(hdrval: str) -> Optional[str]:
     if hdrval is None:
         return ''
 
@@ -78,7 +80,7 @@ def clean_header(hdrval):
     return new_hdrval.strip()
 
 
-def get_requests_session():
+def get_requests_session() -> requests.Session:
     global REQSESSION
     if REQSESSION is None:
         REQSESSION = requests.session()
@@ -94,14 +96,14 @@ def get_requests_session():
     return REQSESSION
 
 
-def lore_get_message(msgid):
+def lore_get_message(msgid: str) -> email.message.Message:
     # See where we're redirected
     rurl = f'https://lore.kernel.org/r/{msgid}'
     rses = get_requests_session()
     resp = rses.head(rurl)
     if resp.status_code < 300 or resp.status_code > 400:
         # Not known on lore
-        return None
+        raise LookupError
     # Pop msgid from the end of the redirect
     msgurl = resp.headers['Location'] + 'raw'
     resp.close()
@@ -111,33 +113,7 @@ def lore_get_message(msgid):
     return msg
 
 
-# Turned off for now
-def patchwork_get_headers(msgid):
-    url = f'https://patchwork.kernel.org/api/1.2/patches/'
-    params = [
-        ('msgid', msgid),
-    ]
-    rses = get_requests_session()
-    resp = rses.get(url, params=params, stream=False)
-    if resp.status_code > 200:
-        return None
-
-    jj = resp.json()
-    if not len(jj):
-        return None
-
-    # we only care about one
-    p_id = jj[0].get('id')
-    resp = rses.get(f'{url}{p_id}', stream=False)
-    if resp.status_code > 200:
-        return None
-
-    logger.info('    found on patchwork')
-    jj = resp.json()
-    return jj.get('headers')
-
-
-def lookaside_fillin(msg):
+def lookaside_fillin(msg: email.message.Message) -> bool:
     wanthdrs = [
         'To',
         'Cc',
@@ -147,12 +123,10 @@ def lookaside_fillin(msg):
         'X-Mailer',
     ]
     msgid = str(msg.get('Message-Id')).strip('<>')
-    lmsg = lore_get_message(msgid)
-    if not lmsg:
+    try:
+        lmsg = lore_get_message(msgid)
+    except LookupError:
         return False
-        # lmsg = patchwork_get_headers(msgid)
-        # if not lmsg:
-        #    return False
 
     for wanthdr in wanthdrs:
         if not msg.get(wanthdr) and lmsg.get(wanthdr):
@@ -161,7 +135,8 @@ def lookaside_fillin(msg):
     return True
 
 
-def marc_get_message(marc_list_id, msgnum, listid, toaddr, lookaside):
+def marc_get_message(marc_list_id: str, msgnum: str, listid: str, toaddr: str,
+                     lookaside: bool) -> email.message.Message:
     rses = get_requests_session()
     url = f'{MARCURL}/?l={marc_list_id}&m={msgnum}&q=mbox'
     logger.info('  grabbing message %s', msgnum)
@@ -179,7 +154,7 @@ def marc_get_message(marc_list_id, msgnum, listid, toaddr, lookaside):
     if not msg.get('Message-Id'):
         logger.info('    No message-id, ignored')
         # Can't use it anyway
-        return None
+        raise LookupError
 
     hdrs = list()
 
@@ -227,7 +202,7 @@ def marc_get_message(marc_list_id, msgnum, listid, toaddr, lookaside):
     return msg
 
 
-def check_if_spam(bmsg):
+def check_if_spam(bmsg: bytes) -> bool:
     if not os.path.exists('/usr/bin/spamc'):
         return False
 
@@ -243,7 +218,16 @@ def check_if_spam(bmsg):
     return True
 
 
-def add_msg_to_mbx(msg, mbx, checkspam):
+def add_msg_to_mbx(msg: email.message.Message, mbx: Union[mailbox.Mailbox, mailbox.Maildir],
+                   checkspam: bool, cleansubj: Optional[str]) -> None:
+    oldsubj = clean_header(msg.get('Subject', ''))
+    if cleansubj and cleansubj in oldsubj:
+        # We only remove it if it's ^thatsring, or ^Re: thatstring
+        if oldsubj.startswith(cleansubj):
+            msg.replace_header('Subject', oldsubj.replace(cleansubj, '', 1).strip())
+        if oldsubj.startswith(f'Re: {cleansubj}'):
+            msg.replace_header('Subject', oldsubj.replace(f'Re: {cleansubj}', 'Re:', 1).strip())
+
     if msg.get_default_type() == 'text/plain':
         try:
             payload = msg.get_payload(decode=True)
@@ -261,6 +245,7 @@ def add_msg_to_mbx(msg, mbx, checkspam):
             logger.info('    spam: %s', msg['Subject'])
             return
 
+        logger.info('    added: %s', msg['Subject'])
         mbx.add(bmsg)
     except: # noqa
         # Throw it out, because life is too short to figure out all possible ways
@@ -269,7 +254,7 @@ def add_msg_to_mbx(msg, mbx, checkspam):
         return
 
 
-def marc_get_full_thread(marc_list_id, thread_id):
+def marc_get_full_thread(marc_list_id: str, thread_id: str) -> List[str]:
     cp = 1
     rses = get_requests_session()
     msgnums = list()
@@ -308,7 +293,7 @@ def marc_get_full_thread(marc_list_id, thread_id):
     return msgnums
 
 
-def parse_pipermail_index(pipermail_url):
+def parse_pipermail_index(pipermail_url: str) -> Set[str]:
     logger.info('Grabbing pipermail index from %s', pipermail_url)
     rses = get_requests_session()
     resp = rses.get(pipermail_url)
@@ -325,7 +310,7 @@ def parse_pipermail_index(pipermail_url):
     return mboxes
 
 
-def parse_hyperkitty_index(hyperkitty_url):
+def parse_hyperkitty_index(hyperkitty_url: str) -> Set[str]:
     logger.info('Grabbing hyperkitty index from %s', hyperkitty_url)
     rses = get_requests_session()
     resp = rses.get(hyperkitty_url)
@@ -354,7 +339,8 @@ def parse_hyperkitty_index(hyperkitty_url):
     return mboxes
 
 
-def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checkspam):
+def grab_pipermail_archive(pipermail_url: str, mbx: Union[mailbox.Mailbox, mailbox.Maildir],
+                           args: argparse.Namespace) -> None:
     tmpfile = mkstemp('pipermail')[1]
     chunks = pipermail_url.split('/')
     if pipermail_url[0] == '/':
@@ -432,25 +418,25 @@ def grab_pipermail_archive(pipermail_url, mbx, listid, toaddr, lookaside, checks
             if newfrom != oldfrom:
                 msg.replace_header('From', newfrom)
 
-        if listid:
-            msg['List-Id'] = f'<{listid}>'
+        if args.listid:
+            msg['List-Id'] = f'<{args.listid}>'
 
-        if lookaside:
+        if args.lookaside:
             lookaside_fillin(msg)
 
         if not msg.get('To'):
-            msg['To'] = toaddr
+            msg['To'] = args.to
         # Fix in-reply-to
         irt = msg.get('in-reply-to')
         if irt and irt[0] != '<':
             msg.replace_header('In-Reply-To', f'<{irt}>')
-        add_msg_to_mbx(msg, mbx, checkspam)
+        add_msg_to_mbx(msg, mbx, args.checkspam, args.clean_subject)
 
     tmpmbx.close()
     os.unlink(tmpfile)
 
 
-def get_marcinfo(args):
+def get_marcinfo(args: argparse.Namespace) -> None:
     global MARCNICE
 
     if args.nice < 0.5:
@@ -521,7 +507,7 @@ def get_marcinfo(args):
                 break
             cp += 1
 
-    mbx = mailbox.mbox(args.out)
+    mbx = get_outbox(args)
     for thdnum in thdnums:
         tnums = marc_get_full_thread(marc_list_id, thdnum)
         # last message starts the thread
@@ -531,8 +517,9 @@ def get_marcinfo(args):
             if tnum in msgnums:
                 msgnums.remove(tnum)
             time.sleep(MARCNICE)
-            msg = marc_get_message(marc_list_id, tnum, args.listid, args.to, args.lookaside)
-            if not msg:
+            try:
+                msg = marc_get_message(marc_list_id, tnum, args.listid, args.to, args.lookaside)
+            except LookupError:
                 continue
 
             if not irt:
@@ -541,7 +528,7 @@ def get_marcinfo(args):
                 msg['References'] = irt
                 msg['In-Reply-To'] = irt
 
-            add_msg_to_mbx(msg, mbx, args.checkspam)
+            add_msg_to_mbx(msg, mbx, args.checkspam, args.clean_subject)
 
     logger.info('Grabbing remaining unthreaded messages')
     for msgnum in msgnums:
@@ -550,18 +537,18 @@ def get_marcinfo(args):
         if not msg:
             continue
 
-        add_msg_to_mbx(msg, mbx, args.checkspam)
+        add_msg_to_mbx(msg, mbx, args.checkspam, args.clean_subject)
 
     mbx.close()
 
 
-def get_mailman(args):
+def get_mailman(args: argparse.Namespace) -> None:
     if not args.to:
         args.to = args.listid.replace('.', '@', 1)
 
-    mbx = mailbox.mbox(args.out)
+    mbx = get_outbox(args)
     if args.url[0] == '/':
-        grab_pipermail_archive(args.url, mbx, args.listid, args.to, args.lookaside, args.checkspam)
+        grab_pipermail_archive(args.url, mbx, args)
     else:
         if args.mailman3:
             months = parse_hyperkitty_index(args.url)
@@ -571,10 +558,11 @@ def get_mailman(args):
             print('Could not find any .txt.gz files listed at %s' % args.url)
             sys.exit(1)
         for month in months:
-            grab_pipermail_archive(month, mbx, args.listid, args.to, args.lookaside, args.checkspam)
+            grab_pipermail_archive(month, mbx, args)
 
 
-def get_nntp(args):
+def get_nntp(args: argparse.Namespace) -> None:
+    import nntplib
     # Expect in format nntp://news.gmane.org/gmane.linux.network
     logger.info('Connecting to %s', args.url)
     chunks = args.url.split('/')
@@ -584,7 +572,7 @@ def get_nntp(args):
     resp, count, first, last, name = server.group(group)
     total = int(last)
 
-    mbx = mailbox.mbox(args.out)
+    mbx = get_outbox(args)
     aid = 1
     while aid <= total:
         try:
@@ -601,9 +589,9 @@ def get_nntp(args):
                 try:
                     msg.replace_header('List-Id', f'<{args.listid}>')
                 except KeyError:
-                    msg.add_header('List-Id', f'<{args.listid}')
+                    msg.add_header('List-Id', f'<{args.listid}>')
 
-            add_msg_to_mbx(msg, mbx, args.checkspam)
+            add_msg_to_mbx(msg, mbx, args.checkspam, args.clean_subject)
 
         except nntplib.NNTPTemporaryError:
             # Ignore one-off article failures -- probably deletes
@@ -614,9 +602,14 @@ def get_nntp(args):
     mbx.close()
 
 
-if __name__ == '__main__':
-    import argparse
+def get_outbox(args: argparse.Namespace) -> Union[mailbox.Mailbox, mailbox.Maildir]:
+    if args.as_maildir:
+        logger.info('Will output into maildir %s', args.out)
+        return mailbox.Maildir(args.out)
+    return mailbox.mbox(args.out)
 
+
+if __name__ == '__main__':
     # noinspection PyTypeChecker
     parser = argparse.ArgumentParser(
         description="Collect external mail archives into a local mbox",
@@ -635,6 +628,10 @@ if __name__ == '__main__':
                         help='Run spamc to check messages for spam before adding')
     parser.add_argument('-o', '--out', required=True,
                         help='Filename of the mailbox file to write out')
+    parser.add_argument('-m', '--as-maildir', action='store_true', default=False,
+                        help='Output as maildir instead of mbox')
+    parser.add_argument('-c', '--clean-subject',
+                        help='Remove this string from subjects (e.g. [listname])')
 
     subparsers = parser.add_subparsers(help='sub-command help', dest='subcmd')
 
