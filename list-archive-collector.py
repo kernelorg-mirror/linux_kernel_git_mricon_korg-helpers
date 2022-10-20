@@ -219,14 +219,15 @@ def check_if_spam(bmsg: bytes) -> bool:
 
 
 def add_msg_to_mbx(msg: email.message.Message, mbx: Union[mailbox.Mailbox, mailbox.Maildir],
-                   checkspam: bool, cleansubj: Optional[str]) -> None:
-    oldsubj = clean_header(msg.get('Subject', ''))
-    if cleansubj and cleansubj in oldsubj:
-        # We only remove it if it's ^thatsring, or ^Re: thatstring
-        if oldsubj.startswith(cleansubj):
-            msg.replace_header('Subject', oldsubj.replace(cleansubj, '', 1).strip())
-        if oldsubj.startswith(f'Re: {cleansubj}'):
-            msg.replace_header('Subject', oldsubj.replace(f'Re: {cleansubj}', 'Re:', 1).strip())
+                   checkspam: bool, cleansubj: Optional[List[str]]) -> None:
+    if cleansubj:
+        for remstr in cleansubj:
+            oldsubj = clean_header(msg.get('Subject', ''))
+            # We only remove it if it's ^thatsring, or ^Re: thatstring
+            if oldsubj.startswith(remstr):
+                msg.replace_header('Subject', oldsubj.replace(remstr, '', 1).strip())
+            elif oldsubj.startswith(f'Re: {remstr}'):
+                msg.replace_header('Subject', oldsubj.replace(f'Re: {remstr}', 'Re:', 1).strip())
 
     if msg.get_default_type() == 'text/plain':
         try:
@@ -630,7 +631,7 @@ if __name__ == '__main__':
                         help='Filename of the mailbox file to write out')
     parser.add_argument('-m', '--as-maildir', action='store_true', default=False,
                         help='Output as maildir instead of mbox')
-    parser.add_argument('-c', '--clean-subject',
+    parser.add_argument('-c', '--clean-subject', nargs='+',
                         help='Remove this string from subjects (e.g. [listname])')
 
     subparsers = parser.add_subparsers(help='sub-command help', dest='subcmd')
