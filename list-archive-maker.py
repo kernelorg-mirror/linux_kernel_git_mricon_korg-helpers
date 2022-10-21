@@ -153,6 +153,9 @@ def process_archives(sources: List[str], outdir: str, knownset: Set[str], listid
                 dupmsgid += 1
                 continue
 
+            if extrahdrs:
+                msg._headers += extrahdrs  # noqa
+
             # Remove headers not in WANTHDRS list and any Received:
             # lines that do not mention the list email address
             newhdrs = list()
@@ -160,7 +163,7 @@ def process_archives(sources: List[str], outdir: str, knownset: Set[str], listid
             cc = list()
             recvtime = None
             is_our_list = False
-            for hdrname, hdrval in list(msg._headers): # noqa
+            for hdrname, hdrval in list(msg._headers):  # noqa
                 lhdrname = hdrname.lower()
                 lhdrval = hdrval.lower()
                 wanthdr = False
@@ -261,9 +264,6 @@ def process_archives(sources: List[str], outdir: str, knownset: Set[str], listid
                     notourlist += 1
                     continue
 
-            if extrahdrs:
-                newhdrs += extrahdrs
-
             msg._headers = newhdrs
 
             msgdate = recvtime
@@ -322,7 +322,7 @@ def main(args: argparse.Namespace):
             dbconn = sqlite3.connect(args.known_ids, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
             cur = dbconn.cursor()
             rows = cur.execute('SELECT mid FROM msgmap').fetchall()
-            knownids = {x[0] for x in rows}
+            knownids = {f'<{x[0]}>' for x in rows}
         else:
             with open(args.known_ids, 'r') as fh:
                 knownids = set(fh.read().splitlines())
