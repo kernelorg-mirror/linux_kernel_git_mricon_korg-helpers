@@ -6,7 +6,7 @@
 #
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
-import falcon
+import falcon  # noqa
 import json
 import socket
 import email
@@ -119,7 +119,7 @@ class GroupsioListener(object):
     def _write_pi(self, pirepo: str, msg: email.message.Message) -> bool:
         success = False
         try:
-            import ezpi
+            import ezpi  # noqa
             ezpi.add_rfc822(pirepo, msg)
             ezpi.run_hook(pirepo)
             logger.info('Wrote to public-inbox at %s', pirepo)
@@ -198,8 +198,10 @@ class GroupsioListener(object):
             return
 
         success = True
-        if doc.get('action', '') == 'sent_message_accepted' and 'message' in doc:
+        if 'message' in doc and len(doc.get('message')):
             success = self._inject_message(doc, req)
+        else:
+            logger.debug('No message in payload, skipping')
 
         if success:
             resp.status = falcon.HTTP_200
