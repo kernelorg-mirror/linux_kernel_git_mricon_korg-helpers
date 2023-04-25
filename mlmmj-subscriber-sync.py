@@ -14,6 +14,7 @@ import requests
 import os
 import sys
 import subprocess
+import hashlib
 
 from typing import Set, List, Optional, Tuple
 from fcntl import lockf, LOCK_EX, LOCK_NB, LOCK_UN
@@ -25,6 +26,8 @@ __VERSION__ = '0.1'
 MLMMJ_SUB = '/usr/bin/mlmmj-sub'
 MLMMJ_UNSUB = '/usr/bin/mlmmj-unsub'
 logger = logging.getLogger(__APPNAME__)
+
+CSUMS = dict()
 
 
 def _run_command(args: List[str], stdin: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
@@ -39,7 +42,8 @@ def _run_command(args: List[str], stdin: Optional[bytes] = None) -> Tuple[int, b
     return sp.returncode, output, error
 
 
-def get_remote_subscribers(mldir: str) -> Set[str]:
+def get_remote_subscribers(mldir: str) -> Tuple[Optional[str], Set[str]]:
+    global CSUMS
     urlfile = os.path.join(mldir, '.external-subscribers-url')
     if not os.path.exists(urlfile):
         raise FileNotFoundError('No .external-subscribers-url defined for %s', mldir)
@@ -48,15 +52,49 @@ def get_remote_subscribers(mldir: str) -> Set[str]:
     rses = requests.session()
     headers = {'User-Agent': f'{__APPNAME__}/{__VERSION__}'}
     rses.headers.update(headers)
+    # Grab the checksums file from that dir first
+    rdir, lname = url.rsplit('/', maxsplit=1)
+    ckpath = rdir + '/checksum.txt'
+    if ckpath not in CSUMS:
+        CSUMS[ckpath] = dict()
+        resp = rses.get(ckpath)
+        if resp.status_code == 200:
+            # Oh, good, we have a checksum.txt
+            data = resp.text.strip()
+            for line in data.splitlines():
+                csum, clname = line.split(maxsplit=1)
+                CSUMS[ckpath][clname] = csum
+
+    csum = None
+    if lname in CSUMS[ckpath]:
+        csum = CSUMS[ckpath][lname]
+        lastcsfile = os.path.join(mldir, '.external-subscribers-last-csum')
+        try:
+            with open(lastcsfile, 'r') as fh:
+                lastcsum = fh.read().strip()
+            if lastcsum == csum:
+                logger.debug('Remote checksum for %s is the same', lname)
+                raise FileExistsError
+        except FileNotFoundError:
+            pass
+
     resp = rses.get(url)
     if resp.status_code != 200:
         logger.info('Unable to retrieve %s: %s', url, resp.text)
         raise FileNotFoundError
     resp.raise_for_status()
-    data = resp.text.strip()
+    bdata = resp.content
+    if csum:
+        # Hardcode checksum to sha256 for now
+        mysum = hashlib.sha256(bdata).hexdigest()
+        if mysum != csum:
+            logger.debug('Checksum for %s did NOT match, ignoring', url)
+            raise FileNotFoundError
+
+    data = bdata.strip().decode()
     subs = set(data.splitlines())
     logger.info('Loaded %s remote subscribers from %s', len(subs), url)
-    return subs
+    return csum, subs
 
 
 def get_last_subscribers(mldir: str) -> Set[str]:
@@ -72,31 +110,44 @@ def get_last_subscribers(mldir: str) -> Set[str]:
     return subs
 
 
-def store_last(subs: Set[str], mldir: str):
+def store_last(subs: Set[str], csum: str, mldir: str):
     lastfile = os.path.join(mldir, '.external-subscribers-last')
     logger.info('Storing %s with %s entries', lastfile, len(subs))
     with open(lastfile, 'w') as fh:
         fh.write('\n'.join(sorted(list(subs))) + '\n')
+    if not csum:
+        return
+    lastcsfile = os.path.join(mldir, '.external-subscribers-last-csum')
+    logger.info('Storing %s with checksum=%s', lastcsfile, csum)
+    with open(lastcsfile, 'w') as fh:
+        fh.write(csum + '\n')
 
 
-def mlmmj_sub(tosub: Set[str], mldir: str) -> None:
-    for addr in tosub:
+def mlmmj_subunsub(remote: Set[str], local: Set[str], mldir: str) -> None:
+    # Make a local log
+    ll = logging.getLogger(mldir)
+    ll.setLevel(logging.DEBUG)
+    lch = logging.FileHandler(os.path.join(mldir, '.external-subscribers.log'))
+    lfmt = logging.Formatter('[%(asctime)s] %(message)s')
+    lch.setFormatter(lfmt)
+    lch.setLevel(logging.INFO)
+    ll.addHandler(lch)
+    for addr in remote.difference(local):
         logger.info('Subscribing %s', addr)
         args = [MLMMJ_SUB, '-L', mldir, '-f', '-q', '-s', '-a', addr]
         ecode, out, err = _run_command(args)
         if ecode > 0:
             logger.critical('Error: %s, %s', out.decode(), err.decode())
             raise RuntimeError('Unable to run mlmmj_sub')
-
-
-def mlmmj_unsub(tounsub: Set[str], mldir: str) -> None:
-    for addr in tounsub:
+        ll.info('subscribed %s', addr)
+    for addr in local.difference(remote):
         logger.info('Unsubscribing %s', addr)
         args = [MLMMJ_UNSUB, '-L', mldir, '-q', '-s', '-a', addr]
         ecode, out, err = _run_command(args)
         if ecode > 0:
             logger.critical('Error: %s, %s', out.decode(), err.decode())
             raise RuntimeError('Unable to run mlmmj_unsub')
+        ll.info('unsubscribed %s', addr)
 
 
 def subscriber_sync(cmdargs: argparse.Namespace) -> None:
@@ -104,8 +155,8 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
     for entry in os.listdir(cmdargs.mlmmj_spool_dir):
         mldir = os.path.join(cmdargs.mlmmj_spool_dir, entry)
         try:
-            remote = get_remote_subscribers(mldir)
-        except FileNotFoundError:
+            csum, remote = get_remote_subscribers(mldir)
+        except (FileNotFoundError, FileExistsError):
             continue
         ml = entry
         logger.info('Processing %s', ml)
@@ -126,9 +177,8 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
             logger.info('No change for %s', ml)
             continue
         try:
-            mlmmj_sub(remote.difference(local), mldir)
-            mlmmj_unsub(local.difference(remote), mldir)
-            store_last(remote, mldir)
+            mlmmj_subunsub(remote, local, mldir)
+            store_last(remote, csum, mldir)
         except RuntimeError:
             logger.critical('Unable to run mlmmj commands, exiting in panic')
             sys.exit(1)
@@ -142,6 +192,8 @@ if __name__ == '__main__':
     parser.add_argument('--mlmmj-spool-dir',
                         default='/var/spool/mlmmj',
                         help='Where mlmmj lists are, if not in /var/spool/mlmmj')
+    parser.add_argument('--sleep-upper', type=int, default=60,
+                        help='Upper range for sleep, use 0 to disable')
     _args = parser.parse_args()
 
     logger.setLevel(logging.DEBUG)
@@ -153,5 +205,11 @@ if __name__ == '__main__':
     else:
         ch.setLevel(logging.INFO)
     logger.addHandler(ch)
+    if _args.sleep_upper:
+        import random
+        import time
+        sn = random.randrange(10, _args.sleep_upper, 5)
+        logger.info('Sleeping %s seconds', sn)
+        time.sleep(sn)
 
     subscriber_sync(_args)
