@@ -54,6 +54,7 @@ MARCURL = 'https://marc.info'
 # Wait this many seconds between requests to marc.info, to avoid triggering
 # anti-abuse blocks (and to just be nice)
 MARCNICE = 1
+LASTMARC = None
 
 # Set our own policy
 EMLPOLICY = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
@@ -137,10 +138,9 @@ def lookaside_fillin(msg: email.message.Message) -> bool:
 
 def marc_get_message(marc_list_id: str, msgnum: str, listid: str, toaddr: str,
                      lookaside: bool) -> email.message.Message:
-    rses = get_requests_session()
     url = f'{MARCURL}/?l={marc_list_id}&m={msgnum}&q=mbox'
     logger.info('  grabbing message %s', msgnum)
-    resp = rses.get(url)
+    resp = marc_nice_get(url)
     rawmsg = resp.content
     multipart = False
     if rawmsg.find(b'\nContent-Type: multipart/mixed;') > 0:
@@ -152,9 +152,7 @@ def marc_get_message(marc_list_id: str, msgnum: str, listid: str, toaddr: str,
 
     msg = email.message_from_bytes(rawmsg)
     if not msg.get('Message-Id'):
-        logger.info('    No message-id, ignored')
-        # Can't use it anyway
-        raise LookupError
+        msg['Message-Id'] = f'<marc-{marc_list_id}-{msgnum}@msgid-missing>'
 
     hdrs = list()
 
@@ -255,19 +253,30 @@ def add_msg_to_mbx(msg: email.message.Message, mbx: Union[mailbox.Mailbox, mailb
         return
 
 
+def marc_nice_get(url: str):
+    global LASTMARC
+    if LASTMARC:
+        msleep = MARCNICE - (time.time() - LASTMARC)
+    else:
+        msleep = MARCNICE
+    if msleep > 0:
+        time.sleep(msleep)
+    rses = get_requests_session()
+    rsp = rses.get(url)
+    LASTMARC = time.time()
+    return rsp
+
+
 def marc_get_full_thread(marc_list_id: str, thread_id: str) -> List[str]:
     cp = 1
-    rses = get_requests_session()
     msgnums = list()
     logger.info('Grabbing thread %s', thread_id)
     while True:
         lastpage = True
         np = cp + 1
         nl = f'r={np}&'
-        # Be nice
-        time.sleep(MARCNICE)
         url = f'{MARCURL}/?t={thread_id}&r={cp}&w=1'
-        rsp = rses.get(url)
+        rsp = marc_nice_get(url)
         soup = BeautifulSoup(rsp.content, features='lxml')
         for tag in soup.find_all('a'):
             href = tag.attrs.get('href')
@@ -466,6 +475,17 @@ def get_marcinfo(args: argparse.Namespace) -> None:
         if match:
             months.append(match.groups()[0])
 
+    mbx = get_outbox(args)
+    havenums = set()
+    if len(mbx):
+        for msg in mbx:
+            xmarc = msg.get('X-MARC-Message')
+            if xmarc:
+                match = re.search(r'm=(\d+)', xmarc)
+                if match:
+                    havenums.add(match.groups()[0])
+
+    logger.info('Found %s messages already in mbox', len(havenums))
     thdnums = set()
     msgnums = set()
     for month in months:
@@ -474,13 +494,11 @@ def get_marcinfo(args: argparse.Namespace) -> None:
         cp = 1
         while True:
             lastpage = True
-            # Be nice
             np = cp + 1
-            time.sleep(MARCNICE)
             url = f'{MARCURL}/?l={marc_list_id}&b={month}&r={cp}&w=1'
             if cp > 1:
                 logger.info('  ... page %s', cp)
-            rsp = rses.get(url)
+            rsp = marc_nice_get(url)
             soup = BeautifulSoup(rsp.content, features='lxml')
             for tag in soup.find_all('a'):
                 href = tag.attrs.get('href')
@@ -508,16 +526,18 @@ def get_marcinfo(args: argparse.Namespace) -> None:
                 break
             cp += 1
 
-    mbx = get_outbox(args)
     for thdnum in thdnums:
         tnums = marc_get_full_thread(marc_list_id, thdnum)
         # last message starts the thread
         tnums.reverse()
         irt = None
         for tnum in tnums:
+            if tnum in havenums:
+                logger.info('Already have %s', tnum)
+                continue
+
             if tnum in msgnums:
                 msgnums.remove(tnum)
-            time.sleep(MARCNICE)
             try:
                 msg = marc_get_message(marc_list_id, tnum, args.listid, args.to, args.lookaside)
             except LookupError:
@@ -533,8 +553,13 @@ def get_marcinfo(args: argparse.Namespace) -> None:
 
     logger.info('Grabbing remaining unthreaded messages')
     for msgnum in msgnums:
-        time.sleep(MARCNICE)
-        msg = marc_get_message(marc_list_id, msgnum, args.listid, args.to, args.lookaside)
+        if msgnum in havenums:
+            logger.info('Already have %s', tnum)
+            continue
+        try:
+            msg = marc_get_message(marc_list_id, msgnum, args.listid, args.to, args.lookaside)
+        except LookupError:
+            continue
         if not msg:
             continue
 
