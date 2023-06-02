@@ -42,8 +42,39 @@ def _run_command(args: List[str], stdin: Optional[bytes] = None) -> Tuple[int, b
     return sp.returncode, output, error
 
 
+def get_git_subscribers(gitdir: str) -> Tuple[Optional[str], Set[str]]:
+    # currently, we only support origin/master
+    curdir = os.getcwd()
+    os.chdir(gitdir)
+    args = ['git', 'pull', 'origin', 'master', '-q']
+    ecode, out, err = _run_command(args)
+    os.chdir(curdir)
+    if ecode > 0:
+        logger.info('Was not able to pull %s', gitdir)
+        logger.info(err.decode())
+    subsfile = os.path.join(gitdir, 'subscribers')
+    subs = set()
+    with open(subsfile, 'r') as fh:
+        while True:
+            line = fh.readline()
+            line = line.strip()
+            if not line:
+                break
+            if line.startswith('#'):
+                continue
+            subs.add(line)
+
+    logger.info('Loaded %s remote subscribers from %s', len(subs), subsfile)
+    return None, subs
+
+
 def get_remote_subscribers(mldir: str) -> Tuple[Optional[str], Set[str]]:
     global CSUMS
+    # This overrides the presence of .external-subscribers-url
+    gitdir = os.path.join(mldir, '.external-subscribers.git')
+    if os.path.isdir(gitdir):
+        return get_git_subscribers(gitdir)
+
     urlfile = os.path.join(mldir, '.external-subscribers-url')
     if not os.path.exists(urlfile):
         raise FileNotFoundError('No .external-subscribers-url defined for %s', mldir)
@@ -156,7 +187,7 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
         mldir = os.path.join(cmdargs.mlmmj_spool_dir, entry)
         try:
             csum, remote = get_remote_subscribers(mldir)
-        except (FileNotFoundError, FileExistsError):
+        except (FileNotFoundError, FileExistsError, TimeoutError):
             continue
         ml = entry
         logger.info('Processing %s', ml)
