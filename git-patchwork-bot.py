@@ -121,7 +121,7 @@ class Restmaker:
             if not pagedata:
                 break
             results.extend(pagedata)
-            if len(pagedata) < REST_PER_PAGE:
+            if len(pagedata) <= REST_PER_PAGE:
                 break
 
         return results
@@ -466,8 +466,8 @@ def git_get_new_revs(gitdir: str, db_heads: List[Tuple[str, str]], git_heads: Li
     return newrevs
 
 
-def git_get_rev_info(gitdir: str, rev: str) -> str:
-    args = ['show', rev]
+def git_get_rev_info(gitdir: str, rev: str, algorithm: str = 'myers') -> str:
+    args = ['show', f'--diff-algorithm={algorithm}', rev]
     return git_run_command(gitdir, args)
 
 
@@ -1225,6 +1225,12 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
                     logger.info('  Matching by msgid: %s (%s)', msgid, logline)
                     patch_ids = get_patchwork_patches_by_project_msgid(rm, project_id, msgid)
                 if not patch_ids:
+                    logger.info('  Regenerating %s using --histogram diff algorithm', rev)
+                    info = git_get_rev_info(repo, rev, algorithm='histogram')
+                    hpwhash = get_patchwork_hash(info)
+                    logger.info('  Matching by --histogram hash: %s (%s)', hpwhash, logline)
+                    patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, hpwhash)
+                if not patch_ids:
                     logger.info('    No match for: %s', logline)
                     continue
 
@@ -1331,8 +1337,6 @@ def pwhash_differ() -> None:
                 logger.info(patch.get('diff'))
                 logger.info('--- hash: %s ---', patch.get('hash'))
                 sys.exit(1)
-    logger.info('No mismatches found')
-    sys.exit(0)
 
 
 if __name__ == '__main__':
