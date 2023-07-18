@@ -61,6 +61,8 @@ WANTHDRS = {'return-path',
             'errors-to',
             'x-mailing-list',
             'resent-to',
+            'dkim-*',
+            'x-developer-*',
             }
 
 __VERSION__ = '2.0'
