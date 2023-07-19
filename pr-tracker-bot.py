@@ -811,7 +811,7 @@ if __name__ == '__main__':
 
     if cmdargs.logfile:
         ch = logging.FileHandler(cmdargs.logfile)
-        formatter = logging.Formatter('[%(asctime)s] %(message)s')
+        formatter = logging.Formatter('[%(process)d] - %(asctime)s - %(message)s')
         ch.setFormatter(formatter)
 
         if cmdargs.debug:
