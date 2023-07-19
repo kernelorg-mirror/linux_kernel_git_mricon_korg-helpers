@@ -1228,8 +1228,11 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
                     logger.info('  Regenerating %s using --histogram diff algorithm', rev)
                     info = git_get_rev_info(repo, rev, algorithm='histogram')
                     hpwhash = get_patchwork_hash(info)
-                    logger.info('  Matching by --histogram hash: %s (%s)', hpwhash, logline)
-                    patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, hpwhash)
+                    if hpwhash != pwhash:
+                        logger.info('  Matching by --histogram hash: %s (%s)', hpwhash, logline)
+                        patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, hpwhash)
+                    else:
+                        logger.info('    diff --histogram resulted in the same hash, ignoring')
                 if not patch_ids:
                     logger.info('    No match for: %s', logline)
                     continue
