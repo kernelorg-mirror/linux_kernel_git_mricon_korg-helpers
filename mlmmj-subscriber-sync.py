@@ -187,7 +187,7 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
         mldir = os.path.join(cmdargs.mlmmj_spool_dir, entry)
         try:
             csum, remote = get_remote_subscribers(mldir)
-        except (FileNotFoundError, FileExistsError, TimeoutError):
+        except (FileNotFoundError, FileExistsError, TimeoutError, OSError):
             continue
         ml = entry
         logger.info('Processing %s', ml)
