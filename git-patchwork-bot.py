@@ -116,12 +116,17 @@ class Restmaker:
             _params = list(params) + [('page', page)]
             logger.debug('Performing query: url=%s, params=%s', url, _params)
             rsp = self.session.get(url, params=_params, stream=False)
+            if rsp.status_code == 404:
+                logger.debug('No such page: %s', page)
+                break
             rsp.raise_for_status()
             pagedata = rsp.json()
             if not pagedata:
+                logger.debug('No pagedata returned, exiting fetches')
                 break
             results.extend(pagedata)
-            if len(pagedata) <= REST_PER_PAGE:
+            if len(pagedata) < REST_PER_PAGE:
+                logger.debug('Fewer than %s returned, assuming last page', REST_PER_PAGE)
                 break
 
         return results
@@ -444,6 +449,7 @@ def git_get_new_revs(gitdir: str, db_heads: List[Tuple[str, str]], git_heads: Li
 
         lines = git_get_command_lines(gitdir, args)
         if not lines:
+            # TODO: Fix for rebased repositories
             continue
 
         revs = list()
