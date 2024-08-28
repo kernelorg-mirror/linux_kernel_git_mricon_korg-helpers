@@ -39,8 +39,8 @@ USEKEYRING=
 
 # Point this at your GnuPG binary version 2.1.11 or above.
 # If you are using USEKEYRING, GnuPG-1 will work, too.
-GPGBIN="/usr/bin/gpg2"
-GPGVBIN="/usr/bin/gpgv2"
+GPGBIN="/usr/bin/gpg"
+GPGVBIN="/usr/bin/gpgv"
 # We need a compatible version of sha256sum, too
 SHA256SUMBIN="/usr/bin/sha256sum"
 # And curl

@@ -26,8 +26,8 @@ if [[ -z ${REMOTE} ]]; then
     REMOTE="origin"
 fi
 
-# Change this if your gpg2 is elsewhere
-GPGBIN="/usr/bin/gpg2"
+# Change this if your gpg is elsewhere
+GPGBIN="/usr/bin/gpg"
 # Change this if your minisign is elsewhere
 MINISIGNBIN="/usr/bin/minisign"
 
