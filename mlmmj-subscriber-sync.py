@@ -15,9 +15,11 @@ import os
 import sys
 import subprocess
 import hashlib
+import email.utils
 
 from typing import Set, List, Optional, Tuple
 from fcntl import lockf, LOCK_EX, LOCK_NB, LOCK_UN
+from requests.exceptions import ConnectionError
 
 
 __APPNAME__ = 'mlmmj-subscriber-sync'
@@ -68,6 +70,42 @@ def get_git_subscribers(gitdir: str) -> Tuple[Optional[str], Set[str]]:
     return None, subs
 
 
+def get_maintainers(url: str) -> Tuple[Optional[str], Set[str]]:
+    rses = requests.session()
+    headers = {'User-Agent': f'{__APPNAME__}/{__VERSION__}'}
+    rses.headers.update(headers)
+    resp = rses.get(url)
+    if resp.status_code != 200:
+        logger.info('Unable to retrieve %s: %s', url, resp.text)
+        raise FileNotFoundError
+    bdata = resp.content
+    data = bdata.strip().decode()
+    cur_sub = dict()
+    subs = set()
+    for mline in data.splitlines():
+        if mline.startswith('#'):
+            continue
+        if len(mline) < 2 or not len(mline[0].strip()):
+            if not cur_sub or not cur_sub.get('S') or not cur_sub.get('M'):
+                continue
+            status = cur_sub.get('S').lower()
+            if status not in {'supported', 'maintained', 'odd fixes'}:
+                continue
+            addrs = email.utils.getaddresses([cur_sub.get('M')])
+            if not addrs:
+                continue
+            for addr in addrs:
+                if addr[1]:
+                    subs.add(addr[1])
+            cur_sub = dict()
+            continue
+        if mline[1] != ':':
+            continue
+        cur_sub[mline[0]] = mline[2:].strip()
+
+    return None, subs
+
+
 def get_remote_subscribers(mldir: str) -> Tuple[Optional[str], Set[str]]:
     global CSUMS
     # This overrides the presence of .external-subscribers-url
@@ -80,10 +118,13 @@ def get_remote_subscribers(mldir: str) -> Tuple[Optional[str], Set[str]]:
         raise FileNotFoundError('No .external-subscribers-url defined for %s', mldir)
     with open(urlfile, 'r') as fh:
         url = fh.read().strip()
+    if 'MAINTAINERS' in url:
+        return get_maintainers(url)
+
     rses = requests.session()
     headers = {'User-Agent': f'{__APPNAME__}/{__VERSION__}'}
     rses.headers.update(headers)
-    # Grab the checksums file from that dir first
+    # Grab the checksum file from that dir first
     rdir, lname = url.rsplit('/', maxsplit=1)
     ckpath = rdir + '/checksum.txt'
     if ckpath not in CSUMS:
@@ -165,7 +206,7 @@ def mlmmj_subunsub(remote: Set[str], local: Set[str], mldir: str) -> None:
     ll.addHandler(lch)
     for addr in remote.difference(local):
         logger.info('Subscribing %s', addr)
-        args = [MLMMJ_SUB, '-L', mldir, '-f', '-q', '-s', '-a', addr]
+        args = [MLMMJ_SUB, '-L', mldir, '-f', '-c', '-s', '-a', addr]
         ecode, out, err = _run_command(args)
         if ecode > 0:
             logger.critical('Error: %s, %s', out.decode(), err.decode())
@@ -173,7 +214,7 @@ def mlmmj_subunsub(remote: Set[str], local: Set[str], mldir: str) -> None:
         ll.info('subscribed %s', addr)
     for addr in local.difference(remote):
         logger.info('Unsubscribing %s', addr)
-        args = [MLMMJ_UNSUB, '-L', mldir, '-q', '-s', '-a', addr]
+        args = [MLMMJ_UNSUB, '-L', mldir, '-c', '-s', '-a', addr]
         ecode, out, err = _run_command(args)
         if ecode > 0:
             logger.critical('Error: %s, %s', out.decode(), err.decode())
@@ -187,11 +228,10 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
         mldir = os.path.join(cmdargs.mlmmj_spool_dir, entry)
         try:
             csum, remote = get_remote_subscribers(mldir)
-        except (FileNotFoundError, FileExistsError, TimeoutError, OSError):
+        except (FileNotFoundError, FileExistsError, TimeoutError, OSError, ConnectionError):
             continue
         ml = entry
         logger.info('Processing %s', ml)
-        # if remote is empty, this is sus -- something probably went wrong
         if not len(remote):
             logger.info('Remote is empty, this is sus')
             continue
