@@ -88,20 +88,26 @@ def get_maintainers(url: str) -> Tuple[Optional[str], Set[str]]:
         if len(mline) < 2 or not len(mline[0].strip()):
             if not cur_sub or not cur_sub.get('S') or not cur_sub.get('M'):
                 continue
-            status = cur_sub.get('S').lower()
+            status = cur_sub.get('S').pop().lower()
             if status not in {'supported', 'maintained', 'odd fixes'}:
                 continue
-            addrs = email.utils.getaddresses([cur_sub.get('M')])
+            addrs = email.utils.getaddresses(cur_sub.get('M'))
             if not addrs:
                 continue
             for addr in addrs:
-                if addr[1]:
-                    subs.add(addr[1])
+                if addr[1] and '@' in addr[1]:
+                    local, remote = addr[1].split('@')
+                    if '+' in local:
+                        local = local.split('+')[0]
+                    subs.add(f'{local}@{remote}')
             cur_sub = dict()
             continue
         if mline[1] != ':':
             continue
-        cur_sub[mline[0]] = mline[2:].strip()
+        ltype = mline[0]
+        if ltype not in cur_sub:
+            cur_sub[ltype] = list()
+        cur_sub[ltype].append(mline[2:].strip())
 
     return None, subs
 
