@@ -16,6 +16,7 @@ import sys
 import subprocess
 import hashlib
 import email.utils
+import fnmatch
 
 from typing import Set, List, Optional, Tuple
 from fcntl import lockf, LOCK_EX, LOCK_NB, LOCK_UN
@@ -175,6 +176,23 @@ def get_remote_subscribers(mldir: str) -> Tuple[Optional[str], Set[str]]:
     return csum, subs
 
 
+def remove_excluded(mldir: str, subs: Set[str]) -> Set[str]:
+    exclfile = os.path.join(mldir, '.external-subscribers-excl')
+    if not os.path.exists(exclfile):
+        return subs
+    with open(exclfile, 'r') as fh:
+        lines = set(fh.read().strip().splitlines())
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            for sub in set(subs):
+                if fnmatch.fnmatch(sub, line):
+                    subs.remove(sub)
+                    logger.debug('Removed excluded %s', sub)
+    return subs
+
+
 def get_last_subscribers(mldir: str) -> Set[str]:
     lastfile = os.path.join(mldir, '.external-subscribers-last')
     if not os.path.exists(lastfile):
@@ -241,6 +259,7 @@ def subscriber_sync(cmdargs: argparse.Namespace) -> None:
         if not len(remote):
             logger.info('Remote is empty, this is sus')
             continue
+        remote = remove_excluded(mldir, remote)
         # Lock it, so there are no clashes
         lf = os.path.join(mldir, '.mlmmj-subscriber-sync.lock')
         lfh = open(lf, 'w')
