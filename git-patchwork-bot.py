@@ -9,7 +9,7 @@
 # It runs from a cronjob, but can be also run from post-update hooks with
 # extra wrappers. For more details, consult:
 #
-# https://korg.wiki.kernel.org/userdoc/pwbot
+# https://korg.docs.kernel.org/patchwork/pwbot.html
 #
 #
 
@@ -27,7 +27,7 @@ import re
 import requests
 import datetime
 
-import ruamel.yaml # noqa
+import ruamel.yaml
 
 from email.mime.text import MIMEText
 from email.header import Header
@@ -36,34 +36,35 @@ from email.utils import formatdate, getaddresses, make_msgid
 from fcntl import lockf, LOCK_EX, LOCK_NB
 
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3.util.retry import Retry
 
 from string import Template
-from typing import Optional, Tuple, Union, Dict, List, Set
+from typing import Optional, Tuple, Union, Dict, List, Set, Any
 
 # Send all email 8-bit, this is not 1999
 from email import charset
 charset.add_charset('utf-8', charset.SHORTEST)
 
-__VERSION__ = '2.0'
-DB_VERSION = 1
-REST_API_VERSION = '1.2'
-LORE_RE = re.compile(r'^\s*Link:\s+\S+://(?:lore|lkml)\.kernel\.org\S*/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
-HUNK_RE = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
-FILENAME_RE = re.compile(r'^(---|\+\+\+) (\S+)')
-REST_PER_PAGE = 100
+__VERSION__: str = '2.0'
+DB_VERSION: str = '1'
+REST_API_VERSION: str = '1.2'
+LORE_RE: re.Pattern = re.compile(r'^\s*Link:\s+\S+://(?:lore|lkml)\.kernel\.org\S*/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
+HUNK_RE: re.Pattern = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
+FILENAME_RE: re.Pattern = re.compile(r'^(---|\+\+\+) (\S+)')
+REST_PER_PAGE: int = 100
 
-CONFIG = None
+CONFIG: Dict[str, Any]
 
-NOMAIL = False
-DRYRUN = False
-MAILHOST = 'localhost'
-DOMAIN = None
-CACHEDIR = os.path.expanduser('~/.cache/git-patchwork-bot')
+NOMAIL: bool = False
+DRYRUN: bool = False
+MAILHOST: str = 'localhost'
+DOMAIN: str = ''
+USER_AGENT: str = 'git-patchwork-helper'
+CACHEDIR: str = os.path.expanduser('~/.cache/git-patchwork-bot')
 
-_project_cache = dict()
-_server_cache = dict()
-_rev_cache = dict()
+_project_cache: Dict[str, Tuple[dict, 'Restmaker', dict]] = dict()
+_server_cache: Dict[str, Tuple['Restmaker', List[dict]]] = dict()
+_rev_cache: Dict[str, Tuple[str, str, str, Optional[str], Optional[str]]] = dict()
 
 logger = logging.getLogger('gitpwcron')
 
@@ -94,8 +95,13 @@ class Restmaker:
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
+        try:
+            useragent = CONFIG['bot'].get('useragent', USER_AGENT)
+        except KeyError:
+            useragent = USER_AGENT
+
         headers = {
-            'User-Agent': f'git-patchwork-bot/{__VERSION__}',
+            'User-Agent': f'{useragent}/{__VERSION__}',
         }
         apitoken = CONFIG['patchworks'][server].get('apitoken', None)
         if not apitoken:
@@ -109,7 +115,6 @@ class Restmaker:
         page = 0
         results = list()
         params.append(('per_page', REST_PER_PAGE))
-        _page_params = list(params)
         while True:
             page += 1
             logger.debug('Processing page %s', page)
@@ -143,7 +148,7 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             raise KeyError('Not able to get cover %s', cover_id)
 
-    def get_patch(self, patch_id: int) -> dict:
+    def get_patch(self, patch_id: int) -> Optional[dict]:
         if patch_id not in self._patches:
             try:
                 logger.debug('Grabbing patch %d', patch_id)
@@ -195,7 +200,7 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             return list()
 
-    def get_projects_list(self, params: list) -> list:
+    def get_projects_list(self, params: list) -> List[dict[str, Any]]:
         try:
             return self.get_unpaginated(self.projects_url, params)
         except requests.exceptions.RequestException as ex:
@@ -203,7 +208,7 @@ class Restmaker:
             return list()
 
     def update_patch(self, patch_id: int, state: Optional[str] = None, archived: bool = False,
-                     commit_ref: Optional[str] = None) -> list:
+                     commit_ref: Optional[str] = None) -> List[Tuple[str, str | bool]]:
         # Clear it out of the cache
         if patch_id in self._patches:
             del self._patches[patch_id]
@@ -212,7 +217,7 @@ class Restmaker:
             logger.debug('Updating patch %d:', patch_id)
             url = '/'.join((self.patches_url, str(patch_id), ''))
             logger.debug('url=%s', url)
-            data = list()
+            data: List[Tuple[str, str | bool]] = list()
             if state is not None:
                 logger.debug('  state=%s', state)
                 data.append(('state', state))
@@ -270,7 +275,7 @@ def get_patchwork_pull_requests_by_project(rm: Restmaker, project: int, fromstat
         ('order', '-date'),
         ('q', 'PULL'),
     ]
-    prs = set()
+    prs: Set[Tuple[str, str, Optional[str]]] = set()
     results = rm.get_patches_list(params)
     if not results:
         return prs
@@ -306,15 +311,13 @@ def project_by_name(pname: str) -> Tuple:
                 server = defurl
                 pconfig = CONFIG['patchworks'][defurl]['projects'][pname]
                 break
-        if not server:
+        if not server or not pconfig:
             logger.critical('Could not find project matching %s in config', pname)
             sys.exit(1)
 
         if server not in _server_cache:
             rm = Restmaker(server)
-            _project_cache[server] = dict()
-            params = list()
-            plist = rm.get_projects_list(params)
+            plist: List[Dict[str, Any]] = rm.get_projects_list(list())
             if not plist:
                 logger.info('Unable to get project list on %s', server)
                 sys.exit(1)
@@ -393,11 +396,11 @@ def git_run_command(gitdir: str, args: List[str], stdin: Optional[str] = None) -
         pp = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (output, error) = pp.communicate(input=stdin.encode('utf-8'))
 
-    output = output.strip().decode('utf-8', errors='replace')
+    decoded = output.strip().decode('utf-8', errors='replace')
     if len(error.strip()):
         logger.debug('Stderr: %s', error.decode('utf-8', errors='replace'))
 
-    return output
+    return decoded
 
 
 def git_get_repo_heads(gitdir: str, branch: str, ancestry: Optional[str] = None) -> List[Tuple[str, str]]:
@@ -557,9 +560,9 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
 
         # If we have a cover letter, then the reference is the msgid of the cover letter,
         # else the reference is the msgid of the first patch
-        patches = sdata.get('patches')
+        patches: List[Dict[str, Any]] = sdata.get('patches', list())
 
-        submitter = sdata.get('submitter')
+        submitter: Dict[str, Any] = sdata.get('submitter', list())
 
         if len(patches) == 1:
             summary.append('Patch: %s' % sdata.get('name'))
@@ -573,9 +576,9 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
         summary.append('  Patchwork: %s' % sdata.get('web_url'))
 
         if sdata.get('cover_letter'):
-            msgid = sdata.get('cover_letter').get('msgid').strip('<>')
+            msgid = sdata.get('cover_letter', dict()).get('msgid').strip('<>')
         else:
-            msgid = patches[0].get('msgid').strip('<>')
+            msgid = patches[0].get('msgid', '').strip('<>')
 
         link = 'https://lore.kernel.org/r/%s' % msgid
         summary.append('  Lore link: %s' % link)
@@ -606,15 +609,15 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
     msg = MIMEText(body, _charset='utf-8')
     msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-    msg['Subject'] = Header('Patchwork summary for: %s' % pname)
-    msg['From'] = Header(tweaks['from'])
+    msg['Subject'] = Header('Patchwork summary for: %s' % pname).encode()
+    msg['From'] = Header(tweaks['from']).encode()
     msg['Message-Id'] = make_msgid('git-patchwork-summary', domain=DOMAIN)
     msg['Date'] = formatdate(localtime=True)
 
     targets = listify(tweaks['summaryto'])
-    msg['To'] = Header(', '.join(targets))
+    msg['To'] = Header(', '.join(targets)).encode()
     if 'alwayscc' in tweaks:
-        msg['Cc'] = Header(', '.join(listify(tweaks['alwayscc'])))
+        msg['Cc'] = Header(', '.join(listify(tweaks['alwayscc']))).encode()
         targets.append(listify(tweaks['alwayscc']))
     if 'alwaysbcc' in tweaks:
         targets.append(listify(tweaks['alwaysbcc']))
@@ -636,7 +639,7 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
     return str(msg['Message-Id'])
 
 
-def get_tweaks(pconfig: Dict[str, str], hconfig: Dict[str, str]) -> Dict[str, str]:
+def get_tweaks(pconfig: Dict[str, str], hconfig: Dict[str, Any]) -> Dict[str, str]:
     fields = ['from', 'summaryto', 'onlyto', 'neverto', 'onlyifcc', 'neverifcc',
               'alwayscc', 'alwaysbcc', 'cclist', 'ccall']
     bubbled = dict()
@@ -650,7 +653,7 @@ def get_tweaks(pconfig: Dict[str, str], hconfig: Dict[str, str]) -> Dict[str, st
 
 
 def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refname: str,
-                      revs: Dict[int, str], pname: str, rs: Dict[str, Union[str, list, dict]],
+                      revs: Dict[int, str], pname: str, rs: Dict[str, Any],
                       hs: Dict[str, Union[str, list, dict]]) -> None:
     logger.info('Sending submitter notifications')
     project, rm, pconfig = project_by_name(pname)
@@ -660,13 +663,15 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
     for sdata in serieslist:
         # If we have a cover letter, then the reference is the msgid of the cover letter,
         # else the reference is the msgid of the first patch
-        patches = sdata.get('patches')
+        patches = sdata.get('patches', list())
         is_pull_request = False
-        content = headers = reference = None
+        content: str = ''
+        headers: Dict[str, Any] = dict()
+        reference: str = ''
         if sdata.get('cover_letter'):
-            reference = sdata.get('cover_letter').get('msgid')
+            reference = sdata.get('cover_letter', dict()).get('msgid')
             try:
-                fullcover = rm.get_cover(sdata.get('cover_letter').get('id'))
+                fullcover = rm.get_cover(sdata.get('cover_letter', dict()).get('id'))
                 headers = {k.lower(): v for k, v in fullcover.get('headers').items()}
                 content = fullcover.get('content')
             except KeyError:
@@ -683,8 +688,8 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
                 logger.debug('Unable to get first patch reference, bailing on %s', sdata.get('id'))
                 continue
 
-        submitter = sdata.get('submitter')
-        project = sdata.get('project')
+        submitter = sdata.get('submitter', dict())
+        project = sdata.get('project', dict())
 
         if 'neverto' in tweaks:
             neverto = listify(tweaks['neverto'])
@@ -729,7 +734,7 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
         logger.debug('Preparing a notification for %s', submitter.get('email'))
         if is_pull_request:
             reqtype = 'pull request'
-        elif len(sdata.get('patches')) > 1:
+        elif len(patches) > 1:
             reqtype = 'series'
         else:
             reqtype = 'patch'
@@ -775,19 +780,19 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
         msg = MIMEText(body, _charset='utf-8')
         msg.replace_header('Content-Transfer-Encoding', '8bit')
 
-        msg['Subject'] = Header('Re: %s' % headers.get('subject'))
-        msg['From'] = Header(tweaks['from'])
+        msg['Subject'] = Header('Re: %s' % headers.get('subject')).encode()
+        msg['From'] = Header(tweaks['from']).encode()
         msg['Message-Id'] = make_msgid('git-patchwork-notify', domain=DOMAIN)
         msg['Date'] = formatdate(localtime=True)
-        msg['References'] = Header(reference)
-        msg['In-Reply-To'] = Header(reference)
+        msg['References'] = Header(reference).encode()
+        msg['In-Reply-To'] = Header(reference).encode()
 
         if 'onlyto' in tweaks:
             targets = listify(tweaks['onlyto'])
             msg['To'] = '%s <%s>' % (submitter.get('name'), targets[0])
         else:
             targets = [submitter.get('email')]
-            msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email')))
+            msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email'))).encode()
 
             ccaddrs = list()
             if tweaks.get('alwayscc'):
@@ -844,9 +849,9 @@ def housekeeping(pname: str) -> None:
 
         cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
         logger.debug('cutoffdate=%s', cutoffdate)
-        series = dict()
+        series: Dict[Tuple[str, str], Dict] = dict()
         page = 0
-        pagedata = list()
+        pagedata: List[Any] = list()
         lastpage = False
         while True:
             if not pagedata and not lastpage:
@@ -1069,10 +1074,15 @@ def housekeeping(pname: str) -> None:
             logger.info('------------------------------')
 
 
-def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
+def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
     global _rev_cache
 
-    git_heads = git_get_repo_heads(repo, branch=rsettings.get('branch', '--heads'))
+    branch = rsettings.get('branch', '--heads')
+    if not isinstance(branch, str):
+        logger.critical('Branch must be a string')
+        sys.exit(1)
+
+    git_heads = git_get_repo_heads(repo, branch=branch)
     if not git_heads:
         logger.info('Could not get the latest ref in %s', repo)
         sys.exit(1)
@@ -1093,7 +1103,11 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
             sys.exit(1)
         # To store multiple pw.db files in a single .git directory,
         # add a suffix based on the repo treename.
-        treename = rsettings.get('treename').replace('/', '_')
+        treename = rsettings.get('treename')
+        if not isinstance(treename, str):
+            logger.critical('treename must be a string')
+            sys.exit(1)
+        treename = treename.replace('/', '_')
         dbpath = os.path.join(gitdir, f'pw-{treename}.db')
     else:
         dbpath = os.path.join(dbpath, 'pw.db')
@@ -1124,8 +1138,8 @@ def pwrun(repo: str, rsettings: Dict[str, Union[str, list, dict]]) -> None:
 
     count = 0
     for pname, psettings in rsettings['projects'].items():
-        rpwhashes = dict()
-        wantstates = list()
+        rpwhashes: Dict[str, Set] = dict()
+        wantstates: List[str] = list()
         have_prs = False
         for refname, revlines in newrevs.items():
             found = False
@@ -1387,29 +1401,29 @@ if __name__ == '__main__':
     logger.setLevel(logging.DEBUG)
 
     if cmdargs.logfile:
-        ch = logging.FileHandler(cmdargs.logfile)
+        fch = logging.FileHandler(cmdargs.logfile)
         formatter = logging.Formatter(
             '[%(asctime)s] %(message)s')
-        ch.setFormatter(formatter)
+        fch.setFormatter(formatter)
 
         if cmdargs.verbose:
-            ch.setLevel(logging.DEBUG)
+            fch.setLevel(logging.DEBUG)
         else:
-            ch.setLevel(logging.INFO)
-        logger.addHandler(ch)
+            fch.setLevel(logging.INFO)
+        logger.addHandler(fch)
 
-    ch = logging.StreamHandler()
+    sch = logging.StreamHandler()
     formatter = logging.Formatter('%(message)s')
-    ch.setFormatter(formatter)
+    sch.setFormatter(formatter)
 
     if cmdargs.quiet:
-        ch.setLevel(logging.CRITICAL)
+        sch.setLevel(logging.CRITICAL)
     elif cmdargs.verbose:
-        ch.setLevel(logging.DEBUG)
+        sch.setLevel(logging.DEBUG)
     else:
-        ch.setLevel(logging.INFO)
+        sch.setLevel(logging.INFO)
 
-    logger.addHandler(ch)
+    logger.addHandler(sch)
     if cmdargs.nomail or cmdargs.dryrun:
         logger.info('NOMAIL: ON')
         NOMAIL = True
@@ -1424,7 +1438,9 @@ if __name__ == '__main__':
 
     with open(cmdargs.cfgfile, 'r') as fh:
         cfgyaml = fh.read()
-    CONFIG = ruamel.yaml.safe_load(cfgyaml)
+
+    yaml = ruamel.yaml.YAML(typ='safe', pure=True)
+    CONFIG = yaml.load(cfgyaml)
 
     if cmdargs.tokens_file:
         with open(cmdargs.tokens_file, 'r') as fh:
@@ -1442,7 +1458,7 @@ if __name__ == '__main__':
         pwhash_differ()
         sys.exit(0)
 
-    if cmdargs.housekeeping:
+    if cmdargs.housekeeping or cmdargs.pwhash:
         for _pserver, _sconfig in CONFIG['patchworks'].items():
             for _pname in _sconfig['projects']:
                 housekeeping(_pname)
