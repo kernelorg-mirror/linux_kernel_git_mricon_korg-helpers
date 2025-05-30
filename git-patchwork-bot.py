@@ -27,8 +27,6 @@ import re
 import requests
 import datetime
 
-import ruamel.yaml
-
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formatdate, getaddresses, make_msgid
@@ -38,19 +36,22 @@ from fcntl import lockf, LOCK_EX, LOCK_NB
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import yaml as pyyaml
+
 from string import Template
 from typing import Optional, Tuple, Union, Dict, List, Set, Any
 
 # Send all email 8-bit, this is not 1999
 from email import charset
+
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
 DB_VERSION: str = '1'
 REST_API_VERSION: str = '1.2'
-LORE_RE: re.Pattern = re.compile(r'^\s*Link:\s+\S+://(?:lore|lkml)\.kernel\.org\S*/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
-HUNK_RE: re.Pattern = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
-FILENAME_RE: re.Pattern = re.compile(r'^(---|\+\+\+) (\S+)')
+MSGID_LINK_RE: re.Pattern[str] = re.compile(r'^\s*Link:\s+\S+://patch\.msgid\.link/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
+HUNK_RE: re.Pattern[str] = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
+FILENAME_RE: re.Pattern[str] = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE: int = 100
 
 CONFIG: Dict[str, Any]
@@ -62,8 +63,8 @@ DOMAIN: str = ''
 USER_AGENT: str = 'git-patchwork-helper'
 CACHEDIR: str = os.path.expanduser('~/.cache/git-patchwork-bot')
 
-_project_cache: Dict[str, Tuple[dict, 'Restmaker', dict]] = dict()
-_server_cache: Dict[str, Tuple['Restmaker', List[dict]]] = dict()
+_project_cache: Dict[str, Tuple[Dict[str, Any], 'Restmaker', Dict[str, Any]]] = dict()
+_server_cache: Dict[str, Tuple['Restmaker', List[Dict[str, Any]]]] = dict()
 _rev_cache: Dict[str, Tuple[str, str, str, Optional[str], Optional[str]]] = dict()
 
 logger = logging.getLogger('gitpwcron')
@@ -76,7 +77,7 @@ class Restmaker:
     patches_url: str
     projects_url: str
     session: requests.Session
-    _patches: Dict[int, Optional[dict]]
+    _patches: Dict[int, Optional[Dict[str, Any]]]
 
     def __init__(self, server: str) -> None:
         self.server = server
@@ -110,10 +111,10 @@ class Restmaker:
         headers['Authorization'] = f'Token {apitoken}'
         self.session.headers.update(headers)
 
-    def get_unpaginated(self, url: str, params: list) -> List[dict]:
+    def get_unpaginated(self, url: str, params: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
         # Caller should catch RequestException
         page = 0
-        results = list()
+        results: List[Dict[str, Any]] = list()
         params.append(('per_page', REST_PER_PAGE))
         while True:
             page += 1
@@ -136,7 +137,7 @@ class Restmaker:
 
         return results
 
-    def get_cover(self, cover_id: int) -> dict:
+    def get_cover(self, cover_id: int) -> Dict[str, Any]:
         try:
             logger.debug('Grabbing cover %d', cover_id)
             url = '/'.join((self.covers_url, str(cover_id), ''))
@@ -148,7 +149,7 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             raise KeyError('Not able to get cover %s', cover_id)
 
-    def get_patch(self, patch_id: int) -> Optional[dict]:
+    def get_patch(self, patch_id: int) -> Optional[Dict[str, Any]]:
         if patch_id not in self._patches:
             try:
                 logger.debug('Grabbing patch %d', patch_id)
@@ -164,7 +165,7 @@ class Restmaker:
 
         return self._patches[patch_id]
 
-    def get_series(self, series_id: int) -> dict:
+    def get_series(self, series_id: int) -> Dict[str, Any]:
         try:
             logger.debug('Grabbing series %d', series_id)
             url = '/'.join((self.series_url, str(series_id), ''))
@@ -176,7 +177,8 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             raise KeyError('Not able to get series %s', series_id)
 
-    def get_patches_list(self, params: list, unpaginated: bool = True) -> List[dict]:
+    def get_patches_list(self, params: List[Tuple[str, Any]],
+                         unpaginated: bool = True) -> List[Dict[str, Any]]:
         try:
             if unpaginated:
                 return self.get_unpaginated(self.patches_url, params)
@@ -188,7 +190,8 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             return list()
 
-    def get_series_list(self, params: list, unpaginated: bool = True) -> List[dict]:
+    def get_series_list(self, params: List[Tuple[str, Any]],
+                        unpaginated: bool = True) -> List[Dict[str, Any]]:
         try:
             if unpaginated:
                 return self.get_unpaginated(self.series_url, params)
@@ -200,7 +203,7 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             return list()
 
-    def get_projects_list(self, params: list) -> List[dict[str, Any]]:
+    def get_projects_list(self, params: List[Tuple[str, Any]]) -> List[dict[str, Any]]:
         try:
             return self.get_unpaginated(self.projects_url, params)
         except requests.exceptions.RequestException as ex:
@@ -208,7 +211,7 @@ class Restmaker:
             return list()
 
     def update_patch(self, patch_id: int, state: Optional[str] = None, archived: bool = False,
-                     commit_ref: Optional[str] = None) -> List[Tuple[str, str | bool]]:
+                     commit_ref: Optional[str] = None) -> List[Tuple[str, Union[str, bool]]]:
         # Clear it out of the cache
         if patch_id in self._patches:
             del self._patches[patch_id]
@@ -239,7 +242,7 @@ class Restmaker:
 
 def get_patchwork_patches_by_project_hash(rm: Restmaker, project: int, pwhash: str) -> List[int]:
     logger.debug('Looking up hash=%s', pwhash)
-    params = [
+    params: List[Tuple[str, Any]] = [
         ('project', project),
         ('archived', 'false'),
         ('hash', pwhash),
@@ -254,7 +257,7 @@ def get_patchwork_patches_by_project_hash(rm: Restmaker, project: int, pwhash: s
 
 def get_patchwork_patches_by_project_msgid(rm: Restmaker, project: int, msgid: str) -> List[int]:
     logger.debug('Looking up msgid=%s', msgid)
-    params = [
+    params: List[Tuple[str, Union[str, int]]] = [
         ('project', project),
         ('archived', 'false'),
         ('msgid', msgid),
@@ -267,15 +270,16 @@ def get_patchwork_patches_by_project_msgid(rm: Restmaker, project: int, msgid: s
     return [patch['id'] for patch in patches]
 
 
-def get_patchwork_pull_requests_by_project(rm: Restmaker, project: int, fromstate: List[str]) -> Set[Tuple]:
-    params = [
+def get_patchwork_pull_requests_by_project(rm: Restmaker, project: int,
+                                           fromstate: List[str]) -> Set[Tuple[str, str, Optional[int]]]:
+    params: List[Tuple[str, Any]] = [
         ('project', project),
         ('archived', 'false'),
         ('state', fromstate),
         ('order', '-date'),
         ('q', 'PULL'),
     ]
-    prs: Set[Tuple[str, str, Optional[str]]] = set()
+    prs: Set[Tuple[str, str, Optional[int]]] = set()
     results = rm.get_patches_list(params)
     if not results:
         return prs
@@ -295,7 +299,7 @@ def get_patchwork_pull_requests_by_project(rm: Restmaker, project: int, fromstat
     return prs
 
 
-def project_by_name(pname: str) -> Tuple:
+def project_by_name(pname: str) -> Tuple[Dict[str, Any], Restmaker, Dict[str, Any]]:
     global _project_cache
     global _server_cache
 
@@ -305,7 +309,7 @@ def project_by_name(pname: str) -> Tuple:
     if pname not in _project_cache:
         # Find patchwork definition containing this project
         server = None
-        pconfig = None
+        pconfig: Optional[Any] = None
         for defurl in CONFIG['patchworks']:
             if pname in CONFIG['patchworks'][defurl]['projects']:
                 server = defurl
@@ -345,13 +349,13 @@ def db_save_meta(c: sqlite3.Cursor) -> None:
     c.execute('''INSERT INTO meta VALUES(?)''', (DB_VERSION,))
 
 
-def db_save_repo_heads(c: sqlite3.Cursor, heads: list) -> None:
+def db_save_repo_heads(c: sqlite3.Cursor, heads: List[Tuple[str, str]]) -> None:
     c.execute('DELETE FROM heads')
     for refname, commit_id in heads:
         c.execute('''INSERT INTO heads VALUES(?,?)''', (refname, commit_id))
 
 
-def db_get_repo_heads(c: sqlite3.Cursor) -> List[Tuple]:
+def db_get_repo_heads(c: sqlite3.Cursor) -> List[Tuple[str, str]]:
     return c.execute('SELECT refname, commit_id FROM heads').fetchall()
 
 
@@ -373,9 +377,9 @@ def db_init_pw_sqlite_db(c: sqlite3.Cursor) -> None:
         )''')
 
 
-def git_get_command_lines(gitdir: str, args: List[str]) -> list:
+def git_get_command_lines(gitdir: str, args: List[str]) -> List[str]:
     out = git_run_command(gitdir, args)
-    lines = list()
+    lines: List[str] = list()
     if out:
         for line in out.split('\n'):
             if line == '':
@@ -404,22 +408,25 @@ def git_run_command(gitdir: str, args: List[str], stdin: Optional[str] = None) -
 
 
 def git_get_repo_heads(gitdir: str, branch: str, ancestry: Optional[str] = None) -> List[Tuple[str, str]]:
-    refs = list()
+    refs: List[Tuple[str, str]] = list()
     lines = git_get_command_lines(gitdir, ['show-ref', branch])
     if ancestry is None:
         ancestry = ''
     else:
         ancestry = f'~{ancestry}'
-    if lines is not None:
+    if lines:
         for line in lines:
             (commit_id, refname) = line.split()
             refs.append((refname, commit_id + ancestry))
     return refs
 
 
-def git_get_new_revs(gitdir: str, db_heads: List[Tuple[str, str]], git_heads: List[Tuple[str, str]],
-                     committers: List[str], merges: bool = False) -> Dict[str, list]:
-    newrevs = dict()
+def git_get_new_revs(gitdir: str,
+                     db_heads: List[Tuple[str, str]],
+                     git_heads: List[Tuple[str, str]],
+                     committers: List[str],
+                     merges: bool = False) -> Dict[str, List[Tuple[str, str, str]]]:
+    newrevs: Dict[str, List[Tuple[str, str, str]]] = dict()
     if committers:
         logger.debug('filtering by committers=%s', committers)
     for db_refrow in list(db_heads):
@@ -455,7 +462,7 @@ def git_get_new_revs(gitdir: str, db_heads: List[Tuple[str, str]], git_heads: Li
             # TODO: Fix for rebased repositories
             continue
 
-        revs = list()
+        revs: List[Tuple[str, str, str]] = list()
 
         for line in lines:
             (commit_id, cn, ce, logmsg) = line.split(':', 3)
@@ -523,7 +530,7 @@ def get_patchwork_hash(diff: str) -> str:
             line = filename_match.group(1) + ' ' + filename
         elif hunk_match:
             # remove line numbers, but leave line counts
-            def fn(x):
+            def fn(x: Union[str, int]) -> int:
                 if not x:
                     return 1
                 return int(x)
@@ -541,19 +548,24 @@ def get_patchwork_hash(diff: str) -> str:
     return hashed.hexdigest()
 
 
-def listify(obj: Union[str, list, None]) -> list:
+def listify(obj: Union[str, List[Any], None]) -> List[Any]:
     if isinstance(obj, list):
         return list(obj)
     return [obj]
 
 
-def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: str, refname: str, revs: Dict[int, str],
-                 pname: str, rs: Dict[str, str], hs: Dict[str, str]) -> str:
+def send_summary(serieslist: List[Dict[str, Any]],
+                 committers: Dict[int, str],
+                 to_state: str, refname: str,
+                 revs: Dict[int, str],
+                 pname: str,
+                 rs: Dict[str, str],
+                 hs: Dict[str, str]) -> str:
     logger.info('Preparing summary')
     # we send summaries by project, so the project name is going to be all the same
 
     count = 0
-    summary = list()
+    summary: List[str] = list()
     for sdata in serieslist:
         count += 1
         logger.debug('Summarizing: %s', sdata.get('name'))
@@ -593,17 +605,17 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
         summary.append('')
 
     bodytpt = Template(CONFIG['templates']['summary'])
-    params = {
+    params: Dict[str, str] = {
         'newstate': to_state,
         'treename': rs['treename'],
         'refname': refname.replace('refs/heads/', '', 1),
         'summary': '\n'.join(summary),
-        'total': count,
+        'total': str(count),
         'signature': CONFIG['templates']['signature'],
     }
     body = bodytpt.safe_substitute(params)
 
-    project, rm, pconfig = project_by_name(pname)
+    _, _, pconfig = project_by_name(pname)
     tweaks = get_tweaks(pconfig, hs)
 
     msg = MIMEText(body, _charset='utf-8')
@@ -642,7 +654,7 @@ def send_summary(serieslist: List[dict], committers: Dict[int, str], to_state: s
 def get_tweaks(pconfig: Dict[str, str], hconfig: Dict[str, Any]) -> Dict[str, str]:
     fields = ['from', 'summaryto', 'onlyto', 'neverto', 'onlyifcc', 'neverifcc',
               'alwayscc', 'alwaysbcc', 'cclist', 'ccall']
-    bubbled = dict()
+    bubbled: Dict[str, str] = dict()
     for field in fields:
         if field in hconfig:
             bubbled[field] = hconfig[field]
@@ -652,9 +664,13 @@ def get_tweaks(pconfig: Dict[str, str], hconfig: Dict[str, Any]) -> Dict[str, st
     return bubbled
 
 
-def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refname: str,
-                      revs: Dict[int, str], pname: str, rs: Dict[str, Any],
-                      hs: Dict[str, Union[str, list, dict]]) -> None:
+def notify_submitters(serieslist: List[Dict[str, Any]],
+                      committers: Dict[int, str],
+                      refname: str,
+                      revs: Dict[int, str],
+                      pname: str,
+                      rs: Dict[str, Any],
+                      hs: Dict[str, Any]) -> None:
     logger.info('Sending submitter notifications')
     project, rm, pconfig = project_by_name(pname)
 
@@ -672,18 +688,19 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
             reference = sdata.get('cover_letter', dict()).get('msgid')
             try:
                 fullcover = rm.get_cover(sdata.get('cover_letter', dict()).get('id'))
-                headers = {k.lower(): v for k, v in fullcover.get('headers').items()}
-                content = fullcover.get('content')
+                headers = {k.lower(): v for k, v in fullcover.get('headers', dict()).items()}
+                content = fullcover.get('content', '')
             except KeyError:
                 logger.debug('Unable to get cover letter, will try first patch')
         if not reference:
             reference = patches[0].get('msgid')
             try:
                 fullpatch = rm.get_patch(patches[0].get('id'))
-                headers = {k.lower(): v for k, v in fullpatch.get('headers').items()}
-                content = fullpatch.get('content')
-                if fullpatch.get('pull_url'):
-                    is_pull_request = True
+                if fullpatch is not None:
+                    headers = {k.lower(): v for k, v in fullpatch.get('headers', dict()).items()}
+                    content = fullpatch.get('content', '')
+                    if fullpatch.get('pull_url'):
+                        is_pull_request = True
             except KeyError:
                 logger.debug('Unable to get first patch reference, bailing on %s', sdata.get('id'))
                 continue
@@ -697,11 +714,11 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
                 logger.debug('Skipping neverto address:%s', submitter.get('email'))
                 continue
 
-        ccs = list()
+        ccs: List[str] = list()
         cchdr = headers.get('cc')
         if cchdr:
             ccs = [chunk[1] for chunk in getaddresses(listify(cchdr))]
-        tos = list()
+        tos: List[str] = list()
         tohdr = headers.get('to')
         if tohdr:
             tos = [chunk[1] for chunk in getaddresses(listify(tohdr))]
@@ -739,7 +756,7 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
         else:
             reqtype = 'patch'
 
-        trimquote = list()
+        trimquote: List[str] = list()
         if content:
             qcount = 0
             for cline in content.split('\n'):
@@ -751,7 +768,7 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
                 trimquote.append('> %s' % cline.rstrip())
                 qcount += 1
 
-        summary = list()
+        summary: List[str] = list()
         committer = 'unknown committer'
         for patch in patches:
             summary.append('  - %s' % patch.get('name'))
@@ -764,7 +781,7 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
                 summary.append('    (no matching commit)')
 
         bodytpt = Template(CONFIG['templates']['submitter'])
-        params = {
+        params: Dict[str, str] = {
             'reqtype': reqtype,
             'treename': rs['treename'],
             'refname': refname.replace('refs/heads/', '', 1),
@@ -794,7 +811,7 @@ def notify_submitters(serieslist: List[dict], committers: Dict[int, str], refnam
             targets = [submitter.get('email')]
             msg['To'] = Header('%s <%s>' % (submitter.get('name'), submitter.get('email'))).encode()
 
-            ccaddrs = list()
+            ccaddrs: List[str] = list()
             if tweaks.get('alwayscc'):
                 ccaddrs += listify(tweaks['alwayscc'])
                 targets += ccaddrs
@@ -849,7 +866,7 @@ def housekeeping(pname: str) -> None:
 
         cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
         logger.debug('cutoffdate=%s', cutoffdate)
-        series: Dict[Tuple[str, str], Dict] = dict()
+        series: Dict[Tuple[str, str], Dict[datetime.datetime, Any]] = dict()
         page = 0
         pagedata: List[Any] = list()
         lastpage = False
@@ -857,7 +874,7 @@ def housekeeping(pname: str) -> None:
             if not pagedata and not lastpage:
                 page += 1
                 logger.debug('  grabbing page %d', page)
-                params = [
+                params: List[Tuple[str, Union[str, int]]] = [
                     ('project', project_id),
                     ('order', '-date'),
                     ('page', page),
@@ -892,7 +909,7 @@ def housekeeping(pname: str) -> None:
 
             ver = entry.get('version')
             subm_id = entry.get('submitter').get('id')
-            patches = list()
+            patches: List[str] = list()
             for patch in entry.get('patches'):
                 patches.append(patch.get('id'))
 
@@ -927,7 +944,7 @@ def housekeeping(pname: str) -> None:
                 logger.debug('Skipping this series, because it is not complete')
                 continue
 
-            sreport = list()
+            sreport: List[str] = list()
             logger.info('Checking: [v%s] %s (%s)', items[latest_version]['rev'], subject,
                         items[latest_version]['date'])
             for v in versions:
@@ -946,6 +963,8 @@ def housekeeping(pname: str) -> None:
                     for patch_id in items[v]['patches']:
                         logger.info('    Superseding patch: %d', patch_id)
                         patch = rm.get_patch(patch_id)
+                        if patch is None:
+                            continue
                         patch_title = patch.get('name')
                         current_state = patch.get('state')
                         if current_state == 'superseded':
@@ -974,7 +993,7 @@ def housekeeping(pname: str) -> None:
         logger.debug('cutoffdate=%s', cutoffdate)
 
         page = 0
-        seen = set()
+        seen: Set[str] = set()
         pagedata = list()
         lastpage = False
         archived = 0
@@ -1096,7 +1115,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             logger.info('Could not find git tree in %s', dbpath)
             sys.exit(1)
         gitdir = gitdir.split(' ', 1)[1]
-        gitdir, worktree = os.path.split(gitdir)
+        gitdir, _ = os.path.split(gitdir)
         gitdir, category = os.path.split(gitdir)
         if category != "worktrees":
             logger.info('Could not find git worktree in %s', dbpath)
@@ -1127,9 +1146,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         return
 
     db_heads = db_get_repo_heads(c)
-    committers = rsettings.get('committers', list())
+    climit = rsettings.get('committers', list())
 
-    newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=committers, merges=True)
+    newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=climit, merges=True)
     if not newrevs:
         logger.debug('No new revs in %s', repo)
         return
@@ -1138,7 +1157,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
     count = 0
     for pname, psettings in rsettings['projects'].items():
-        rpwhashes: Dict[str, Set] = dict()
+        rpwhashes: Dict[str, Set[Tuple[str, str, str, Optional[str], Optional[str]]]] = dict()
         wantstates: List[str] = list()
         have_prs = False
         for refname, revlines in newrevs.items():
@@ -1168,7 +1187,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                         logger.debug('Skipping %s (no pwhash)', rev)
                         continue
                     msgid = None
-                    lore_match = LORE_RE.search(info)
+                    lore_match = MSGID_LINK_RE.search(info)
                     if lore_match:
                         msgid = lore_match.group(1)
                         logger.debug('Msgid for %s: %s', rev, msgid)
@@ -1182,9 +1201,10 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         logger.debug('wantstates=%s', wantstates)
 
         logger.info(' project : %s', pname)
-        project, rm, pconfig = project_by_name(pname)
+        project, rm, _ = project_by_name(pname)
         project_id = project['id']
 
+        prs: Set[Tuple[str, str, int | None]] = set()
         if have_prs:
             logger.info('  PR merge commit found, loading up pull requests')
             # Find all from states we're interested in
@@ -1199,17 +1219,19 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             for wanthead, hsettings in psettings.items():
                 if refname.endswith(wanthead):
                     break
+            if hsettings is None:
+                continue
             # Patchwork lowercases state name and replaces spaces with dashes
             to_state = hsettings['tostate'].lower().replace(' ', '-')
-            fromstate = list()
+            fromstate: List[str] = list()
             for fs in hsettings.get('fromstate', list()):
                 fromstate.append(fs.lower().replace(' ', '-'))
             if not fromstate:
                 fromstate = list(wantstates)
 
             # We create patch_id->rev mapping first
-            revs = dict()
-            committers = dict()
+            revs: Dict[int, str] = dict()
+            committers: Dict[int, str] = dict()
             for rev, logline, committer, pwhash, msgid in hashpairs:
                 if have_prs and pwhash is None:
                     if logline.find(' of ') > 0:
@@ -1230,7 +1252,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     logger.debug('Looking for ref %s host %s', m_refname, m_host)
 
                     for pull_host, pull_refname, patch_id in prs:
-                        if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1:
+                        if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1 and patch_id is not None:
                             logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
                             revs[patch_id] = rev
                             committers[patch_id] = committer
@@ -1238,6 +1260,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     continue
 
                 # Do we have a matching hash on the server?
+                if pwhash is None:
+                    logger.info('  No pwhash for %s, skipping', rev)
+                    continue
                 logger.info('  Matching by hash: %s (%s)', pwhash, logline)
                 patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, pwhash)
                 if not patch_ids and msgid:
@@ -1270,8 +1295,8 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     committers[patch_id] = committer
 
             # Now we iterate through it
-            updated_series = list()
-            done_patches = set()
+            updated_series: List[Dict[str, Any]] = list()
+            done_patches: Set[int] = set()
             for patch_id in list(revs.keys()):
                 logger.info('   Processing: %s', patch_id)
                 if patch_id in done_patches:
@@ -1279,6 +1304,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     logger.info('    Already applied as part of previous series')
                     continue
                 pdata = rm.get_patch(patch_id)
+                if pdata is None:
+                    logger.info('    Patch not found on %s, skipping', rm.server)
+                    continue
                 serieslist = pdata.get('series', None)
                 if not serieslist:
                     # This is probably from the time before patchwork-2 migration.
@@ -1289,8 +1317,8 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                 for series in serieslist:
                     series_id = series.get('id')
                     sdata = rm.get_series(series_id)
-                    update_queue = list()
-                    for spatch in sdata.get('patches'):
+                    update_queue: List[Tuple[str, int, str, str]] = list()
+                    for spatch in sdata.get('patches', dict()):
                         spatch_id = spatch.get('id')
 
                         if spatch_id in revs:
@@ -1333,7 +1361,11 @@ def check_repos() -> None:
         logger.info('Could not obtain an exclusive lock, assuming another process is running.')
         sys.exit(0)
 
-    for repo in CONFIG['repos']:
+    if not isinstance(cmdargs.reposdir, str):
+        logger.critical('reposdir must be a string')
+        sys.exit(1)
+
+    for repo in CONFIG.get('repos', list()):
         fullpath = os.path.join(cmdargs.reposdir.rstrip('/'), repo.lstrip('/'))
         if not os.path.exists(fullpath):
             logger.info('Repository not found: %s', repo)
@@ -1352,9 +1384,12 @@ def pwhash_differ() -> None:
     check_patch_id = cmdargs.pwhash
     for pw in CONFIG['patchworks']:
         logger.info('Patchwork: %s', pw)
-        for pname, psettings in CONFIG['patchworks'][pw]['projects'].items():
-            project, rm, pconfig = project_by_name(pname)
+        for pname, _ in CONFIG['patchworks'][pw]['projects'].items():
+            _, rm, _ = project_by_name(pname)
             patch = rm.get_patch(check_patch_id)
+            if not patch:
+                logger.info('Patch %d not found on %s', check_patch_id, rm.server)
+                sys.exit(1)
             if patch.get('hash') != inhash:
                 logger.info('--- patchwork diff ---')
                 logger.info(patch.get('diff'))
@@ -1426,26 +1461,25 @@ if __name__ == '__main__':
     logger.addHandler(sch)
     if cmdargs.nomail or cmdargs.dryrun:
         logger.info('NOMAIL: ON')
-        NOMAIL = True
+        NOMAIL = True  # type: ignore[assignment]
     if cmdargs.dryrun:
         logger.info('DRYRUN: ON')
-        DRYRUN = True
+        DRYRUN = True  # type: ignore[assignment]
     if cmdargs.cachedir:
-        CACHEDIR = cmdargs.cachedir
+        CACHEDIR = cmdargs.cachedir  # type: ignore[assignment]
     if cmdargs.domain:
-        DOMAIN = cmdargs.domain
-    MAILHOST = cmdargs.mailhost
+        DOMAIN = str(cmdargs.domain)  # type: ignore[assignment]
+    MAILHOST = cmdargs.mailhost  # type: ignore[assignment]
 
     with open(cmdargs.cfgfile, 'r') as fh:
         cfgyaml = fh.read()
 
-    yaml = ruamel.yaml.YAML(typ='safe', pure=True)
-    CONFIG = yaml.load(cfgyaml)
+    CONFIG: Dict[str, Any] = pyyaml.safe_load(cfgyaml)  # type: ignore[assignment]
 
     if cmdargs.tokens_file:
         with open(cmdargs.tokens_file, 'r') as fh:
             tkyaml = fh.read()
-        tks = ruamel.yaml.safe_load(tkyaml)
+        tks = pyyaml.safe_load(tkyaml)
         for _pserver, _sconfig in tks['patchworks'].items():
             if _pserver in CONFIG['patchworks']:
                 logger.debug('Taking apitoken info for %s from %s', _pserver, cmdargs.tokens_file)
