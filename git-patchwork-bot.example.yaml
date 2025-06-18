@@ -162,4 +162,8 @@ templates:
   signature: |
              Deet-doot-dot, I am a bot.
              https://korg.docs.kernel.org/patchwork/pwbot.html
+
+  bot:
+    useragent: 'git-patchwork-helper'
+
 # yamllint enable

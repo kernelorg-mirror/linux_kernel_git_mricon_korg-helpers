@@ -1158,6 +1158,10 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=climit, merges=True)
     if not newrevs:
+        # Save current heads if we limited by committers
+        if climit and not DRYRUN:
+            db_save_repo_heads(c, git_heads)
+            dbconn.commit()
         logger.debug('No new revs in %s', repo)
         return
 
@@ -1226,7 +1230,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             # Get our settings
             hsettings = None
             for wanthead, hsettings in psettings.items():
-                if refname.endswith(wanthead):
+                if refname.endswith(wanthead) or fnmatch.fnmatch(refname, wanthead):
                     break
             if hsettings is None:
                 continue
