@@ -26,6 +26,7 @@ import hashlib
 import re
 import requests
 import datetime
+import fnmatch
 
 from email.mime.text import MIMEText
 from email.header import Header
@@ -144,7 +145,7 @@ class Restmaker:
             logger.debug('url=%s', url)
             rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
-            return rsp.json()
+            return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             raise KeyError('Not able to get cover %s', cover_id)
@@ -172,7 +173,7 @@ class Restmaker:
             logger.debug('url=%s', url)
             rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
-            return rsp.json()
+            return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             raise KeyError('Not able to get series %s', series_id)
@@ -185,7 +186,7 @@ class Restmaker:
             else:
                 rsp = self.session.get(self.patches_url, params=params, stream=False)
                 rsp.raise_for_status()
-                return rsp.json()
+                return list(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             return list()
@@ -198,12 +199,12 @@ class Restmaker:
             else:
                 rsp = self.session.get(self.series_url, params=params, stream=False)
                 rsp.raise_for_status()
-                return rsp.json()
+                return list(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             return list()
 
-    def get_projects_list(self, params: List[Tuple[str, Any]]) -> List[dict[str, Any]]:
+    def get_projects_list(self, params: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
         try:
             return self.get_unpaginated(self.projects_url, params)
         except requests.exceptions.RequestException as ex:
@@ -237,7 +238,7 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             raise RuntimeError('Unable to update patch %s', patch_id)
 
-        return rsp.json()
+        return list(rsp.json())
 
 
 def get_patchwork_patches_by_project_hash(rm: Restmaker, project: int, pwhash: str) -> List[int]:
@@ -1025,13 +1026,20 @@ def housekeeping(pname: str) -> None:
 
             entry = pagedata.pop()
             # Did we go too far forward?
-            patch_date = datetime.datetime.strptime(entry.get('date'), "%Y-%m-%dT%H:%M:%S")
+            _date = entry.get('date')
+            if not _date:
+                logger.debug('No date for patch %s, skipping', entry.get('id'))
+                continue
+            patch_date = datetime.datetime.strptime(_date, "%Y-%m-%dT%H:%M:%S")
             if patch_date >= cutoffdate:
                 # mark that we're on the last page
                 lastpage = True
                 continue
 
             patch_id = entry.get('id')
+            if patch_id is None:
+                logger.debug('No patch ID for entry %s, skipping', entry)
+                continue
             if patch_id in seen:
                 # If the archived setting isn't actually sticking on the server for
                 # some reason, then we are in for an infinite loop. Recognize this
@@ -1163,7 +1171,8 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         for refname, revlines in newrevs.items():
             found = False
             for wanthead, hsettings in psettings.items():
-                if refname.endswith(wanthead):
+                # Check endswith, but also do fnmatch matching for wildcards
+                if refname.endswith(wanthead) or fnmatch.fnmatch(refname, wanthead):
                     found = True
                     if 'fromstate' in hsettings:
                         wantstates += hsettings['fromstate']
@@ -1181,8 +1190,8 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
                 if rev not in _rev_cache:
                     info = git_get_rev_info(repo, rev)
-                    pwhash = get_patchwork_hash(info)
-                    if not pwhash:
+                    rpwhash = get_patchwork_hash(info)
+                    if not rpwhash:
                         # Theoretically, should never happen?
                         logger.debug('Skipping %s (no pwhash)', rev)
                         continue
@@ -1191,7 +1200,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     if lore_match:
                         msgid = lore_match.group(1)
                         logger.debug('Msgid for %s: %s', rev, msgid)
-                    _rev_cache[rev] = (rev, logline, committer, pwhash, msgid)
+                    _rev_cache[rev] = (rev, logline, committer, rpwhash, msgid)
 
                 rpwhashes[refname].add(_rev_cache[rev])
 
@@ -1474,7 +1483,7 @@ if __name__ == '__main__':
     with open(cmdargs.cfgfile, 'r') as fh:
         cfgyaml = fh.read()
 
-    CONFIG: Dict[str, Any] = pyyaml.safe_load(cfgyaml)  # type: ignore[assignment]
+    CONFIG = pyyaml.safe_load(cfgyaml)  # type: ignore[assignment]
 
     if cmdargs.tokens_file:
         with open(cmdargs.tokens_file, 'r') as fh:
