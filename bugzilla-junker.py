@@ -17,12 +17,82 @@ import re
 import shelve
 import datetime
 import tomllib
+import os
+import sys
 
 from urllib.parse import urlparse
 
 from typing import Optional, Set, Dict, List, Any
 
+try:
+    import jsonschema  # type: ignore
+    has_jsonschema = True
+except ImportError:
+    has_jsonschema = False
+
 VERSION = '2.0'
+
+# Configuration schema for validation
+CONFIG_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "main": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "pattern": r"^https?://[^\s/$.?#].[^\s]*$",
+                    "description": "Bugzilla instance URL"
+                },
+                "apikey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Bugzilla API key for authentication"
+                },
+                "logfile": {
+                    "type": ["string", "null"],
+                    "description": "Path to log file (optional)"
+                },
+                "cache": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Path to cache database file"
+                }
+            },
+            "required": ["url", "apikey", "cache"],
+            "additionalProperties": False
+        },
+        "spam": {
+            "type": "object",
+            "properties": {
+                "comment_tag": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Tag to apply to spam comments"
+                },
+                "bug_group": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Group to move spam bugs to"
+                },
+                "bug_status": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Status to set for spam bugs"
+                },
+                "bug_resolution": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Resolution to set for spam bugs"
+                }
+            },
+            "required": ["comment_tag", "bug_group", "bug_status", "bug_resolution"],
+            "additionalProperties": False
+        }
+    },
+    "required": ["main", "spam"],
+    "additionalProperties": False
+}
 
 logger = logging.getLogger('bugjunker')
 
@@ -40,6 +110,95 @@ reqsession: Optional[requests.Session] = None
 # Persistent shelve database for caching seen comments, attachments, and whitelists
 # Stores: seencids, seenaids, okdomains, okfolks, lastrun timestamp
 bzshelf: Optional[shelve.Shelf[Any]] = None
+
+
+def validate_config_file_permissions(config_path: str) -> None:
+    """
+    Check that the configuration file has secure permissions.
+
+    Warns if the config file is readable by others, as it contains
+    sensitive information like API keys.
+
+    Args:
+        config_path: Path to the configuration file
+    """
+    try:
+        stat_info = os.stat(config_path)
+        # Check if file is readable by group or others (permissions & 0o044)
+        if stat_info.st_mode & 0o044:
+            logger.warning('Config file %s is readable by others - consider chmod 600', config_path)
+    except OSError as e:
+        logger.warning('Could not check permissions for %s: %s', config_path, e)
+
+
+def validate_config_schema(config_data: Dict[str, Any]) -> None:
+    """
+    Validate configuration data against the defined schema.
+
+    Uses jsonschema if available for comprehensive validation,
+    otherwise falls back to basic manual validation of required fields.
+
+    Args:
+        config_data: The parsed configuration dictionary
+
+    Raises:
+        SystemExit: If configuration validation fails
+    """
+    if has_jsonschema:
+        try:
+            jsonschema.validate(config_data, CONFIG_SCHEMA)  # type: ignore
+            logger.debug('Configuration schema validation passed')
+        except jsonschema.ValidationError as e:  # type: ignore
+            logger.error('Configuration validation error: %s', e.message)
+            logger.error('Failed at path: %s', ' -> '.join(str(p) for p in e.absolute_path))
+            if e.instance:
+                logger.error('Invalid value: %s', e.instance)
+            sys.exit(1)
+        except jsonschema.SchemaError as e:  # type: ignore
+            logger.error('Internal schema error: %s', e.message)
+            sys.exit(1)
+
+
+def validate_config_paths(config_data: Dict[str, Any]) -> None:
+    """
+    Validate that configured paths are accessible and writable where needed.
+
+    Checks that cache directory is writable and logfile directory exists
+    if a logfile is configured.
+
+    Args:
+        config_data: The parsed configuration dictionary
+    """
+    main_config = config_data.get('main', {})
+
+    # Validate cache path
+    cache_path = main_config.get('cache')
+    if cache_path:
+        cache_dir = os.path.dirname(cache_path)
+        if cache_dir and not os.path.exists(cache_dir):
+            try:
+                os.makedirs(cache_dir, mode=0o700)
+                logger.debug('Created cache directory: %s', cache_dir)
+            except OSError as e:
+                logger.error('Cannot create cache directory %s: %s', cache_dir, e)
+                sys.exit(1)
+
+        # Test if we can write to the cache location
+        if cache_dir and not os.access(cache_dir, os.W_OK):
+            logger.error('Cache directory %s is not writable', cache_dir)
+            sys.exit(1)
+
+    # Validate logfile path if specified
+    logfile = main_config.get('logfile')
+    if logfile:
+        logfile_dir = os.path.dirname(logfile)
+        if logfile_dir and not os.path.exists(logfile_dir):
+            try:
+                os.makedirs(logfile_dir, mode=0o755)
+                logger.debug('Created log directory: %s', logfile_dir)
+            except OSError as e:
+                logger.error('Cannot create log directory %s: %s', logfile_dir, e)
+                sys.exit(1)
 
 
 def get_session() -> requests.Session:
@@ -585,8 +744,8 @@ def get_config() -> Dict[str, Any]:
         cmdargs.config. The file is expected to be in TOML format.
 
     Raises:
-        Various exceptions may be raised if the config file is missing,
-        malformed, or contains invalid TOML syntax.
+        SystemExit: If the config file is missing, malformed, contains invalid
+                   TOML syntax, or fails validation.
     """
     global config
 
@@ -594,9 +753,31 @@ def get_config() -> Dict[str, Any]:
     if config is None:
         logger.info('Loading configuration file %s', cmdargs.config)
 
-        # Load and parse TOML configuration file
-        # Open in binary mode as required by tomllib
-        config = tomllib.load(open(cmdargs.config, 'rb'))
+        # Check if config file exists
+        if not os.path.exists(cmdargs.config):
+            logger.error('Configuration file not found: %s', cmdargs.config)
+            sys.exit(1)
+
+        # Check file permissions for security
+        validate_config_file_permissions(cmdargs.config)
+
+        try:
+            # Load and parse TOML configuration file
+            # Open in binary mode as required by tomllib
+            with open(cmdargs.config, 'rb') as f:
+                config = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            logger.error('Error parsing TOML configuration file: %s', e)
+            sys.exit(1)
+        except OSError as e:
+            logger.error('Error reading configuration file %s: %s', cmdargs.config, e)
+            sys.exit(1)
+
+        # Validate configuration schema
+        validate_config_schema(config)
+
+        # Validate paths and create directories if needed
+        validate_config_paths(config)
 
     return config
 
@@ -708,7 +889,7 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    description = 'Junk spammy bugzilla comments and ban their authors'
+    description = ('Junk spammy bugzilla comments and ban their authors.')
     parser = argparse.ArgumentParser(description=description, prog='bz-comment-junker.py')
     parser.add_argument('-c', '--config', required=True,
                         help='Configuration file')
