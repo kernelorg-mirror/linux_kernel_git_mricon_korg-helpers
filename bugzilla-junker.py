@@ -5,346 +5,709 @@
 # to see if any of them link to external sites. If the reviewer deems them
 # spammy, the script will tag them as such.
 #
-# Caution: work in progress
+# Does not use any third party services -- the reviewer has to review every
+# URL manually. Maybe using a sniffer service would be a good next step.
 #
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
-import sys
 import requests
 import argparse
 import logging
 import re
 import shelve
 import datetime
-import notify2
-import time
+import tomllib
 
 from urllib.parse import urlparse
-from configparser import ConfigParser
 
-logger = logging.getLogger('default')
+from typing import Optional, Set, Dict, List, Any
 
-APIKEY = None
-BZURL = None
+VERSION = '2.0'
 
-REQSESSION = None
+logger = logging.getLogger('bugjunker')
 
-CACHEDATA = None
+# Global variables for caching and state management
+# These are initialized lazily to avoid unnecessary resource allocation
 
+# Configuration data loaded from TOML file
+# Contains Bugzilla URL, API key, cache paths, and other settings
+config: Optional[Dict[str, Any]] = None
 
-def notify_desktop(message):
-    notify2.init('bugjunker')
-    n = notify2.Notification('bugjunker', message)
-    n.set_timeout(notify2.EXPIRES_NEVER)
-    n.show()
+# Persistent HTTP session for Bugzilla API requests
+# Reused across multiple requests to maintain connection pools and cookies
+reqsession: Optional[requests.Session] = None
 
-
-def get_session():
-    global REQSESSION
-    if REQSESSION is None:
-        REQSESSION = requests.session()
-        REQSESSION.headers.update({'User-Agent': 'bugjunker'})
-    return REQSESSION
+# Persistent shelve database for caching seen comments, attachments, and whitelists
+# Stores: seencids, seenaids, okdomains, okfolks, lastrun timestamp
+bzshelf: Optional[shelve.Shelf[Any]] = None
 
 
-def ban_hammer(spammers):
-    params = {}
-    for spammer in set(spammers):
-        path = 'user/{spammer}'.format(spammer=spammer)
+def get_session() -> requests.Session:
+    """
+    Get or create a persistent HTTP session for Bugzilla API requests.
+
+    This function implements a singleton pattern to reuse the same requests.Session
+    object across multiple API calls, which improves performance by maintaining
+    connection pools and cookies.
+
+    Returns:
+        requests.Session: A configured session object with appropriate User-Agent header
+
+    Note:
+        The session is lazily initialized on first call and cached in the global
+        reqsession variable for subsequent calls.
+    """
+    global reqsession
+
+    # Check if session already exists (singleton pattern)
+    if reqsession is None:
+        # Create new session instance
+        reqsession = requests.session()  # type: ignore[assignment]
+
+        # Set User-Agent header to identify our application to the server
+        # This helps with debugging and allows server administrators to
+        # identify traffic from this specific tool
+        reqsession.headers.update({'User-Agent': f'bugjunker/{VERSION}'})
+
+    return reqsession
+
+
+def ban_hammer(spammers: Set[str]) -> None:
+    """
+    Ban identified spammer users in Bugzilla by disabling their accounts.
+
+    This function disables email notifications and sets a login denial message
+    for users who have been identified as spammers. Once banned, these users
+    will not be able to log in and will see a "Spammer" message when attempting
+    to access their account.
+
+    Args:
+        spammers: Set of user email addresses or usernames to ban
+
+    Note:
+        This action is irreversible through this script. Manual intervention
+        by a Bugzilla administrator would be required to unban users.
+    """
+    params: Dict[str, Any] = dict()
+
+    # Process each identified spammer
+    for spammer in spammers:
+        # Construct API path for user modification
+        path = f'user/{spammer}'
         logger.info('Banning %s', spammer)
-        payload = {
-            'email_enabled': False,
-            'login_denied_text': 'Spammer',
+
+        # Prepare payload to disable the user account
+        payload: Dict[str, Any] = {
+            'email_enabled': False,         # Disable email notifications
+            'login_denied_text': 'Spammer', # Set denial message shown on login attempts
         }
+
+        # Execute the ban via Bugzilla REST API
         bz_put(path, params, payload)
 
 
-def tag_hammer(spamcids, spamtag):
-    params = {}
+def tag_hammer(spamcids: Set[int]) -> None:
+    """
+    Tag identified spam comments with a spam label in Bugzilla.
+
+    This function applies a configurable spam tag to comments that have been
+    identified as spam. The tag helps moderators and administrators quickly
+    identify problematic content and can be used for filtering or reporting.
+
+    Args:
+        spamcids: Set of comment IDs to tag as spam
+
+    Note:
+        The spam tag is defined in the configuration file under 'spam.comment_tag'.
+        Tagged comments remain visible but are marked for administrative review.
+    """
+    config = get_config()
+    params: Dict[str, Any] = dict()
+
+    # Process each spam comment ID (convert to set to remove duplicates)
     for cid in set(spamcids):
         logger.info('Tagging comment %s', cid)
-        path = 'bug/comment/{cid}/tags'.format(cid=cid)
-        payload = {
-            'comment_id': cid,
-            'add': [spamtag],
+
+        # Construct API path for comment tag modification
+        path = f'bug/comment/{cid}/tags'
+
+        # Prepare payload to add the spam tag
+        payload: Dict[str, Any] = {
+            'comment_id': cid,                      # Target comment ID
+            'add': [config['spam']['comment_tag']], # Add the configured spam tag
         }
+
+        # Execute the tagging via Bugzilla REST API
         bz_put(path, params, payload)
 
 
-def bug_hammer(spambugs, args):
-    params = {}
+def bug_hammer(spambugs: Set[int]) -> None:
+    """
+    Mark entire bugs as spam by closing them and making them private.
+
+    This function is used for the most severe spam cases, typically when the
+    initial bug report (comment #0) itself is spam. It closes the bug with
+    a spam-related status/resolution and moves it to a private group to hide
+    it from public view.
+
+    Args:
+        spambugs: Set of bug IDs to mark as spam and hide
+
+    Note:
+        This is the most severe action - it effectively removes the entire bug
+        from public visibility. The status, resolution, and group are configured
+        in the configuration file under the 'spam' section.
+    """
+    config = get_config()
+    params: Dict[str, Any] = dict()
+
+    # Process each spam bug ID (convert to set to remove duplicates)
     for bugid in set(spambugs):
         logger.info('Junking bug %s', bugid)
+
+        # Construct API path for bug modification
         path = 'bug/{bugid}'.format(bugid=bugid)
-        payload = {
-            'groups': {'add': [args.group]},
-            'status': args.status,
-            'resolution': args.resolution,
+
+        # Prepare payload to close and hide the bug
+        payload: Dict[str, Any] = {
+            'groups': {'add': [config['spam']['bug_group']]}, # Move to private group (hide from public)
+            'status': config['spam']['bug_status'],           # Set bug status (from config)
+            'resolution': config['spam']['bug_resolution'],   # Set resolution (from config)
         }
+
+        # Execute the bug modification via Bugzilla REST API
         bz_put(path, params, payload)
 
 
-def bz_get(path, params):
-    url = '{BZURL}/rest/{path}'.format(BZURL=BZURL, path=path)
-    params['api_key'] = APIKEY
+def bz_get(path: str, params: Dict[str, Any]) -> Any:
+    """
+    Perform a GET request to the Bugzilla REST API.
+
+    This is a low-level utility function that handles authentication and
+    constructs the full URL for Bugzilla API requests. It automatically
+    adds the API key for authentication and returns the parsed JSON response.
+
+    Args:
+        path: The API endpoint path (relative to /rest/), e.g., 'bug/123' or 'user/user@example.com'
+        params: Dictionary of query parameters to include in the request
+
+    Returns:
+        Any: The parsed JSON response from the Bugzilla API
+
+    Note:
+        The API key is automatically added from the configuration file.
+        The base URL is constructed from config['main']['url'].
+    """
+    config = get_config()
+
+    # Construct full URL by combining base URL with REST path
+    url = f"{config['main']['url']}/rest/{path}"
+
+    # Add API key to parameters for authentication
+    params['api_key'] = config['main']['apikey']
+
+    # Get the persistent HTTP session for connection reuse
     ses = get_session()
+
+    # Execute the GET request
     res = ses.get(url, params=params)
+
+    # Parse and return JSON response
     return res.json()
 
 
-def bz_put(path, params, payload):
-    url = '{BZURL}/rest/{path}'.format(BZURL=BZURL, path=path)
-    params['api_key'] = APIKEY
+def bz_put(path: str, params: Dict[str, Any], payload: Dict[str, Any]) -> Any:
+    """
+    Perform a PUT request to the Bugzilla REST API to modify data.
+
+    This is a low-level utility function that handles authentication and
+    constructs the full URL for Bugzilla API modification requests. It
+    automatically adds the API key for authentication and sends the payload
+    as JSON data to update or modify Bugzilla entities.
+
+    Args:
+        path: The API endpoint path (relative to /rest/), e.g., 'bug/123' or 'user/user@example.com'
+        params: Dictionary of query parameters to include in the request
+        payload: Dictionary containing the data to be sent as JSON for modification
+
+    Returns:
+        Any: The parsed JSON response from the Bugzilla API
+
+    Note:
+        This function is used for all modification operations (user bans, comment tagging,
+        bug status changes, etc.). The API key is automatically added from the configuration.
+    """
+    config = get_config()
+
+    # Construct full URL by combining base URL with REST path
+    url = f"{config['main']['url']}/rest/{path}"
+
+    # Add API key to parameters for authentication
+    params['api_key'] = config['main']['apikey']
+
+    # Get the persistent HTTP session for connection reuse
     ses = get_session()
+
+    # Execute the PUT request with JSON payload
     res = ses.put(url, params=params, json=payload)
+
+    # Parse and return JSON response
     return res.json()
 
 
-def load_cache(cachefile):
-    global CACHEDATA
-    if CACHEDATA is not None:
-        return CACHEDATA
+def get_shelf() -> shelve.Shelf[Any]:
+    """
+    Get or create a persistent shelve database to keep the state between runs.
 
-    # noinspection PyBroadException
-    try:
-        with shelve.open(cachefile, 'r') as wc:
-            logger.info('Loading cache from %s', cachefile)
-            CACHEDATA = dict(wc)
-    except:
-        CACHEDATA = {
-            'seencids': list(),
-            'seenaids': list(),
-            'okdomains': list(),
-            'okfolks': list(),
-        }
-        pass
+    This function implements a singleton pattern to manage a persistent cache
+    that stores information between script runs. The cache tracks processed
+    comments/attachments, whitelisted domains/users, and the last run timestamp
+    to avoid reprocessing the same data and maintain user decisions.
 
-    if 'lastrun' in CACHEDATA:
-        lastrun = CACHEDATA['lastrun']
-    else:
-        lastrun = '24h'
+    Returns:
+        shelve.Shelf[Any]: A persistent database object for storing cache data
 
-    return lastrun, CACHEDATA
+    Cache Structure:
+        - seencids: Set of comment IDs that have been processed
+        - seenaids: Set of attachment IDs that have been checked
+        - okdomains: Set of whitelisted domain names (approved by user)
+        - okfolks: Set of whitelisted user emails/names (approved by user)
+        - lastrun: Timestamp of last script execution (for incremental processing)
+
+    Note:
+        The cache file location is specified in config['main']['cache'].
+        The singleton pattern ensures only one database connection per script run.
+    """
+    global bzshelf
+
+    # Check if shelf is already initialized (singleton pattern)
+    if bzshelf is not None:
+        return bzshelf
+
+    config = get_config()
+    logger.info('Loading cache from %s', config['main']['cache'])
+
+    # Open shelve database with 'c' flag (create if doesn't exist)
+    bzshelf = shelve.open(config['main']['cache'], 'c')
+
+    # Initialize cache structure with empty sets if keys don't exist
+
+    # Track processed comment IDs to avoid duplicate processing
+    if 'seencids' not in bzshelf:
+        bzshelf['seencids'] = set()
+
+    # Track checked attachment IDs to avoid duplicate attachment checks
+    if 'seenaids' not in bzshelf:
+        bzshelf['seenaids'] = set()
+
+    # Store user-approved domain names to skip future prompts
+    if 'okdomains' not in bzshelf:
+        bzshelf['okdomains'] = set()
+
+    # Store user-approved users to skip future prompts
+    if 'okfolks' not in bzshelf:
+        bzshelf['okfolks'] = set()
+
+    # Track last run time for incremental processing (default to 24h lookback)
+    if 'lastrun' not in bzshelf:
+        bzshelf['lastrun'] = '24h'
+
+    return bzshelf
 
 
-def save_cache(cachefile, cachedata):
-    with shelve.open(cachefile, 'c') as wc:
-        for key, val in cachedata.items():
-            wc[key] = val
-        wc.sync()
+def check_bad_urls(urls: list[str]) -> set[tuple[str, Optional[str]]]:
+    """
+    Check a list of URLs for potentially suspicious domains.
 
+    This function filters URLs to identify those that may be spam by checking
+    if their domains are in the whitelist of approved domains. URLs from
+    non-whitelisted domains are flagged as potentially suspicious and will
+    require user review.
 
-def check_bad_urls(urls, okdomains):
+    Args:
+        urls: List of URL strings to check for suspicious domains
+
+    Returns:
+        set[tuple[str, Optional[str]]]: Set of tuples containing:
+            - First element: The full suspicious URL
+            - Second element: The domain name (netloc) or None if parsing failed
+
+    Note:
+        Only URLs with domains NOT in the okdomains whitelist are returned.
+        Malformed URLs that can't be parsed are also flagged with domain=None.
+    """
+    badness: set[tuple[str, Optional[str]]] = set()
+    bzs = get_shelf()
+
+    # Check each URL against the whitelist
     for url in urls:
         try:
+            # Parse the URL to extract domain information
             up = urlparse(url)
+
+            # Check if domain is NOT in the approved domains whitelist
+            if up.netloc not in bzs['okdomains']:
+                # Flag this URL as potentially suspicious
+                badness.add((url, up.netloc))
+
         except ValueError:
-            return url, None
-        isok = False
-        for okd in okdomains:
-            if okd == up.netloc:
-                isok = True
-                break
-        if not isok:
-            return url, up.netloc
+            # Handle malformed URLs that can't be parsed
+            # Flag with None domain to indicate parsing failure
+            badness.add((url, None))
 
-    return None, None
+    return badness
 
 
-def is_junk_attachment(attid):
-    attid = str(attid)
+def is_junk_attachment(attid: int) -> bool:
+    """
+    Check if a bug attachment is likely to be spam and modify it if so.
+
+    This function examines attachment metadata to determine if it's potentially
+    spam. HTML attachments are considered highly suspicious and are automatically
+    converted to safe plain text files. Legitimate attachments like patches and
+    plain text files are preserved.
+
+    Args:
+        attid: The attachment ID to check
+
+    Returns:
+        bool: True if the attachment was identified and processed as junk,
+              False if the attachment appears legitimate or doesn't exist
+
+    Note:
+        This function performs DESTRUCTIVE actions on HTML attachments by
+        converting them to private plain text files named 'caution.txt'.
+        Patches and plain text attachments are considered safe and preserved.
+    """
     logger.info('    checking attachment %s', attid)
-    path = 'bug/attachment/{attid}'.format(attid=attid)
+
+    # Construct API path for attachment retrieval
+    path = f'bug/attachment/{attid}'
+
+    # Fetch attachment metadata from Bugzilla
     attinfo = bz_get(path, {})
+
+    # Check if attachment exists in the response
     if attid not in attinfo['attachments']:
         return False
+
+    # Extract attachment metadata
     attdata = attinfo['attachments'][attid]
+
+    # Allow legitimate attachment types to pass through
     if attdata['is_patch'] or attdata['content_type'] in ('text/plain',):
+        # Patches and plain text are considered safe
         return False
+
+    # Check for HTML attachments - almost always spam
     if attdata['content_type'] == 'text/html':
-        # Almost certainly junk
+        # HTML attachments are highly suspicious - convert to safe format
         logger.info('    junking attachment %s', attid)
-        payload = {
-            'content_type': 'text/plain',
-            'filename': 'caution.txt',
-            'is_private': True,
+
+        # Prepare payload to neutralize the attachment
+        payload: Dict[str, Any] = {
+            'content_type': 'text/plain',  # Change to safe content type
+            'filename': 'caution.txt',     # Replace with warning filename
+            'is_private': True,            # Make it private to reduce exposure
         }
+
+        # Execute the attachment modification
         bz_put(path, {}, payload)
         return True
+
+    # Other content types are not currently processed
     return False
 
 
-def process_bugs(cmdargs, cachefile, c, bugs, spamtag):
-    spammers = list()
-    spamcids = list()
-    spambugs = list()
+def process_bugs(bugs: List[Any]) -> tuple[set[str], set[int], set[int]]:
+    """
+    Process a list of bugs to identify spam comments, attachments, and users.
 
+    This is the main spam detection engine that analyzes bug comments for
+    suspicious URLs, checks attachments, and prompts the user for decisions
+    about potentially spammy content. It maintains state to avoid reprocessing
+    and respects user whitelisting decisions.
+
+    Args:
+        bugs: List of bug dictionaries from Bugzilla API containing bug metadata
+
+    Returns:
+        tuple[set[str], set[int], set[int]]: A 3-tuple containing:
+            - spammers: Set of user emails/names identified as spammers
+            - spamcids: Set of comment IDs that should be tagged as spam
+            - spambugs: Set of bug IDs that should be completely hidden (spam bug reports)
+
+    Interactive Behavior:
+        For each suspicious URL found, the user is prompted with options:
+        - 'b' (ban): Mark the user as spammer and tag content as spam
+        - 'a' (allow): Allow this specific URL but don't whitelist the domain
+        - 'w' (whitelist): Add domain and user to permanent whitelist
+
+    Note:
+        This function modifies the persistent cache to track processed items
+        and user decisions. Comment #0 spam results in the entire bug being hidden.
+    """
+    # Initialize collections to track identified spam
+    spammers: set[str] = set()      # Users identified as spammers
+    spamcids: set[int] = set()      # Comment IDs to be tagged as spam
+    spambugs: set[int] = set()      # Bug IDs to be completely hidden
+
+    # Get persistent cache and configuration
+    bzs = get_shelf()
+    config = get_config()
+
+    # Process each bug in the provided list
     for bug in bugs:
         logger.info('Analyzing [%s]: %s', bug['id'], bug['summary'])
-        params = {}
+
+        # Fetch all comments for this bug
+        params: dict[str, Any] = dict()
         bugid = bug['id']
-        path = 'bug/{bugid}/comment'.format(bugid=bugid)
+        path = f'bug/{bugid}/comment'
         comments = bz_get(path, params)
-        for f1, f2 in comments['bugs'].items():
-            c_count = -1
+
+        # Process comments for each bug (nested structure from API)
+        for _, f2 in comments['bugs'].items():
+            c_count = -1  # Track comment position (0 = initial bug report)
+
+            # Analyze each individual comment
             for comment in f2['comments']:
                 c_count += 1
                 cid = comment['id']
-                if cid in c['seencids']:
-                    # already seen, skip
+
+                # Skip comments we've already processed
+                if cid in bzs['seencids']:
                     continue
 
-                c['seencids'].append(cid)
+                # Mark comment as seen (unless dry run)
+                if not cmdargs.dry_run:
+                    bzs['seencids'].add(cid)
 
                 creator = comment['creator']
-                if creator in c['okfolks']:
-                    # Known good person
+
+                # Skip comments from whitelisted users
+                if creator in bzs['okfolks']:
                     continue
 
                 tags = comment['tags']
-                if spamtag in tags:
-                    # already marked as spammy
+
+                # Skip comments already tagged as spam
+                if config['spam']['comment_tag'] in tags:
                     continue
 
+                # Auto-tag comments from known spammers
                 if creator in spammers:
-                    # Made by a known spammer, banit
-                    spamcids.append(cid)
+                    if not cmdargs.dry_run:
+                        spamcids.add(cid)
                     logger.info('    auto-tagging comment by %s: %s', creator, cid)
                     continue
 
+                # Check attachments if enabled
                 if cmdargs.checkatt:
                     attid = comment['attachment_id']
-                    if attid is not None and attid not in c['seenaids']:
-                        c['seenaids'].append(attid)
-                        if is_junk_attachment(attid):
-                            logger.info('    check if spammer: %s', creator)
+                    if attid is not None and attid not in bzs['seenaids']:
+                        if not cmdargs.dry_run:
+                            bzs['seenaids'].add(attid)
+                            if is_junk_attachment(attid):
+                                logger.info('    check if spammer: %s', creator)
 
-                # Look for remote URLs in the comment
-                if bug['url'].find('http') > -1 or comment['text'].find('http') > -1:
+                # Look for HTTP URLs in comment text and bug URL field
+                if 'http' in bug['url'] or 'http' in comment['text']:
+                    # Extract all HTTP/HTTPS URLs from comment text
                     urls = re.findall(r'(https?://\S+)', comment['text'])
+
+                    # Include bug URL field if present
                     if len(bug['url']):
                         urls.append(bug['url'])
-                    badurl, baddomain = check_bad_urls(urls, c['okdomains'])
 
-                    if badurl is not None:
-                        if cmdargs.noninteractive:
-                            notify_desktop('Spam in %s: %s' % (bug['id'], baddomain))
-                            when = datetime.datetime.strptime(bug['last_change_time'], '%Y-%m-%dT%H:%M:%SZ')
-                            c['seencids'].remove(cid)
-                            c['lastrun'] = when.strftime('%Y-%m-%d %H:%M:%S')
-                            c['needsinput'] = True
-                            return spammers, spamcids, spambugs
+                    # Check URLs against whitelist
+                    badness = check_bad_urls(urls)
 
+                    # Process each suspicious URL found
+                    for badurl, baddomain in badness:
+                        # Skip if creator already identified as spammer
+                        if creator in spammers:
+                            logger.info('    spamcid: %s', cid)
+                            spamcids.add(cid)
+                            continue
+
+                        # Present suspicious URL to user for decision
                         logger.info('    ---')
-                        logger.info('    suspish URL: %s', badurl)
-                        logger.info('    checkit out: %s/show_bug.cgi?id=%s#c%s',
-                                    BZURL, bugid, c_count)
+                        logger.info('    creator: %s', creator)
+                        logger.info('    sus URL: %s', badurl)
+                        logger.info('       link: %s/show_bug.cgi?id=%s#c%s',
+                                    config['main']['url'], bugid, c_count)
                         baw = input('    (b)an, (a)llow, (w)hitelist %s: ' % baddomain)
 
+                        # Handle user decision: Allow this URL
                         if baw == 'a':
-                            c['okfolks'].append(creator)
-                            save_cache(cachefile, c)
+                            if not cmdargs.dry_run:
+                                bzs.sync()  # Save cache state
                             continue
 
+                        # Handle user decision: Whitelist domain and user
                         if baw == 'w':
-                            logger.info('    whitelisted %s', baddomain)
-                            c['okdomains'].append(baddomain)
-                            c['okfolks'].append(creator)
-                            save_cache(cachefile, c)
+                            if not cmdargs.dry_run:
+                                logger.info('    whitelisted %s', baddomain)
+                                bzs['okdomains'].add(baddomain)  # Whitelist domain
+                                bzs['okfolks'].add(creator)     # Whitelist user
+                                bzs.sync()  # Save whitelist additions
                             continue
 
+                        # Default action (or explicit ban): Mark as spam
                         logger.info('    spamcid: %s', cid)
-                        spamcids.append(cid)
+                        spamcids.add(cid)
+                        logger.info('    spammer: %s', creator)
+                        spammers.add(creator)
 
-                        # If it's a comment #0, then the whole bug needs junking
+                        # Special case: If comment #0 is spam, hide entire bug
                         if c_count == 0:
-                            spambugs.append(bug['id'])
-
-                        if creator not in spammers:
-                            logger.info('    spammer: %s', creator)
-                            spammers.append(creator)
+                            spambugs.add(bug['id'])
 
     return spammers, spamcids, spambugs
 
 
-def main(args):
-    global BZURL
-    global APIKEY
+def get_config() -> Dict[str, Any]:
+    """
+    Load and return the configuration from the TOML file.
 
+    This function implements a singleton pattern to load the configuration file
+    only once per script execution. The configuration contains all settings
+    needed for Bugzilla API access, spam detection parameters, and file paths.
+
+    Returns:
+        Dict[str, Any]: The parsed configuration dictionary containing:
+            - main: Bugzilla connection settings (url, apikey, cache, logfile, spamtag)
+            - spam: Spam handling settings (comment_tag, bug_group, bug_status, bug_resolution)
+
+    Note:
+        The configuration file path is taken from the command-line argument
+        cmdargs.config. The file is expected to be in TOML format.
+
+    Raises:
+        Various exceptions may be raised if the config file is missing,
+        malformed, or contains invalid TOML syntax.
+    """
+    global config
+
+    # Check if configuration is already loaded (singleton pattern)
+    if config is None:
+        logger.info('Loading configuration file %s', cmdargs.config)
+
+        # Load and parse TOML configuration file
+        # Open in binary mode as required by tomllib
+        config = tomllib.load(open(cmdargs.config, 'rb'))
+
+    return config
+
+
+def main() -> None:
+    """
+    Main entry point for the Bugzilla spam detection and removal tool.
+
+    This function orchestrates the entire spam detection workflow:
+    1. Sets up logging based on command-line arguments
+    2. Loads configuration and initializes persistent cache
+    3. Queries Bugzilla for recent changes since last run
+    4. Processes bugs to identify spam content
+    5. Executes appropriate actions (ban users, tag comments, hide bugs)
+    6. Updates the last run timestamp for incremental processing
+
+    The function supports dry-run mode for testing and uses incremental
+    processing to avoid reprocessing the same bugs on subsequent runs.
+
+    Note:
+        This function relies on global variables for configuration and
+        command-line arguments that are set up before main() is called.
+    """
+    global config
+    global logger
+
+    # Initialize logging with DEBUG level (will be filtered by handlers)
     logger.setLevel(logging.DEBUG)
 
-    ch = logging.StreamHandler()
-    formatter = logging.Formatter('%(message)s')
-    ch.setFormatter(formatter)
+    # Set up console logging handler
+    sch = logging.StreamHandler()
+    formatter = logging.Formatter('%(message)s')  # Simple format for console
+    sch.setFormatter(formatter)
 
-    if args.quiet:
-        ch.setLevel(logging.CRITICAL)
-    elif args.debug:
-        ch.setLevel(logging.DEBUG)
+    # Configure console logging level based on command-line flags
+    if cmdargs.quiet:
+        sch.setLevel(logging.CRITICAL)  # Only show critical errors
+    elif cmdargs.debug:
+        sch.setLevel(logging.DEBUG)     # Show all debug information
     else:
-        ch.setLevel(logging.INFO)
+        sch.setLevel(logging.INFO)      # Default: show info and above
 
-    logger.addHandler(ch)
+    logger.addHandler(sch)
 
-    logger.info('Loading configuration file %s', args.config)
-    config = ConfigParser()
-    config.read(args.config)
-    BZURL = config.get('main', 'url')
-    APIKEY = config.get('main', 'apikey')
+    # Load configuration from TOML file
+    config = get_config()
 
-    spamtag = config.get('main', 'spamtag')
-
-    if config.get('main', 'logfile'):
-        ch = logging.FileHandler(config.get('main', 'logfile'))
+    # Set up file logging if configured
+    if config['main']['logfile']:
+        fch = logging.FileHandler(config['main']['logfile'])
+        # More detailed format for file logs (includes process ID and timestamp)
         fmt = '[%(process)d] %(asctime)s - %(message)s'
-        ch.setFormatter(logging.Formatter(fmt))
-        ch.setLevel(logging.INFO)
-        logger.addHandler(ch)
+        fch.setFormatter(logging.Formatter(fmt))
+        fch.setLevel(logging.INFO)  # Always log INFO and above to file
+        logger.addHandler(fch)
 
-    cachefile = config.get('main', 'cache')
-    lastrun, c = load_cache(cachefile)
+    # Initialize persistent cache for tracking state between runs
+    bzs = get_shelf()
 
+    # Determine time range for this run (incremental processing)
+    if cmdargs.lookback is not None:
+        # Use explicit lookback period from command line
+        lastrun = cmdargs.lookback
+    else:
+        # Use cached timestamp from last run (or default '24h')
+        lastrun = bzs['lastrun']
 
-    if args.lookback is not None:
-        lastrun = args.lookback
+    # Prepare Bugzilla API query parameters for bug changes
+    params: Dict[str, str] = {
+        'chfieldfrom': lastrun,                                    # Changes since this time
+        'include_fields': 'id,summary,last_change_time,url',      # Minimize data transfer
+    }
+    logger.info('Querying %s for changes since %s', config['main']['url'], lastrun)
 
-    while True:
-        if args.noninteractive and 'needsinput' in c and c['needsinput']:
-            logger.info('Need to run interactively to make some decisions')
-            sys.exit(0)
+    # Record current time for next run's timestamp
+    unow = datetime.datetime.now(datetime.timezone.utc)
 
-        params = {
-            'chfieldfrom': lastrun,
-            'include_fields': 'id,summary,last_change_time,url',
-        }
-        logger.info('Querying %s for changes since %s', BZURL, lastrun)
+    # Query Bugzilla for bugs with changes since last run
+    jdata = bz_get('bug', params)
 
-        unow = datetime.datetime.utcnow()
-        json = bz_get('bug', params)
-        c['lastrun'] = unow.strftime('%Y-%m-%d %H:%M:%S')
-        c['needsinput'] = False
-        if len(json['bugs']):
-            spammers, spamcids, spambugs = process_bugs(args, cachefile, c, json['bugs'], spamtag)
+    # Update last run timestamp (unless in dry-run mode)
+    if not cmdargs.dry_run:
+        bzs['lastrun'] = unow.strftime('%Y-%m-%d %H:%M:%S')
 
-            if len(spammers) or len(spamcids) or len(spambugs):
-                ban_hammer(spammers)
-                tag_hammer(spamcids, spamtag)
-                bug_hammer(spambugs, args)
-            else:
-                logger.info('No new spam found')
+    # Process any bugs that were found
+    if len(jdata['bugs']):
+        # Run the main spam detection engine
+        spammers, spamcids, spambugs = process_bugs(jdata['bugs'])
+
+        # Handle dry-run mode
+        if cmdargs.dry_run:
+            logger.info('Dry run, not performing any actions')
+            return
+
+        # Execute spam removal actions if any spam was found
+        if len(spammers) or len(spamcids) or len(spambugs):
+            # Apply the three levels of spam countermeasures
+            ban_hammer(spammers)    # Ban user accounts
+            tag_hammer(spamcids)    # Tag spam comments
+            bug_hammer(spambugs)    # Hide entire spam bug reports
         else:
-            logger.info('No changes since %s', lastrun)
+            logger.info('No new spam found')
+    else:
+        logger.info('No changes since %s', lastrun)
 
-        save_cache(cachefile, c)
-
-        if not args.sleep:
-            sys.exit(0)
-
-        logger.info('Sleeping %d seconds', args.sleep)
-        time.sleep(args.sleep)
+    # Clean up: close the persistent cache database
+    bzs.sync()
+    bzs.close()
 
 
-def cmd():
+if __name__ == '__main__':
     description = 'Junk spammy bugzilla comments and ban their authors'
     parser = argparse.ArgumentParser(description=description, prog='bz-comment-junker.py')
     parser.add_argument('-c', '--config', required=True,
@@ -353,28 +716,12 @@ def cmd():
                         help='Output only errors')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
                         help='Add debugging info')
+    parser.add_argument('-n', '--dry-run', action='store_true', default=False,
+                        help='Dry run, do not perform any actions or store anything')
     parser.add_argument('-l', '--lookback', default=None,
                         help='How far back to look (default: since last run, or 24h if no cached data)')
-    parser.add_argument('-n', '--noninteractive', action='store_true', default=False,
-                        help='Run non-interactively and send an alert when potential spam is found')
     parser.add_argument('-a', '--check-attachments', action='store_true', dest='checkatt', default=False,
                         help='Check attachments for junkiness')
-    parser.add_argument('--sleep', type=int, default=0,
-                        help='After the run, sleep N seconds and then run again')
-    parser.add_argument('--status', default='RESOLVED',
-                        help='Status value for junked bugs')
-    parser.add_argument('--resolution', default='INVALID',
-                        help='Resolution value for junked bugs')
-    parser.add_argument('--product', default='Other',
-                        help='Product value for junked bugs')
-    parser.add_argument('--component', default='Spam',
-                        help='Component value for junked bugs')
-    parser.add_argument('--group', default='Junk',
-                        help='Private group name for junked bugs')
 
-    args = parser.parse_args()
-    main(args)
-
-
-if __name__ == '__main__':
-    cmd()
+    cmdargs = parser.parse_args()
+    main()
