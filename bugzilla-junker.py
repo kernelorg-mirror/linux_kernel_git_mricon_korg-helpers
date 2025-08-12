@@ -174,6 +174,8 @@ def validate_config_paths(config_data: Dict[str, Any]) -> None:
     # Validate cache path
     cache_path = main_config.get('cache')
     if cache_path:
+        # Expand ~ and environment variables in cache path
+        cache_path = os.path.expandvars(os.path.expanduser(cache_path))
         cache_dir = os.path.dirname(cache_path)
         if cache_dir and not os.path.exists(cache_dir):
             try:
@@ -191,6 +193,8 @@ def validate_config_paths(config_data: Dict[str, Any]) -> None:
     # Validate logfile path if specified
     logfile = main_config.get('logfile')
     if logfile:
+        # Expand ~ and environment variables in logfile path
+        logfile = os.path.expandvars(os.path.expanduser(logfile))
         logfile_dir = os.path.dirname(logfile)
         if logfile_dir and not os.path.exists(logfile_dir):
             try:
@@ -444,10 +448,11 @@ def get_shelf() -> shelve.Shelf[Any]:
         return bzshelf
 
     config = get_config()
-    logger.info('Loading cache from %s', config['main']['cache'])
+    cache_path = os.path.expandvars(os.path.expanduser(config['main']['cache']))
+    logger.info('Loading cache from %s', cache_path)
 
     # Open shelve database with 'c' flag (create if doesn't exist)
-    bzshelf = shelve.open(config['main']['cache'], 'c')
+    bzshelf = shelve.open(cache_path, 'c')
 
     # Initialize cache structure with empty sets if keys don't exist
 
@@ -752,19 +757,20 @@ def get_config() -> Dict[str, Any]:
     # Check if configuration is already loaded (singleton pattern)
     if config is None:
         logger.info('Loading configuration file %s', cmdargs.config)
+        cfgfile = os.path.expandvars(os.path.expanduser(cmdargs.config))
 
         # Check if config file exists
-        if not os.path.exists(cmdargs.config):
+        if not os.path.exists(cfgfile):
             logger.error('Configuration file not found: %s', cmdargs.config)
             sys.exit(1)
 
         # Check file permissions for security
-        validate_config_file_permissions(cmdargs.config)
+        validate_config_file_permissions(cfgfile)
 
         try:
             # Load and parse TOML configuration file
             # Open in binary mode as required by tomllib
-            with open(cmdargs.config, 'rb') as f:
+            with open(cfgfile, 'rb') as f:
                 config = tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
             logger.error('Error parsing TOML configuration file: %s', e)
@@ -826,8 +832,10 @@ def main() -> None:
     config = get_config()
 
     # Set up file logging if configured
-    if config['main']['logfile']:
-        fch = logging.FileHandler(config['main']['logfile'])
+    if config['main'].get('logfile'):
+        # Expand ~ and environment variables in logfile path
+        logfile_path = os.path.expandvars(os.path.expanduser(config['main']['logfile']))
+        fch = logging.FileHandler(logfile_path)
         # More detailed format for file logs (includes process ID and timestamp)
         fmt = '[%(process)d] %(asctime)s - %(message)s'
         fch.setFormatter(logging.Formatter(fmt))
@@ -891,8 +899,8 @@ def main() -> None:
 if __name__ == '__main__':
     description = ('Junk spammy bugzilla comments and ban their authors.')
     parser = argparse.ArgumentParser(description=description, prog='bz-comment-junker.py')
-    parser.add_argument('-c', '--config', required=True,
-                        help='Configuration file')
+    parser.add_argument('-c', '--config', help='Configuration file',
+                        default='~/.config/bugzilla-junker.conf')
     parser.add_argument('-q', '--quiet', action='store_true', default=False,
                         help='Output only errors')
     parser.add_argument('-d', '--debug', action='store_true', default=False,
