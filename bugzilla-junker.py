@@ -452,7 +452,7 @@ def get_shelf() -> shelve.Shelf[Any]:
     logger.info('Loading cache from %s', cache_path)
 
     # Open shelve database with 'c' flag (create if doesn't exist)
-    bzshelf = shelve.open(cache_path, 'c')
+    bzshelf = shelve.open(cache_path, flag='c', writeback=True)
 
     # Initialize cache structure with empty sets if keys don't exist
 
@@ -689,6 +689,11 @@ def process_bugs(bugs: List[Any]) -> tuple[set[str], set[int], set[int]]:
 
                     # Process each suspicious URL found
                     for badurl, baddomain in badness:
+                        # Skip if creator or domain already added to whitelists
+                        if creator in bzs['okfolks'] or baddomain in bzs['okdomains']:
+                            logger.info('    already whitelisted: %s', badurl)
+                            continue
+
                         # Skip if creator already identified as spammer
                         if creator in spammers:
                             logger.info('    spamcid: %s', cid)
@@ -705,8 +710,6 @@ def process_bugs(bugs: List[Any]) -> tuple[set[str], set[int], set[int]]:
 
                         # Handle user decision: Allow this URL
                         if baw == 'a':
-                            if not cmdargs.dry_run:
-                                bzs.sync()  # Save cache state
                             continue
 
                         # Handle user decision: Whitelist domain and user
@@ -714,7 +717,7 @@ def process_bugs(bugs: List[Any]) -> tuple[set[str], set[int], set[int]]:
                             if not cmdargs.dry_run:
                                 logger.info('    whitelisted %s', baddomain)
                                 bzs['okdomains'].add(baddomain)  # Whitelist domain
-                                bzs['okfolks'].add(creator)     # Whitelist user
+                                bzs['okfolks'].add(creator)      # Whitelist user
                                 bzs.sync()  # Save whitelist additions
                             continue
 
