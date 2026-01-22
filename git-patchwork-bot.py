@@ -555,6 +555,21 @@ def listify(obj: Union[str, List[Any], None]) -> List[Any]:
     return [obj]
 
 
+def get_url_path(url: str) -> str:
+    """Extract the path portion from a git URL for comparison.
+
+    Handles protocol differences (git://, https://, http://) and
+    subdomain variations (git.kernel.org vs gitolite.kernel.org)
+    by returning just the path component.
+    """
+    # Strip protocol prefix
+    path = re.sub(r'^\w+://', '', url)
+    # Strip hostname (everything up to first /)
+    if '/' in path:
+        path = path.split('/', 1)[1]
+    return path
+
+
 def send_summary(serieslist: List[Dict[str, Any]],
                  committers: Dict[int, str],
                  to_state: str, refname: str,
@@ -1264,8 +1279,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
                     logger.debug('Looking for ref %s host %s', m_refname, m_host)
 
+                    m_path = get_url_path(m_host)
                     for pull_host, pull_refname, patch_id in prs:
-                        if pull_host.find(m_host) > -1 and pull_refname.find(m_refname) > -1 and patch_id is not None:
+                        if get_url_path(pull_host) == m_path and pull_refname.find(m_refname) > -1 and patch_id is not None:
                             logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
                             revs[patch_id] = rev
                             committers[patch_id] = committer
