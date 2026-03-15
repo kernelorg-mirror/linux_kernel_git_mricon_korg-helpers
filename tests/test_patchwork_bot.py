@@ -1,7 +1,9 @@
 """Tests for git-patchwork-bot.py."""
 
+import sqlite3
+
 from conftest import load_script
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -422,3 +424,404 @@ class TestGetPatchworkHash:
         diff_unix = 'diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n'
         diff_dos = diff_unix.replace('\n', '\r\n')
         assert pwbot.get_patchwork_hash(diff_unix) == pwbot.get_patchwork_hash(diff_dos)
+
+
+class TestListify:
+    """Tests for listify()."""
+
+    def test_list_input(self):
+        assert pwbot.listify(['a', 'b']) == ['a', 'b']
+
+    def test_list_input_returns_copy(self):
+        original = ['a', 'b']
+        result = pwbot.listify(original)
+        assert result == original
+        assert result is not original
+
+    def test_string_input(self):
+        assert pwbot.listify('hello') == ['hello']
+
+    def test_none_input(self):
+        assert pwbot.listify(None) == [None]
+
+    def test_empty_list(self):
+        assert pwbot.listify([]) == []
+
+
+class TestGetTweaks:
+    """Tests for get_tweaks() config merging."""
+
+    def test_hconfig_overrides_pconfig(self):
+        pconfig = {'from': 'project@example.com', 'summaryto': 'list@example.com'}
+        hconfig = {'from': 'head@example.com'}
+        result = pwbot.get_tweaks(pconfig, hconfig)
+        assert result['from'] == 'head@example.com'
+        assert result['summaryto'] == 'list@example.com'
+
+    def test_pconfig_used_as_fallback(self):
+        pconfig = {'from': 'project@example.com', 'alwayscc': 'cc@example.com'}
+        hconfig = {}
+        result = pwbot.get_tweaks(pconfig, hconfig)
+        assert result['from'] == 'project@example.com'
+        assert result['alwayscc'] == 'cc@example.com'
+
+    def test_unknown_fields_ignored(self):
+        pconfig = {'from': 'a@b.com', 'bogus': 'ignored'}
+        hconfig = {'also_bogus': 'nope'}
+        result = pwbot.get_tweaks(pconfig, hconfig)
+        assert 'bogus' not in result
+        assert 'also_bogus' not in result
+        assert result['from'] == 'a@b.com'
+
+    def test_empty_configs(self):
+        assert pwbot.get_tweaks({}, {}) == {}
+
+    def test_all_known_fields(self):
+        fields = ['from', 'summaryto', 'onlyto', 'neverto', 'onlyifcc',
+                   'neverifcc', 'alwayscc', 'alwaysbcc', 'cclist', 'ccall']
+        pconfig = {f: f'p-{f}' for f in fields}
+        result = pwbot.get_tweaks(pconfig, {})
+        for f in fields:
+            assert result[f] == f'p-{f}'
+
+
+class TestGitGetNewRevs:
+    """Tests for git_get_new_revs() with mocked git output."""
+
+    MODULE = 'git_patchwork_bot'
+
+    def test_basic_new_revs(self):
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        git_output = [
+            'deadbeef:Alice:alice@example.com:Fix null pointer bug',
+            'cafebabe:Bob:bob@example.com:Add feature X',
+        ]
+        with patch.object(pwbot, 'git_get_command_lines', return_value=git_output):
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [])
+        assert 'refs/heads/main' in result
+        revs = result['refs/heads/main']
+        assert len(revs) == 2
+        assert revs[0] == ('deadbeef', 'Fix null pointer bug', 'Alice <alice@example.com>')
+        assert revs[1] == ('cafebabe', 'Add feature X', 'Bob <bob@example.com>')
+
+    def test_no_changes(self):
+        """Same commit in db and git means no new revs."""
+        heads = [('refs/heads/main', 'aaa')]
+        result = pwbot.git_get_new_revs('/fake/repo', list(heads), list(heads), [])
+        assert result == {}
+
+    def test_committer_filter(self):
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        git_output = [
+            'deadbeef:Alice:alice@example.com:Fix bug',
+            'cafebabe:Bob:bob@example.com:Add feature',
+        ]
+        with patch.object(pwbot, 'git_get_command_lines', return_value=git_output):
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads,
+                                            ['alice@example.com'])
+        revs = result['refs/heads/main']
+        assert len(revs) == 1
+        assert revs[0][0] == 'deadbeef'
+
+    def test_empty_committer_name(self):
+        """When committer name is empty, just use the email."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        git_output = ['deadbeef::alice@example.com:Fix bug']
+        with patch.object(pwbot, 'git_get_command_lines', return_value=git_output):
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [])
+        assert result['refs/heads/main'][0][2] == 'alice@example.com'
+
+    def test_deleted_ref(self):
+        """Ref present in db but gone from git should be removed from db_heads."""
+        db_heads = [('refs/heads/gone', 'aaa'), ('refs/heads/main', 'bbb')]
+        git_heads = [('refs/heads/main', 'ccc')]
+        git_output = ['deadbeef:A:a@b.com:Fix']
+        with patch.object(pwbot, 'git_get_command_lines', return_value=git_output):
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [])
+        # The deleted ref should have been removed from db_heads
+        assert ('refs/heads/gone', 'aaa') not in db_heads
+        assert 'refs/heads/main' in result
+
+    def test_merges_flag(self):
+        """When merges=False, --no-merges should be in the git args."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        with patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_git:
+            pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [], merges=False)
+            args = mock_git.call_args[0][1]
+            assert '--no-merges' in args
+
+    def test_merges_flag_true(self):
+        """When merges=True, --no-merges should NOT be in the git args."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        with patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_git:
+            pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [], merges=True)
+            args = mock_git.call_args[0][1]
+            assert '--no-merges' not in args
+
+    def test_subject_with_colons(self):
+        """Colons in the commit subject should not break parsing."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        git_output = ['deadbeef:Alice:alice@example.com:net: fix: handle edge case']
+        with patch.object(pwbot, 'git_get_command_lines', return_value=git_output):
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [])
+        assert result['refs/heads/main'][0][1] == 'net: fix: handle edge case'
+
+
+class TestSendSummary:
+    """Tests for send_summary() with mocked globals and SMTP."""
+
+    FAKE_CONFIG = {
+        'templates': {
+            'summary': (
+                'The following patches have been marked $newstate in $treename ($refname):\n'
+                '\n'
+                '$summary\n'
+                'Total: $total\n'
+                '$signature'
+            ),
+            'signature': '-- \npwbot',
+        },
+    }
+
+    def _make_series(self, name='Test series', patch_ids=(100,),
+                     submitter_name='Alice', submitter_email='alice@example.com',
+                     cover_letter=None, web_url='https://pw.example.com/series/1/'):
+        patches = [
+            {'id': pid, 'name': f'[PATCH {i+1}/{len(patch_ids)}] patch {i+1}', 'msgid': f'<msg{pid}@example.com>'}
+            for i, pid in enumerate(patch_ids)
+        ]
+        sdata = {
+            'name': name,
+            'patches': patches,
+            'submitter': {'name': submitter_name, 'email': submitter_email},
+            'web_url': web_url,
+        }
+        if cover_letter:
+            sdata['cover_letter'] = cover_letter
+        return sdata
+
+    @pytest.fixture(autouse=True)
+    def _setup_globals(self):
+        """Set up module globals for send_summary tests."""
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        orig_nomail = pwbot.NOMAIL
+        orig_domain = pwbot.DOMAIN
+        pwbot.CONFIG = self.FAKE_CONFIG
+        pwbot.NOMAIL = True
+        pwbot.DOMAIN = 'test.example.com'
+        yield
+        if orig_config is not None:
+            pwbot.CONFIG = orig_config
+        pwbot.NOMAIL = orig_nomail
+        pwbot.DOMAIN = orig_domain
+
+    @patch.object(pwbot, 'project_by_name')
+    def test_single_patch_summary(self, mock_pbn):
+        mock_pbn.return_value = ({}, MagicMock(), {
+            'from': 'bot@example.com',
+            'summaryto': 'maintainer@example.com',
+        })
+        serieslist = [self._make_series(name='Fix null pointer', patch_ids=(100,))]
+        revs = {100: 'deadbeef'}
+        committers = {100: 'Committer <c@example.com>'}
+
+        msgid = pwbot.send_summary(
+            serieslist, committers, 'accepted', 'refs/heads/main',
+            revs, 'test-project',
+            {'treename': 'linux-test'},
+            {'from': 'bot@example.com', 'summaryto': 'maintainer@example.com'},
+        )
+        assert msgid  # returns a Message-Id
+        assert 'git-patchwork-summary' in msgid
+
+    @patch.object(pwbot, 'project_by_name')
+    def test_series_vs_patch_label(self, mock_pbn):
+        mock_pbn.return_value = ({}, MagicMock(), {
+            'from': 'bot@example.com',
+            'summaryto': 'maintainer@example.com',
+        })
+        # Single patch should say "Patch:"
+        single = [self._make_series(name='Fix bug', patch_ids=(100,))]
+        # Multi-patch should say "Series:"
+        multi = [self._make_series(name='Big refactor', patch_ids=(100, 101, 102))]
+
+        # We can't easily inspect the body with NOMAIL=True (it just logs),
+        # but we can at least verify both cases don't crash
+        pwbot.send_summary(
+            single, {100: 'C <c@x>'}, 'accepted', 'refs/heads/main',
+            {100: 'aaa'}, 'test-project',
+            {'treename': 'linux-test'}, {},
+        )
+        pwbot.send_summary(
+            multi, {100: 'C <c@x>'}, 'accepted', 'refs/heads/main',
+            {100: 'aaa', 101: 'bbb', 102: 'ccc'}, 'test-project',
+            {'treename': 'linux-test'}, {},
+        )
+
+    @patch.object(pwbot, 'project_by_name')
+    def test_cover_letter_msgid_used(self, mock_pbn):
+        mock_pbn.return_value = ({}, MagicMock(), {
+            'from': 'bot@example.com',
+            'summaryto': 'maintainer@example.com',
+        })
+        cover = {'msgid': '<cover@example.com>', 'id': 50}
+        serieslist = [self._make_series(patch_ids=(100, 101), cover_letter=cover)]
+
+        msgid = pwbot.send_summary(
+            serieslist, {100: 'C <c@x>'}, 'accepted', 'refs/heads/main',
+            {100: 'aaa', 101: 'bbb'}, 'test-project',
+            {'treename': 'linux-test'}, {},
+        )
+        assert msgid
+
+
+class TestGitGetRepoHeads:
+    """Tests for git_get_repo_heads() with mocked git output."""
+
+    def test_basic_heads(self):
+        lines = [
+            'aaa111 refs/heads/main',
+            'bbb222 refs/heads/next',
+        ]
+        with patch.object(pwbot, 'git_get_command_lines', return_value=lines):
+            result = pwbot.git_get_repo_heads('/fake/repo', 'refs/heads/*')
+        assert result == [
+            ('refs/heads/main', 'aaa111'),
+            ('refs/heads/next', 'bbb222'),
+        ]
+
+    def test_with_ancestry(self):
+        lines = ['aaa111 refs/heads/main']
+        with patch.object(pwbot, 'git_get_command_lines', return_value=lines):
+            result = pwbot.git_get_repo_heads('/fake/repo', 'refs/heads/*', ancestry='5')
+        assert result == [('refs/heads/main', 'aaa111~5')]
+
+    def test_no_ancestry_default(self):
+        lines = ['aaa111 refs/heads/main']
+        with patch.object(pwbot, 'git_get_command_lines', return_value=lines):
+            result = pwbot.git_get_repo_heads('/fake/repo', 'refs/heads/*')
+        assert result == [('refs/heads/main', 'aaa111')]
+
+    def test_empty_output(self):
+        with patch.object(pwbot, 'git_get_command_lines', return_value=[]):
+            result = pwbot.git_get_repo_heads('/fake/repo', 'refs/heads/*')
+        assert result == []
+
+    def test_show_ref_args(self):
+        with patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_git:
+            pwbot.git_get_repo_heads('/fake/repo', 'refs/heads/main')
+            mock_git.assert_called_once_with('/fake/repo', ['show-ref', 'refs/heads/main'])
+
+
+class TestGitGetCommandLines:
+    """Tests for git_get_command_lines() output splitting."""
+
+    def test_splits_lines(self):
+        with patch.object(pwbot, 'git_run_command', return_value='line1\nline2\nline3'):
+            result = pwbot.git_get_command_lines('/fake', ['log'])
+        assert result == ['line1', 'line2', 'line3']
+
+    def test_skips_empty_lines(self):
+        with patch.object(pwbot, 'git_run_command', return_value='line1\n\nline2\n\n'):
+            result = pwbot.git_get_command_lines('/fake', ['log'])
+        assert result == ['line1', 'line2']
+
+    def test_empty_output(self):
+        with patch.object(pwbot, 'git_run_command', return_value=''):
+            result = pwbot.git_get_command_lines('/fake', ['log'])
+        assert result == []
+
+
+class TestGitGetPatchId:
+    """Tests for git_get_patch_id() parsing."""
+
+    def test_parses_patch_id(self):
+        with patch.object(pwbot, 'git_run_command', return_value='abc123def456 deadbeefcafe'):
+            result = pwbot.git_get_patch_id('some diff')
+        assert result == 'abc123def456'
+
+    def test_empty_output(self):
+        with patch.object(pwbot, 'git_run_command', return_value=''):
+            result = pwbot.git_get_patch_id('some diff')
+        assert result is None
+
+    def test_passes_stdin(self):
+        with patch.object(pwbot, 'git_run_command', return_value='abc 123') as mock_git:
+            pwbot.git_get_patch_id('my diff content')
+            mock_git.assert_called_once_with('', ['patch-id', '--stable'], stdin='my diff content')
+
+
+class TestGitGetRevInfo:
+    """Tests for git_get_rev_info() argument construction."""
+
+    def test_default_algorithm(self):
+        with patch.object(pwbot, 'git_run_command', return_value='') as mock_git:
+            pwbot.git_get_rev_info('/fake/repo', 'abc123')
+            mock_git.assert_called_once_with('/fake/repo', ['show', '--diff-algorithm=myers', 'abc123'])
+
+    def test_histogram_algorithm(self):
+        with patch.object(pwbot, 'git_run_command', return_value='') as mock_git:
+            pwbot.git_get_rev_info('/fake/repo', 'abc123', algorithm='histogram')
+            mock_git.assert_called_once_with('/fake/repo', ['show', '--diff-algorithm=histogram', 'abc123'])
+
+
+class TestDatabase:
+    """Tests for sqlite database functions using in-memory databases."""
+
+    @pytest.fixture
+    def db(self):
+        conn = sqlite3.connect(':memory:')
+        c = conn.cursor()
+        pwbot.db_init_pw_sqlite_db(c)
+        conn.commit()
+        yield c
+        conn.close()
+
+    def test_init_creates_tables(self, db):
+        """db_init_pw_sqlite_db should create meta and heads tables."""
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        table_names = [t[0] for t in tables]
+        assert 'meta' in table_names
+        assert 'heads' in table_names
+
+    def test_init_sets_db_version(self, db):
+        version = db.execute('SELECT version FROM meta').fetchone()[0]
+        assert str(version) == pwbot.DB_VERSION
+
+    def test_save_and_get_heads_roundtrip(self, db):
+        heads = [
+            ('refs/heads/main', 'aaa111'),
+            ('refs/heads/next', 'bbb222'),
+            ('refs/heads/stable', 'ccc333'),
+        ]
+        pwbot.db_save_repo_heads(db, heads)
+        result = pwbot.db_get_repo_heads(db)
+        assert result == heads
+
+    def test_save_heads_replaces_existing(self, db):
+        pwbot.db_save_repo_heads(db, [('refs/heads/main', 'old111')])
+        pwbot.db_save_repo_heads(db, [('refs/heads/main', 'new222')])
+        result = pwbot.db_get_repo_heads(db)
+        assert result == [('refs/heads/main', 'new222')]
+
+    def test_save_empty_heads(self, db):
+        pwbot.db_save_repo_heads(db, [('refs/heads/main', 'aaa')])
+        pwbot.db_save_repo_heads(db, [])
+        result = pwbot.db_get_repo_heads(db)
+        assert result == []
+
+    def test_save_meta_resets_version(self, db):
+        """db_save_meta should always write the current DB_VERSION."""
+        db.execute('DELETE FROM meta')
+        db.execute('INSERT INTO meta VALUES(999)')
+        pwbot.db_save_meta(db)
+        version = db.execute('SELECT version FROM meta').fetchone()[0]
+        assert str(version) == pwbot.DB_VERSION
