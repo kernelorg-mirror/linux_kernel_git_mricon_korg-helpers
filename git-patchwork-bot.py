@@ -15,42 +15,40 @@
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
-import os
-import sys
 import argparse
-import smtplib
-import subprocess
-import sqlite3
-import logging
-import hashlib
-import re
-import requests
 import datetime
 import fnmatch
-
-from email.mime.text import MIMEText
-from email.header import Header
-from email.utils import formatdate, getaddresses, make_msgid
-
-from fcntl import lockf, LOCK_EX, LOCK_NB
-
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-import yaml as pyyaml
-
-from string import Template
-from typing import Optional, Tuple, Union, Dict, List, Set, Any
+import hashlib
+import logging
+import os
+import re
+import smtplib
+import sqlite3
+import subprocess
+import sys
 
 # Send all email 8-bit, this is not 1999
 from email import charset
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formatdate, getaddresses, make_msgid
+from fcntl import LOCK_EX, LOCK_NB, lockf
+from string import Template
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import requests
+import yaml as pyyaml
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
 DB_VERSION: str = '1'
 REST_API_VERSION: str = '1.2'
-MSGID_LINK_RE: re.Pattern[str] = re.compile(r'^\s*Link:\s+\S+://patch\.msgid\.link/([^@]+@[^@\s/]+)$', flags=re.M | re.I)
+MSGID_LINK_RE: re.Pattern[str] = re.compile(
+    r'^\s*Link:\s+\S+://patch\.msgid\.link/([^@]+@[^@\s/]+)$', flags=re.M | re.I
+)
 HUNK_RE: re.Pattern[str] = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
 FILENAME_RE: re.Pattern[str] = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE: int = 100
@@ -1517,20 +1515,20 @@ if __name__ == '__main__':
     logger.addHandler(sch)
     if cmdargs.nomail or cmdargs.dryrun:
         logger.info('NOMAIL: ON')
-        NOMAIL = True  # type: ignore[assignment]
+        NOMAIL = True
     if cmdargs.dryrun:
         logger.info('DRYRUN: ON')
-        DRYRUN = True  # type: ignore[assignment]
+        DRYRUN = True
     if cmdargs.cachedir:
-        CACHEDIR = cmdargs.cachedir  # type: ignore[assignment]
+        CACHEDIR = cmdargs.cachedir
     if cmdargs.domain:
-        DOMAIN = str(cmdargs.domain)  # type: ignore[assignment]
-    MAILHOST = cmdargs.mailhost  # type: ignore[assignment]
+        DOMAIN = str(cmdargs.domain)
+    MAILHOST = cmdargs.mailhost
 
     with open(cmdargs.cfgfile, 'r') as fh:
         cfgyaml = fh.read()
 
-    CONFIG = pyyaml.safe_load(cfgyaml)  # type: ignore[assignment]
+    CONFIG = pyyaml.safe_load(cfgyaml)
 
     if cmdargs.tokens_file:
         with open(cmdargs.tokens_file, 'r') as fh:
