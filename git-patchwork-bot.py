@@ -560,13 +560,17 @@ def get_url_path(url: str) -> str:
 
     Handles protocol differences (git://, https://, http://) and
     subdomain variations (git.kernel.org vs gitolite.kernel.org)
-    by returning just the path component.
+    by returning just the path component. Strips trailing slashes
+    and .git suffixes to normalize for comparison.
     """
     # Strip protocol prefix
     path = re.sub(r'^\w+://', '', url)
     # Strip hostname (everything up to first /)
     if '/' in path:
         path = path.split('/', 1)[1]
+    path = path.rstrip('/')
+    if path.endswith('.git'):
+        path = path[:-4]
     return path
 
 
