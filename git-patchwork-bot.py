@@ -574,6 +574,41 @@ def get_url_path(url: str) -> str:
     return path
 
 
+def parse_merge_logline(logline: str) -> Optional[Tuple[str, str]]:
+    """Parse a merge commit subject line to extract the ref and URL.
+
+    Returns a (refname, url) tuple, or None if the logline is not
+    a recognizable merge commit.
+    """
+    if logline.find(' of ') > 0:
+        matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
+        if not matches:
+            return None
+        return matches.group(1), matches.group(2)
+    elif logline.find('://') > 0:
+        matches = re.search(r'Merge\s(\w+://\S+)', logline)
+        if not matches:
+            return None
+        return 'master', matches.group(1)
+    return None
+
+
+def find_matching_pr(m_host: str, m_refname: str,
+                     prs: Set[Tuple[str, str, Optional[int]]]) -> Optional[int]:
+    """Find a pull request matching a merge commit's URL and ref.
+
+    Compares the path portion of URLs (ignoring protocol, hostname,
+    trailing slashes, and .git suffixes) and checks that the ref name
+    appears in the pull request ref. Returns the matching patch_id,
+    or None if no match is found.
+    """
+    m_path = get_url_path(m_host)
+    for pull_host, pull_refname, patch_id in prs:
+        if get_url_path(pull_host) == m_path and pull_refname.find(m_refname) > -1 and patch_id is not None:
+            return patch_id
+    return None
+
+
 def send_summary(serieslist: List[Dict[str, Any]],
                  committers: Dict[int, str],
                  to_state: str, refname: str,
@@ -1266,30 +1301,18 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             committers: Dict[int, str] = dict()
             for rev, logline, committer, pwhash, msgid in hashpairs:
                 if have_prs and pwhash is None:
-                    if logline.find(' of ') > 0:
-                        matches = re.search(r'Merge\s\S+\s[\'\"](\S+)[\'\"]\sof\s(\w+://\S+)', logline)
-                        if not matches:
-                            continue
-                        m_refname = matches.group(1)
-                        m_host = matches.group(2)
-                    elif logline.find('://') > 0:
-                        matches = re.search(r'Merge\s(\w+://\S+)', logline)
-                        if not matches:
-                            continue
-                        m_refname = 'master'
-                        m_host = matches.group(1)
-                    else:
+                    parsed = parse_merge_logline(logline)
+                    if parsed is None:
                         continue
+                    m_refname, m_host = parsed
 
                     logger.debug('Looking for ref %s host %s', m_refname, m_host)
 
-                    m_path = get_url_path(m_host)
-                    for pull_host, pull_refname, patch_id in prs:
-                        if get_url_path(pull_host) == m_path and pull_refname.find(m_refname) > -1 and patch_id is not None:
-                            logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
-                            revs[patch_id] = rev
-                            committers[patch_id] = committer
-                            break
+                    patch_id = find_matching_pr(m_host, m_refname, prs)
+                    if patch_id is not None:
+                        logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
+                        revs[patch_id] = rev
+                        committers[patch_id] = committer
                     continue
 
                 # Do we have a matching hash on the server?
