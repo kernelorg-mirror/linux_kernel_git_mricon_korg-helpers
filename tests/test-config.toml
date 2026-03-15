@@ -1,0 +1,12 @@
+# Test configuration file for validation
+[main]
+url = "https://bugzilla.example.com"
+apikey = "test-api-key"
+cache = "/tmp/test-cache.db"
+logfile = "/tmp/test.log"
+
+[spam]
+comment_tag = "spam"
+bug_group = "TestJunk"
+bug_status = "CLOSED"
+bug_resolution = "INVALID"

@@ -1,0 +1,12 @@
+# Test configuration with ~ expansion
+[main]
+url = "https://bugzilla.example.com"
+apikey = "test-api-key"
+cache = "~/test-cache.db"
+logfile = "~/logs/test.log"
+
+[spam]
+comment_tag = "spam"
+bug_group = "TestJunk"
+bug_status = "CLOSED"
+bug_resolution = "INVALID"

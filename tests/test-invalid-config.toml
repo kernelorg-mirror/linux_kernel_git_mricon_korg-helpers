@@ -1,0 +1,9 @@
+# Invalid test configuration file
+[main]
+url = "not-a-valid-url"
+# missing apikey
+cache = ""
+
+[spam]
+comment_tag = ""
+# missing other required fields

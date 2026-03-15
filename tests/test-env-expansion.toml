@@ -1,0 +1,12 @@
+# Test configuration with environment variable expansion
+[main]
+url = "https://bugzilla.example.com"
+apikey = "test-api-key"
+cache = "$HOME/.cache/bugzilla-junker.db"
+logfile = "$HOME/logs/bugzilla-junker.log"
+
+[spam]
+comment_tag = "spam"
+bug_group = "TestJunk"
+bug_status = "CLOSED"
+bug_resolution = "INVALID"
