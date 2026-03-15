@@ -1,6 +1,7 @@
 """Tests for git-patchwork-bot.py."""
 
 from conftest import load_script
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -194,3 +195,230 @@ class TestFindMatchingPr:
             ('git://git.kernel.org/pub/scm/linux/kernel/git/hid/hid.git', 'tags/hid-v1', 20),
         )
         assert pwbot.find_matching_pr(BT_URL_GIT, BT_TAG, prs) == 42
+
+
+class TestGetPatchworkPullRequests:
+    """Tests for get_patchwork_pull_requests_by_project() with mocked API."""
+
+    def _mock_rm(self, api_results):
+        rm = MagicMock()
+        rm.get_patches_list.return_value = api_results
+        return rm
+
+    def test_basic_pull_request(self):
+        rm = self._mock_rm([
+            {'id': 42, 'pull_url': f'{BT_URL_DOTGIT} tags/{BT_TAG}'},
+        ])
+        prs = pwbot.get_patchwork_pull_requests_by_project(rm, 1, ['new'])
+        assert (BT_URL_DOTGIT, f'tags/{BT_TAG}', 42) in prs
+
+    def test_pull_url_without_refname(self):
+        """When pull_url has no branch/tag, refname defaults to master."""
+        rm = self._mock_rm([
+            {'id': 10, 'pull_url': 'https://github.com/user/repo.git'},
+        ])
+        prs = pwbot.get_patchwork_pull_requests_by_project(rm, 1, ['new'])
+        assert ('https://github.com/user/repo.git', 'master', 10) in prs
+
+    def test_entry_without_pull_url(self):
+        """Patches without pull_url should be skipped."""
+        rm = self._mock_rm([
+            {'id': 10, 'pull_url': None},
+            {'id': 11},
+        ])
+        prs = pwbot.get_patchwork_pull_requests_by_project(rm, 1, ['new'])
+        assert len(prs) == 0
+
+    def test_mixed_entries(self):
+        """Mix of pull requests and regular patches."""
+        rm = self._mock_rm([
+            {'id': 10, 'pull_url': f'{BT_URL_DOTGIT} tags/{BT_TAG}'},
+            {'id': 11, 'pull_url': None},
+            {'id': 12, 'pull_url': 'https://github.com/user/repo.git fixes-branch'},
+        ])
+        prs = pwbot.get_patchwork_pull_requests_by_project(rm, 1, ['new'])
+        assert len(prs) == 2
+        ids = {p[2] for p in prs}
+        assert ids == {10, 12}
+
+    def test_empty_results(self):
+        rm = self._mock_rm([])
+        prs = pwbot.get_patchwork_pull_requests_by_project(rm, 1, ['new'])
+        assert len(prs) == 0
+
+    def test_query_params(self):
+        """Verify correct API query parameters are sent."""
+        rm = self._mock_rm([])
+        pwbot.get_patchwork_pull_requests_by_project(rm, 99, ['new', 'under-review'])
+        params = rm.get_patches_list.call_args[0][0]
+        param_dict = dict(params)
+        assert param_dict['project'] == 99
+        assert param_dict['archived'] == 'false'
+        assert param_dict['q'] == 'PULL'
+        assert param_dict['order'] == '-date'
+
+
+class TestGetPatchworkPatchesByHash:
+    """Tests for get_patchwork_patches_by_project_hash() with mocked API."""
+
+    def _mock_rm(self, api_results):
+        rm = MagicMock()
+        rm.get_patches_list.return_value = api_results
+        return rm
+
+    def test_single_match(self):
+        rm = self._mock_rm([{'id': 100}])
+        ids = pwbot.get_patchwork_patches_by_project_hash(rm, 1, 'abc123')
+        assert ids == [100]
+
+    def test_multiple_matches(self):
+        rm = self._mock_rm([{'id': 100}, {'id': 101}, {'id': 102}])
+        ids = pwbot.get_patchwork_patches_by_project_hash(rm, 1, 'abc123')
+        assert ids == [100, 101, 102]
+
+    def test_no_match(self):
+        rm = self._mock_rm([])
+        ids = pwbot.get_patchwork_patches_by_project_hash(rm, 1, 'abc123')
+        assert ids == []
+
+    def test_query_params(self):
+        rm = self._mock_rm([])
+        pwbot.get_patchwork_patches_by_project_hash(rm, 5, 'deadbeef')
+        params = rm.get_patches_list.call_args[0][0]
+        param_dict = dict(params)
+        assert param_dict['project'] == 5
+        assert param_dict['hash'] == 'deadbeef'
+        assert param_dict['archived'] == 'false'
+
+
+class TestGetPatchworkPatchesByMsgid:
+    """Tests for get_patchwork_patches_by_project_msgid() with mocked API."""
+
+    def _mock_rm(self, api_results):
+        rm = MagicMock()
+        rm.get_patches_list.return_value = api_results
+        return rm
+
+    def test_single_match(self):
+        rm = self._mock_rm([{'id': 200}])
+        ids = pwbot.get_patchwork_patches_by_project_msgid(rm, 1, 'msg@example.com')
+        assert ids == [200]
+
+    def test_no_match(self):
+        rm = self._mock_rm([])
+        ids = pwbot.get_patchwork_patches_by_project_msgid(rm, 1, 'msg@example.com')
+        assert ids == []
+
+    def test_query_params(self):
+        rm = self._mock_rm([])
+        pwbot.get_patchwork_patches_by_project_msgid(rm, 3, 'test@kernel.org')
+        params = rm.get_patches_list.call_args[0][0]
+        param_dict = dict(params)
+        assert param_dict['project'] == 3
+        assert param_dict['msgid'] == 'test@kernel.org'
+
+
+class TestGetPatchworkHash:
+    """Tests for get_patchwork_hash() diff hashing."""
+
+    def test_simple_diff(self):
+        diff = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -1,3 +1,3 @@\n'
+            ' context\n'
+            '-old line\n'
+            '+new line\n'
+            ' context\n'
+        )
+        h = pwbot.get_patchwork_hash(diff)
+        assert len(h) == 40  # sha1 hex digest
+
+    def test_same_diff_same_hash(self):
+        diff = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -10,3 +10,3 @@\n'
+            ' context\n'
+            '-old\n'
+            '+new\n'
+        )
+        assert pwbot.get_patchwork_hash(diff) == pwbot.get_patchwork_hash(diff)
+
+    def test_line_numbers_ignored(self):
+        """Patchwork hash ignores hunk line numbers, only keeps counts."""
+        diff1 = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -1,3 +1,3 @@\n'
+            ' ctx\n'
+            '-old\n'
+            '+new\n'
+        )
+        diff2 = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -99,3 +200,3 @@\n'
+            ' ctx\n'
+            '-old\n'
+            '+new\n'
+        )
+        assert pwbot.get_patchwork_hash(diff1) == pwbot.get_patchwork_hash(diff2)
+
+    def test_path_prefix_normalized(self):
+        """Patchwork hash normalizes the -p1 top-directory prefix.
+
+        Git always uses a/ and b/, but other tools might use different
+        prefixes. The hash normalizes the first path component so that
+        --- x/foo.c and --- a/foo.c produce the same hash.
+        """
+        diff1 = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -1,1 +1,1 @@\n'
+            '-old\n'
+            '+new\n'
+        )
+        diff2 = (
+            'diff --git x/foo.c y/foo.c\n'
+            '--- x/foo.c\n'
+            '+++ y/foo.c\n'
+            '@@ -1,1 +1,1 @@\n'
+            '-old\n'
+            '+new\n'
+        )
+        assert pwbot.get_patchwork_hash(diff1) == pwbot.get_patchwork_hash(diff2)
+
+    def test_content_before_diff_ignored(self):
+        """Commit message text before the diff line should be ignored."""
+        diff_only = (
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -1,1 +1,1 @@\n'
+            '-old\n'
+            '+new\n'
+        )
+        with_preamble = (
+            'Subject: Fix the thing\n'
+            '\n'
+            'This fixes a bug.\n'
+            '\n'
+            'diff --git a/foo.c b/foo.c\n'
+            '--- a/foo.c\n'
+            '+++ b/foo.c\n'
+            '@@ -1,1 +1,1 @@\n'
+            '-old\n'
+            '+new\n'
+        )
+        assert pwbot.get_patchwork_hash(diff_only) == pwbot.get_patchwork_hash(with_preamble)
+
+    def test_carriage_returns_normalized(self):
+        diff_unix = 'diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n'
+        diff_dos = diff_unix.replace('\n', '\r\n')
+        assert pwbot.get_patchwork_hash(diff_unix) == pwbot.get_patchwork_hash(diff_dos)
