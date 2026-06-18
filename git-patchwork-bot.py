@@ -330,12 +330,28 @@ def project_by_name(pname: str) -> Tuple[Dict[str, Any], Restmaker, Dict[str, An
             rm, plist = _server_cache[server]
 
         found = False
+        # Prefer an exact link_name match. We used to accept any link_name
+        # that merely started with the configured name, but that silently
+        # resolved to the wrong project whenever one name was a prefix of
+        # another (e.g. "linux-mm" matching "linux-mmc", which sorts first),
+        # so those patches were never processed. Fall back to the old
+        # startswith behaviour only when nothing matches exactly, to stay
+        # compatible with any configuration that relied on it.
         for project in plist:
-            if project['link_name'].lower().startswith(pname.lower()):
-                logger.debug('project lookup: linkname=%s, server=%s, id=%d', pname, server, project['id'])
+            if project['link_name'].lower() == pname.lower():
+                logger.debug('project lookup (exact): linkname=%s, server=%s, id=%d',
+                             pname, server, project['id'])
                 _project_cache[pname] = (project, rm, pconfig)
                 found = True
                 break
+        if not found:
+            for project in plist:
+                if project['link_name'].lower().startswith(pname.lower()):
+                    logger.debug('project lookup (prefix): linkname=%s, server=%s, id=%d',
+                                 pname, server, project['id'])
+                    _project_cache[pname] = (project, rm, pconfig)
+                    found = True
+                    break
         if not found:
             logger.info('Could not find project matching %s on server %s', pname, server)
             raise KeyError(f'No match for project {pname} on server {server}')

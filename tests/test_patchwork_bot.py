@@ -946,3 +946,71 @@ class TestAutoArchive:
             pwbot.housekeeping('test-project')
         rm.update_patch.assert_not_called()
         assert rm.get_patches_list.call_count == 1
+
+
+class TestProjectByName:
+    """Tests for project_by_name() link_name matching.
+
+    The server caches are pre-seeded so these never touch the network.
+    """
+
+    SERVER = 'https://pw.example.com'
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        orig_pcache = dict(pwbot._project_cache)
+        orig_scache = dict(pwbot._server_cache)
+        pwbot._project_cache.clear()
+        pwbot._server_cache.clear()
+        yield
+        pwbot._project_cache.clear()
+        pwbot._project_cache.update(orig_pcache)
+        pwbot._server_cache.clear()
+        pwbot._server_cache.update(orig_scache)
+        if orig_config is not None:
+            pwbot.CONFIG = orig_config
+
+    def _seed(self, config_projects, server_projects):
+        """Set up CONFIG and pre-seed the server cache.
+
+        config_projects: iterable of project names to put in the config.
+        server_projects: list of (id, link_name) as returned by the API.
+        """
+        pwbot.CONFIG = {'patchworks': {self.SERVER: {
+            'projects': {name: {'from': 'bot@example.com'} for name in config_projects}
+        }}}
+        plist = [{'id': pid, 'link_name': ln} for pid, ln in server_projects]
+        rm = MagicMock()
+        pwbot._server_cache[self.SERVER] = (rm, plist)
+        return rm
+
+    def test_exact_match_wins_over_prefix(self):
+        """The linux-mm/linux-mmc bug: exact match must beat an earlier prefix.
+
+        linux-mmc (id 32) is returned before linux-mm (id 365) by the real
+        API, and 'linux-mmc'.startswith('linux-mm') is True, so the old
+        startswith-only logic resolved linux-mm to linux-mmc.
+        """
+        self._seed(['linux-mm', 'linux-mmc'],
+                   [(32, 'linux-mmc'), (365, 'linux-mm')])
+        project, _, _ = pwbot.project_by_name('linux-mm')
+        assert project['id'] == 365
+
+    def test_prefix_project_resolves_to_itself(self):
+        """The longer name must still resolve to its own project."""
+        self._seed(['linux-mm', 'linux-mmc'],
+                   [(32, 'linux-mmc'), (365, 'linux-mm')])
+        project, _, _ = pwbot.project_by_name('linux-mmc')
+        assert project['id'] == 32
+
+    def test_exact_match_is_case_insensitive(self):
+        self._seed(['Linux-MM'], [(365, 'linux-mm')])
+        project, _, _ = pwbot.project_by_name('Linux-MM')
+        assert project['id'] == 365
+
+    def test_prefix_fallback_when_no_exact_match(self):
+        """With no exact match, the legacy startswith behaviour still applies."""
+        self._seed(['foo'], [(9, 'foobar')])
+        project, _, _ = pwbot.project_by_name('foo')
+        assert project['id'] == 9
