@@ -44,6 +44,12 @@ PULL_BODY_WITH_COMMIT_ID_RE = [
     re.compile(r'^\s*for you to fetch changes up to ([0-9a-f]{5,40}):', re.MULTILINE | re.IGNORECASE),
 ]
 
+# The "since" (base) commit a well-formed request-pull is based on. We use it
+# to detect empty pull requests where the base and the tip are identical.
+PULL_BODY_SINCE_COMMIT_ID_RE = [
+    re.compile(r'^\s*The following changes since commit ([0-9a-f]{5,40}):', re.MULTILINE | re.IGNORECASE),
+]
+
 # I don't like these
 PULL_BODY_REMOTE_REF_RE = [
     re.compile(r'^\s*([\w+-]+(?:://|@)[\w/.@:~-]+)[\s\\]+([\w/._-]+)\s*$', re.MULTILINE | re.IGNORECASE),
@@ -230,6 +236,16 @@ def git_get_commit_id_from_repo_ref(repo, ref):
     return commit_id
 
 
+def commit_ids_match(cid1, cid2):
+    # request-pull emits the "since" and "up to" commit-ids with the same
+    # abbreviation length (usually full 40-char hashes), but be tolerant in
+    # case one side is abbreviated: compare on the shorter of the two.
+    if not cid1 or not cid2:
+        return False
+    shorter = min(len(cid1), len(cid2))
+    return cid1[:shorter].lower() == cid2[:shorter].lower()
+
+
 def get_remote_ref_from_body(body):
     repo = None
     ref = None
@@ -264,6 +280,25 @@ def record_pr_data(shard, msg_commit_id, msg, c):
             pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
 
     if pr_commit_id is None:
+        return False
+
+    # A well-formed request-pull lists a "since" base commit that differs
+    # from the "up to" tip commit. If they are identical, the request is
+    # empty -- there is nothing to actually pull -- and the tip is just
+    # whatever the sender happened to be based on (often an already-merged
+    # commit). Tracking it would make us falsely "thank" for the PR the
+    # moment that base shows up in the tree. See:
+    # https://lore.kernel.org/all/CAHk-=whn39dQtoMeJrz++nAnZpgnrooU0dgzOZXdn1LyxQ+f2w@mail.gmail.com/
+    since_commit_id = None
+    for cid_re in PULL_BODY_SINCE_COMMIT_ID_RE:
+        matches = cid_re.search(body)
+        if matches:
+            since_commit_id = matches.groups()[0]
+            break
+
+    if since_commit_id is not None and commit_ids_match(since_commit_id, pr_commit_id):
+        logger.info('Ignoring empty pull request: base and tip are the same commit (%s)',
+                    pr_commit_id)
         return False
 
     logger.debug('pr_commit_id=%s', pr_commit_id)
