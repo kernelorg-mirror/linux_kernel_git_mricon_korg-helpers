@@ -1048,16 +1048,22 @@ def housekeeping(pname: str) -> None:
         page = 0
         seen: Set[str] = set()
         pagedata = list()
-        lastpage = False
         archived = 0
         while True:
-            if not pagedata and not lastpage:
+            if not pagedata:
                 if archived:
                     logger.info('Archived %d patches, grabbing next page', archived)
                 params = [
                     ('project', project_id),
                     ('archived', 'false'),
                     ('state', 'new'),
+                    # Let patchwork do the date filtering for us. The "before"
+                    # filter (lookup_expr=lt on the patch date) has been part of
+                    # the REST API since well before our pinned v1.2, so every
+                    # patch the server hands back is already old enough to
+                    # archive. This avoids parsing dates on our side, which used
+                    # to choke on ISO timestamps that carried microseconds.
+                    ('before', cutoffdate.isoformat()),
                     ('order', 'date'),
                     ('per_page', REST_PER_PAGE)
                 ]
@@ -1065,7 +1071,8 @@ def housekeeping(pname: str) -> None:
                 if DRYRUN:
                     # We don't need pagination if we're not in dryrun, because
                     # once we archive the patches, they don't show up in this
-                    # query any longer.
+                    # query any longer. In dryrun we never actually archive, so
+                    # we have to walk the pages ourselves.
                     page += 1
                     params.append(('page', page))
 
@@ -1077,17 +1084,6 @@ def housekeeping(pname: str) -> None:
                 break
 
             entry = pagedata.pop()
-            # Did we go too far forward?
-            _date = entry.get('date')
-            if not _date:
-                logger.debug('No date for patch %s, skipping', entry.get('id'))
-                continue
-            patch_date = datetime.datetime.strptime(_date, "%Y-%m-%dT%H:%M:%S")
-            if patch_date >= cutoffdate:
-                # mark that we're on the last page
-                lastpage = True
-                continue
-
             patch_id = entry.get('id')
             if patch_id is None:
                 logger.debug('No patch ID for entry %s, skipping', entry)

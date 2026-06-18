@@ -1,11 +1,11 @@
 """Tests for git-patchwork-bot.py."""
 
+import datetime
 import sqlite3
-
-from conftest import load_script
 from unittest.mock import MagicMock, patch
 
 import pytest
+from conftest import load_script
 
 pwbot = load_script('git-patchwork-bot.py')
 
@@ -825,3 +825,124 @@ class TestDatabase:
         pwbot.db_save_meta(db)
         version = db.execute('SELECT version FROM meta').fetchone()[0]
         assert str(version) == pwbot.DB_VERSION
+
+
+class TestAutoArchive:
+    """Tests for the autoarchive branch of housekeeping().
+
+    These exercise the path that now relies on patchwork's server-side
+    ``before`` filter instead of parsing patch dates locally. A pconfig
+    with only ``autoarchive`` set skips the autosupersede block and
+    returns before any mail is sent (the report is empty), so we can
+    drive the archive loop in isolation.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_globals(self):
+        orig_dryrun = pwbot.DRYRUN
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        pwbot.DRYRUN = False
+        pwbot.CONFIG = {'templates': {'signature': 'sig'}}
+        yield
+        pwbot.DRYRUN = orig_dryrun
+        if orig_config is not None:
+            pwbot.CONFIG = orig_config
+
+    def _mock_pbn(self, rm, hconfig=None):
+        """Build a project_by_name() return value: (project, rm, pconfig)."""
+        if hconfig is None:
+            hconfig = {'autoarchive': 180}
+        pconfig = {'housekeeping': hconfig}
+        project = {'id': 7}
+        return (project, rm, pconfig)
+
+    def test_before_filter_is_sent(self):
+        """The query must offload date filtering to patchwork's 'before'."""
+        rm = MagicMock()
+        rm.get_patches_list.return_value = []
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        params = dict(rm.get_patches_list.call_args[0][0])
+        assert 'before' in params
+        # The value must be a valid ISO timestamp patchwork can parse.
+        datetime.datetime.fromisoformat(params['before'])
+        assert params['state'] == 'new'
+        assert params['archived'] == 'false'
+        assert params['project'] == 7
+
+    def test_before_reflects_cutoff_days(self):
+        """The 'before' cutoff should track the configured autoarchive days."""
+        rm = MagicMock()
+        rm.get_patches_list.return_value = []
+        with patch.object(pwbot, 'project_by_name',
+                          return_value=self._mock_pbn(rm, {'autoarchive': 30})):
+            pwbot.housekeeping('test-project')
+        params = dict(rm.get_patches_list.call_args[0][0])
+        before = datetime.datetime.fromisoformat(params['before'])
+        delta_days = (datetime.datetime.now() - before).total_seconds() / 86400
+        assert abs(delta_days - 30) < 1
+
+    def test_microsecond_timestamp_does_not_crash(self):
+        """Regression: ISO dates with microseconds used to crash strptime.
+
+        The old code parsed entry['date'] with "%Y-%m-%dT%H:%M:%S", which
+        raised ValueError on timestamps like '...:00.123456'. We no longer
+        parse dates on our side at all, so such a patch archives cleanly.
+        """
+        rm = MagicMock()
+        rm.get_patches_list.side_effect = [
+            [{'id': 100, 'date': '2020-01-15T10:30:00.123456'}],
+            [],
+        ]
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        rm.update_patch.assert_called_once_with(100, archived=True)
+
+    def test_archives_across_refetches(self):
+        """In a real run, archived patches drop out, so we refetch until empty."""
+        rm = MagicMock()
+        rm.get_patches_list.side_effect = [
+            [{'id': 1, 'date': '2020-01-01T00:00:00'},
+             {'id': 2, 'date': '2020-01-02T00:00:00'}],
+            [{'id': 3, 'date': '2020-01-03T00:00:00'}],
+            [],
+        ]
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        archived_ids = sorted(c.args[0] for c in rm.update_patch.call_args_list)
+        assert archived_ids == [1, 2, 3]
+        for c in rm.update_patch.call_args_list:
+            assert c.kwargs == {'archived': True}
+
+    def test_seen_guard_breaks_infinite_loop(self):
+        """If the archived flag never sticks, the seen-set must break the loop."""
+        rm = MagicMock()
+        # Server keeps handing back the same patch no matter what.
+        rm.get_patches_list.return_value = [{'id': 99, 'date': '2020-01-01T00:00:00'}]
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        rm.update_patch.assert_called_once_with(99, archived=True)
+
+    def test_dryrun_paginates_and_does_not_archive(self):
+        """Dryrun never archives, so it must paginate with incrementing pages."""
+        pwbot.DRYRUN = True
+        rm = MagicMock()
+        rm.get_patches_list.side_effect = [
+            [{'id': 1, 'date': '2020-01-01T00:00:00'}],
+            [{'id': 2, 'date': '2020-01-02T00:00:00'}],
+            [],
+        ]
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        rm.update_patch.assert_not_called()
+        pages = [dict(c.args[0]).get('page') for c in rm.get_patches_list.call_args_list]
+        assert pages == [1, 2, 3]
+
+    def test_no_patches_means_no_updates(self):
+        """An empty project should archive nothing and make a single query."""
+        rm = MagicMock()
+        rm.get_patches_list.return_value = []
+        with patch.object(pwbot, 'project_by_name', return_value=self._mock_pbn(rm)):
+            pwbot.housekeeping('test-project')
+        rm.update_patch.assert_not_called()
+        assert rm.get_patches_list.call_count == 1
