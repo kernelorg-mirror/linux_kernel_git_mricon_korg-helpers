@@ -4,6 +4,7 @@
 __pycache__/
 *.pyc
 .venv/
+uv.lock
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
