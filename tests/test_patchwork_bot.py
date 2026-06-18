@@ -1014,3 +1014,94 @@ class TestProjectByName:
         self._seed(['foo'], [(9, 'foobar')])
         project, _, _ = pwbot.project_by_name('foo')
         assert project['id'] == 9
+
+
+class TestGetListPage:
+    """Tests for Restmaker.get_list_page() status exposure."""
+
+    def _rm(self):
+        # Bypass __init__, which needs a full CONFIG; we only exercise session.
+        rm = pwbot.Restmaker.__new__(pwbot.Restmaker)
+        rm.session = MagicMock()
+        return rm
+
+    def test_success_returns_items_and_status(self):
+        rm = self._rm()
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = [{'id': 1}, {'id': 2}]
+        rm.session.get.return_value = resp
+        items, status = rm.get_list_page('http://x/series/', [('page', 1)])
+        assert items == [{'id': 1}, {'id': 2}]
+        assert status == 200
+
+    def test_http_error_exposes_status_code(self):
+        rm = self._rm()
+        resp = MagicMock(status_code=500)
+        resp.raise_for_status.side_effect = pwbot.requests.exceptions.HTTPError(response=resp)
+        rm.session.get.return_value = resp
+        items, status = rm.get_list_page('http://x/series/', [])
+        assert items == []
+        assert status == 500
+
+    def test_connection_error_returns_none_status(self):
+        rm = self._rm()
+        rm.session.get.side_effect = pwbot.requests.exceptions.ConnectionError()
+        items, status = rm.get_list_page('http://x/series/', [])
+        assert items == []
+        assert status is None
+
+
+class TestGetProjectSeriesSince:
+    """Tests for get_project_series_since() resilient pagination.
+
+    REST_PER_PAGE is shrunk to 3 so the bisect path is small enough to
+    enumerate. rm.get_list_page is mocked to return canned (items, status)
+    tuples in call order.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _small_pages(self):
+        orig = pwbot.REST_PER_PAGE
+        pwbot.REST_PER_PAGE = 3
+        yield
+        pwbot.REST_PER_PAGE = orig
+
+    def _rm(self, pages):
+        rm = MagicMock()
+        rm.get_list_page.side_effect = pages
+        return rm
+
+    def test_clean_pagination(self):
+        page1 = [{'id': 0}, {'id': 1}, {'id': 2}]  # full page -> keep going
+        page2 = [{'id': 3}]                          # short page -> stop
+        rm = self._rm([(page1, 200), (page2, 200)])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert [s['id'] for s in out] == [0, 1, 2, 3]
+
+    def test_skips_unserializable_series_and_continues(self):
+        """A 500 page is re-fetched one series at a time; the bad one is skipped."""
+        rm = self._rm([
+            ([{'id': 0}, {'id': 1}, {'id': 2}], 200),  # page 1 (full)
+            ([], 500),                                 # page 2 -> bisect indices 3,4,5
+            ([{'id': 3}], 200),                        # index 3 ok
+            ([], 500),                                 # index 4 is the poison -> skip
+            ([{'id': 5}], 200),                        # index 5 ok
+            ([], 200),                                 # page 3 empty -> stop
+        ])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert [s['id'] for s in out] == [0, 1, 2, 3, 5]
+
+    def test_bisect_reaching_end_stops(self):
+        rm = self._rm([
+            ([{'id': 0}, {'id': 1}, {'id': 2}], 200),  # page 1 (full)
+            ([], 500),                                 # page 2 -> bisect
+            ([{'id': 3}], 200),                        # index 3 ok
+            ([], 200),                                 # index 4 empty -> past the end
+        ])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert [s['id'] for s in out] == [0, 1, 2, 3]
+
+    def test_connection_error_stops_gracefully(self):
+        rm = self._rm([([], None)])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert out == []

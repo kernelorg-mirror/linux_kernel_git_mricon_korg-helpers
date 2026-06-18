@@ -202,6 +202,26 @@ class Restmaker:
             logger.info('REST error: %s', ex)
             return list()
 
+    def get_list_page(self, url: str,
+                      params: List[Tuple[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Fetch a single result page, exposing the HTTP status to the caller.
+
+        Returns an (items, status_code) tuple. On a request error, items is an
+        empty list and status_code is the HTTP status if the server responded,
+        or None for a connection-level failure. Unlike the get_*_list helpers,
+        this does not hide the failure, so the caller can react to it (e.g.
+        retry a smaller page to step over a single unserializable record).
+        """
+        try:
+            rsp = self.session.get(url, params=params, stream=False)
+            status = rsp.status_code
+            rsp.raise_for_status()
+            return list(rsp.json()), status
+        except requests.exceptions.RequestException as ex:
+            logger.debug('REST error: %s', ex)
+            status = ex.response.status_code if ex.response is not None else None
+            return list(), status
+
     def get_projects_list(self, params: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
         try:
             return self.get_unpaginated(self.projects_url, params)
@@ -914,6 +934,70 @@ def notify_submitters(serieslist: List[Dict[str, Any]],
             logger.info('------------------------------')
 
 
+def get_project_series_since(rm: Restmaker, project_id: int, since_iso: str) -> List[Dict[str, Any]]:
+    """Return all series for a project with a date at or after since_iso.
+
+    Patchwork returns HTTP 500 for an *entire* page if it cannot serialize even
+    a single series in it (e.g. a patch whose data breaks URL building). With a
+    plain "newest first" query that bad series lands on the first page, so the
+    whole autosupersede run for the project silently fetches nothing.
+
+    To stay robust, we order by id (stable, unlike date which can tie) and page
+    through ourselves. When a page fails, we re-fetch it one series at a time so
+    we can skip just the series patchwork chokes on and still process the rest.
+    """
+    collected: List[Dict[str, Any]] = list()
+    page = 1
+    while True:
+        params: List[Tuple[str, Any]] = [
+            ('project', project_id),
+            ('since', since_iso),
+            ('order', 'id'),
+            ('page', page),
+            ('per_page', REST_PER_PAGE),
+        ]
+        items, status = rm.get_list_page(rm.series_url, params)
+        if status == 200:
+            collected.extend(items)
+            if len(items) < REST_PER_PAGE:
+                break
+            page += 1
+            continue
+        if status is None:
+            logger.info('Could not fetch series page %d for project %d, stopping', page, project_id)
+            break
+
+        # A series on this page cannot be serialized by patchwork. Re-fetch the
+        # page one series at a time so a single bad series does not block the
+        # rest. per_page=1 page numbers index into the same id-ordered list.
+        logger.info('Series page %d for project %d returned HTTP %d; '
+                    'isolating the unserializable series', page, project_id, status)
+        base = (page - 1) * REST_PER_PAGE
+        reached_end = False
+        for offset in range(REST_PER_PAGE):
+            one_params: List[Tuple[str, Any]] = [
+                ('project', project_id),
+                ('since', since_iso),
+                ('order', 'id'),
+                ('page', base + offset + 1),
+                ('per_page', 1),
+            ]
+            one, one_status = rm.get_list_page(rm.series_url, one_params)
+            if one_status == 200:
+                if not one:
+                    reached_end = True
+                    break
+                collected.extend(one)
+            else:
+                logger.info('  Skipping unserializable series at index %d (project %d, HTTP %s)',
+                            base + offset, project_id, one_status)
+        if reached_end:
+            break
+        page += 1
+
+    return collected
+
+
 def housekeeping(pname: str) -> None:
     project, rm, pconfig = project_by_name(pname)
     if 'housekeeping' not in pconfig:
@@ -936,35 +1020,16 @@ def housekeeping(pname: str) -> None:
         cutoffdate = datetime.datetime.now() - datetime.timedelta(days=cutoffdays)
         logger.debug('cutoffdate=%s', cutoffdate)
         series: Dict[Tuple[str, str], Dict[datetime.datetime, Any]] = dict()
-        page = 0
-        pagedata: List[Any] = list()
-        lastpage = False
-        while True:
-            if not pagedata and not lastpage:
-                page += 1
-                logger.debug('  grabbing page %d', page)
-                params: List[Tuple[str, Union[str, int]]] = [
-                    ('project', project_id),
-                    ('order', '-date'),
-                    ('page', page),
-                    ('per_page', REST_PER_PAGE)
-                ]
-                # we do our own pagination
-                pagedata = rm.get_series_list(params, unpaginated=False)
-
-            if not pagedata:
-                # Got them all?
-                logger.debug('Finished processing all series')
-                break
-
-            entry = pagedata.pop()
-            # Did we go too far back?
+        # Let patchwork filter by date for us with "since"; this keeps the query
+        # small and lets get_project_series_since() page through resiliently, so
+        # a single series patchwork cannot serialize does not stall the project.
+        for entry in get_project_series_since(rm, project_id, cutoffdate.isoformat()):
             s_date = entry.get('date')
-            series_date = datetime.datetime.strptime(s_date, "%Y-%m-%dT%H:%M:%S")
-            if series_date < cutoffdate:
-                lastpage = True
-                logger.debug('Went too far back, stopping at %s', series_date)
+            if not s_date:
                 continue
+            # fromisoformat copes with optional microseconds; strptime with a
+            # fixed format would raise on timestamps that carry them.
+            series_date = datetime.datetime.fromisoformat(s_date)
 
             s_id = entry.get('id')
             s_name = entry.get('name')
@@ -977,10 +1042,9 @@ def housekeeping(pname: str) -> None:
             s_name = re.sub(r'^\[.*?]\s*', '', s_name)
 
             ver = entry.get('version')
-            subm_id = entry.get('submitter').get('id')
-            patches: List[str] = list()
-            for patch in entry.get('patches'):
-                patches.append(patch.get('id'))
+            submitter: Any = entry.get('submitter') or dict()
+            subm_id = submitter.get('id')
+            patches = [patch.get('id') for patch in entry.get('patches', list())]
 
             if not patches:
                 # Not sure how we can have a series without patches, but ok
@@ -991,7 +1055,7 @@ def housekeeping(pname: str) -> None:
                 series[(subm_id, s_name)] = dict()
 
             series[(subm_id, s_name)][series_date] = {
-                'id': id,
+                'id': s_id,
                 'patches': patches,
                 'complete': received_all,
                 'date': s_date,
@@ -1063,7 +1127,7 @@ def housekeeping(pname: str) -> None:
 
         page = 0
         seen: Set[str] = set()
-        pagedata = list()
+        pagedata: List[Any] = list()
         archived = 0
         while True:
             if not pagedata:
