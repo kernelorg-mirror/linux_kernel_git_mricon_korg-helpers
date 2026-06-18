@@ -5,7 +5,7 @@
 # public-inbox v2 git repository), and notifies senders when their pull
 # requests get merged.
 #
-# It runs from a cronjob, but can be also run from post-update hooks with 
+# It runs from a cronjob, but can be also run from post-update hooks with
 # extra wrappers. For more details, consult:
 #
 # https://korg.wiki.kernel.org/userdoc/prtracker
@@ -13,22 +13,22 @@
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
-import os
-import sys
 import argparse
 import email
 import email.message
 import email.utils
-import smtplib
-import time
-import subprocess
-import sqlite3
 import logging
+import os
 import pathlib
 import re
-
-from fcntl import lockf, LOCK_EX, LOCK_NB
+import smtplib
+import sqlite3
+import subprocess
+import sys
+import time
+from fcntl import LOCK_EX, LOCK_NB, lockf
 from string import Template
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 DB_VERSION = 2
 
@@ -59,7 +59,7 @@ PULL_BODY_REMOTE_REF_RE = [
 logger = logging.getLogger('prtracker')
 
 
-def db_migrate_1_to_2(projpath):
+def db_migrate_1_to_2(projpath: str) -> None:
     pirepo, maxshard = get_pirepo_dir(projpath, None)
     old_dbpath = os.path.join(projpath, '{0}.git'.format(maxshard), 'prs.db')
     dbconn_old = sqlite3.connect(old_dbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
@@ -84,12 +84,13 @@ def db_migrate_1_to_2(projpath):
     dbconn.close()
 
 
-def db_save_meta(c):
+def db_save_meta(c: sqlite3.Cursor) -> None:
     c.execute('DELETE FROM meta')
     c.execute('''INSERT INTO meta VALUES(?)''', (DB_VERSION,))
 
 
-def db_save_repo_heads(c, heads, shard=None):
+def db_save_repo_heads(c: sqlite3.Cursor, heads: Iterable[Tuple[str, str]],
+                       shard: Optional[int] = None) -> None:
     if shard is None:
         c.execute('DELETE FROM heads')
         for refname, commit_id in heads:
@@ -101,14 +102,14 @@ def db_save_repo_heads(c, heads, shard=None):
         c.execute('''INSERT INTO heads VALUES(?,?,?)''', (shard, refname, commit_id))
 
 
-def db_get_repo_heads(c, shard=None):
+def db_get_repo_heads(c: sqlite3.Cursor, shard: Optional[int] = None) -> List[Tuple[str, str]]:
     if shard is None:
         return c.execute('SELECT refname, commit_id FROM heads').fetchall()
     return c.execute('SELECT refname, commit_id FROM heads WHERE pi_shard=?',
                      (shard,)).fetchall()
 
 
-def db_init_common_sqlite_db(c):
+def db_init_common_sqlite_db(c: sqlite3.Cursor) -> None:
     c.execute('''
         CREATE TABLE meta (
             version INTEGER
@@ -116,7 +117,7 @@ def db_init_common_sqlite_db(c):
     db_save_meta(c)
 
 
-def db_init_pr_sqlite_db(c):
+def db_init_pr_sqlite_db(c: sqlite3.Cursor) -> None:
     logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
     db_init_common_sqlite_db(c)
     c.execute('''
@@ -136,7 +137,7 @@ def db_init_pr_sqlite_db(c):
         )''')
 
 
-def db_init_thanks_sqlite_db(c):
+def db_init_thanks_sqlite_db(c: sqlite3.Cursor) -> None:
     logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
     db_init_common_sqlite_db(c)
     c.execute('''
@@ -153,9 +154,9 @@ def db_init_thanks_sqlite_db(c):
         )''')
 
 
-def git_get_command_lines(gitdir, args):
+def git_get_command_lines(gitdir: Optional[str], args: List[str]) -> List[str]:
     out = git_run_command(gitdir, args)
-    lines = list()
+    lines: List[str] = list()
     if out:
         for line in out.split('\n'):
             if line == '':
@@ -165,7 +166,7 @@ def git_get_command_lines(gitdir, args):
     return lines
 
 
-def git_run_command(gitdir, args, logstderr=False):
+def git_run_command(gitdir: Optional[str], args: List[str], logstderr: bool = False) -> str:
     fullargs = ['git', '--no-pager']
     if gitdir:
         fullargs += ['--git-dir', gitdir]
@@ -174,16 +175,16 @@ def git_run_command(gitdir, args, logstderr=False):
     logger.debug('Running %s' % ' '.join(fullargs))
 
     (output, error) = subprocess.Popen(fullargs, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
-    output = output.strip().decode('utf-8', errors='replace')
+    outstr = output.strip().decode('utf-8', errors='replace')
 
     if logstderr and len(error.strip()):
         logger.debug('Stderr: %s', error.decode('utf-8', errors='replace'))
 
-    return output
+    return outstr
 
 
-def git_get_repo_heads(gitdir):
-    refs = list()
+def git_get_repo_heads(gitdir: Optional[str]) -> List[Tuple[str, str]]:
+    refs: List[Tuple[str, str]] = list()
     lines = git_get_command_lines(gitdir, ['show-ref', '--heads'])
     if lines is not None:
         for line in lines:
@@ -192,7 +193,7 @@ def git_get_repo_heads(gitdir):
     return refs
 
 
-def git_get_message_from_pi(projpath, shard, commit_id):
+def git_get_message_from_pi(projpath: str, shard: int, commit_id: str) -> Optional[email.message.Message]:
     pirepo = os.path.join(projpath, '{0}.git'.format(shard))
     full_email = git_run_command(pirepo, ['show', '%s:m' % commit_id])
     if not len(full_email):
@@ -202,7 +203,7 @@ def git_get_message_from_pi(projpath, shard, commit_id):
     return msg
 
 
-def git_get_commit_id_from_repo_ref(repo, ref):
+def git_get_commit_id_from_repo_ref(repo: str, ref: str) -> Optional[str]:
     # We only handle git and http/s URLs
     if not (repo.find('git://') == 0 or repo.find('http://') == 0 or repo.find('https://') == 0):
         logger.debug('%s uses unsupported protocol', repo)
@@ -236,7 +237,7 @@ def git_get_commit_id_from_repo_ref(repo, ref):
     return commit_id
 
 
-def commit_ids_match(cid1, cid2):
+def commit_ids_match(cid1: Optional[str], cid2: Optional[str]) -> bool:
     # request-pull emits the "since" and "up to" commit-ids with the same
     # abbreviation length (usually full 40-char hashes), but be tolerant in
     # case one side is abbreviated: compare on the shorter of the two.
@@ -246,9 +247,9 @@ def commit_ids_match(cid1, cid2):
     return cid1[:shorter].lower() == cid2[:shorter].lower()
 
 
-def get_remote_ref_from_body(body):
-    repo = None
-    ref = None
+def get_remote_ref_from_body(body: str) -> Tuple[Optional[str], Optional[str]]:
+    repo: Optional[str] = None
+    ref: Optional[str] = None
     for reporef_re in PULL_BODY_REMOTE_REF_RE:
         matches = reporef_re.search(body)
         if matches:
@@ -262,12 +263,12 @@ def get_remote_ref_from_body(body):
     return repo, ref
 
 
-def record_pr_data(shard, msg_commit_id, msg, c):
+def record_pr_data(shard: int, msg_commit_id: str, msg: email.message.Message, c: sqlite3.Cursor) -> bool:
     body = get_plain_part(msg)
     if body is None:
         return False
 
-    pr_commit_id = None
+    pr_commit_id: Optional[str] = None
     for cid_re in PULL_BODY_WITH_COMMIT_ID_RE:
         matches = cid_re.search(body)
         if matches:
@@ -276,7 +277,7 @@ def record_pr_data(shard, msg_commit_id, msg, c):
 
     if pr_commit_id is None:
         repo, ref = get_remote_ref_from_body(body)
-        if repo is not None:
+        if repo is not None and ref is not None:
             pr_commit_id = git_get_commit_id_from_repo_ref(repo, ref)
 
     if pr_commit_id is None:
@@ -289,7 +290,7 @@ def record_pr_data(shard, msg_commit_id, msg, c):
     # commit). Tracking it would make us falsely "thank" for the PR the
     # moment that base shows up in the tree. See:
     # https://lore.kernel.org/all/CAHk-=whn39dQtoMeJrz++nAnZpgnrooU0dgzOZXdn1LyxQ+f2w@mail.gmail.com/
-    since_commit_id = None
+    since_commit_id: Optional[str] = None
     for cid_re in PULL_BODY_SINCE_COMMIT_ID_RE:
         matches = cid_re.search(body)
         if matches:
@@ -307,13 +308,16 @@ def record_pr_data(shard, msg_commit_id, msg, c):
 
     rechdr = msg.get('Received')
     if rechdr:
-        received = time.strftime('%Y-%m-%dT%H:%M:%S%z',
-                                 email.utils.parsedate(rechdr.split(';')[-1].strip()))
+        parsed = email.utils.parsedate(rechdr.split(';')[-1].strip())
+        if parsed:
+            received = time.strftime('%Y-%m-%dT%H:%M:%S%z', parsed)
     else:
         # Do we have a date?
         datehdr = msg.get('Date')
         if datehdr:
-            received = time.strftime('%Y-%m-%dT%H:%M:%S%z', email.utils.parsedate(datehdr))
+            parsed = email.utils.parsedate(datehdr)
+            if parsed:
+                received = time.strftime('%Y-%m-%dT%H:%M:%S%z', parsed)
 
     logger.debug('received=%s', received)
     subject = msg['Subject'].replace('\n', ' ')
@@ -329,8 +333,9 @@ def record_pr_data(shard, msg_commit_id, msg, c):
     return False
 
 
-def git_get_new_revs(gitdir, db_heads, git_heads):
-    newrevs = dict()
+def git_get_new_revs(gitdir: Optional[str], db_heads: List[Tuple[str, str]],
+                     git_heads: List[Tuple[str, str]]) -> Dict[str, List[Tuple[str, str]]]:
+    newrevs: Dict[str, List[Tuple[str, str]]] = dict()
     for db_refrow in list(db_heads):
         if db_refrow in git_heads:
             logger.debug('No changes in %s', db_refrow[0])
@@ -338,7 +343,7 @@ def git_get_new_revs(gitdir, db_heads, git_heads):
 
         (refname, db_commit_id) = db_refrow
         # Find a matching one in git
-        git_commit_id = None
+        git_commit_id: Optional[str] = None
         for git_refrow in git_heads:
             if git_refrow[0] == refname:
                 git_commit_id = git_refrow[1]
@@ -372,14 +377,14 @@ def git_get_new_revs(gitdir, db_heads, git_heads):
     return newrevs
 
 
-def git_get_merge_id(repo, commit_id):
+def git_get_merge_id(repo: str, commit_id: str) -> str:
     # get merge commit id
     args = ['rev-list', '%s..' % commit_id, '--ancestry-path']
     lines = git_get_command_lines(repo, args)
     return lines[-1]
 
 
-def get_pirepo_dir(projpath, topdir):
+def get_pirepo_dir(projpath: str, topdir: Optional[str]) -> Tuple[str, int]:
     if topdir:
         projpath = os.path.join(topdir, projpath)
 
@@ -397,7 +402,7 @@ def get_pirepo_dir(projpath, topdir):
         at += 1
 
 
-def parse_pull_requests(pirepo, topdir, dryrun):
+def parse_pull_requests(pirepo: str, topdir: Optional[str], dryrun: bool) -> None:
     projpath, maxshard = get_pirepo_dir(pirepo, topdir)
     pirepo = os.path.join(projpath, '{0}.git'.format(maxshard))
     logger.debug('pirepo=%s', pirepo)
@@ -486,9 +491,10 @@ def parse_pull_requests(pirepo, topdir, dryrun):
         dbconn.commit()
 
 
-def get_config_from_cfgfile(repo, pitopdir, cmdconfig, cfgfile=None):
+def get_config_from_cfgfile(repo: str, pitopdir: str, cmdconfig: List[str],
+                            cfgfile: Optional[str] = None) -> Tuple[Set[str], Dict[str, str]]:
     from configparser import ConfigParser
-    config = dict()
+    config: Dict[str, str] = dict()
     if cmdconfig:
         for entry in cmdconfig:
             key, value = entry.split('=', 1)
@@ -508,7 +514,7 @@ def get_config_from_cfgfile(repo, pitopdir, cmdconfig, cfgfile=None):
 
     # Find all prtracker.db files in pitopdir
     tp = pathlib.Path(pitopdir)
-    pirepos = set()
+    pirepos: Set[str] = set()
     for subp in tp.glob('**/prtracker.db'):
         for globpatt in globpatts:
             if subp.match(globpatt):
@@ -517,20 +523,20 @@ def get_config_from_cfgfile(repo, pitopdir, cmdconfig, cfgfile=None):
     return pirepos, config
 
 
-def get_all_thanked_prs(c, cutoffdays=30):
+def get_all_thanked_prs(c: sqlite3.Cursor, cutoffdays: int = 30) -> Set[str]:
     rows = c.execute('''
                      SELECT pr_commit_id
                        FROM thanks
                       WHERE sent > datetime('now', ?)
                      ''', ('-%d day' % cutoffdays,)).fetchall()
-    sent_prs = set()
+    sent_prs: Set[str] = set()
     for row in rows:
         sent_prs.update((row[0],))
 
     return sent_prs
 
 
-def get_all_prs(projpath, cutoffdays=30):
+def get_all_prs(projpath: str, cutoffdays: int = 30) -> List[Any]:
     dbpath = os.path.join(projpath, 'prtracker.db')
     if not os.path.isfile(dbpath):
         # The DB does not exist, and we don't create it
@@ -542,26 +548,26 @@ def get_all_prs(projpath, cutoffdays=30):
     prc = prdbconn.cursor()
     rows = prc.execute('''
                        SELECT pi_shard, pr_commit_id, msg_commit_id
-                         FROM prs 
+                         FROM prs
                         WHERE received >= datetime('now', ?)
                        ''', ('-%d day' % cutoffdays,)).fetchall()
     return rows
 
 
-def get_plain_part(msg):
+def get_plain_part(msg: email.message.Message) -> Optional[str]:
     # walk until we find the first text/plain part
-    body = None
+    body: Optional[str] = None
     for part in msg.walk():
         if part.get_content_type().find('text/plain') < 0:
             continue
-        body = part.get_payload(decode=True)
-        if body is None:
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
             continue
 
         # We don't have to bother with charsets, because
         # we are looking for content that's guaranteed to be
         # in us-ascii.
-        body = body.decode('utf-8', errors='replace')
+        body = payload.decode('utf-8', errors='replace')
         # Look for evidence of a git pull request in this body
         (repo, ref) = get_remote_ref_from_body(body)
         if repo is None:
@@ -573,16 +579,16 @@ def get_plain_part(msg):
     return body
 
 
-def get_unprocessed_prs(c, prs, cutoffdays=30):
+def get_unprocessed_prs(c: sqlite3.Cursor, prs: List[Any], cutoffdays: int = 30) -> List[Any]:
     sent_prs = get_all_thanked_prs(c, cutoffdays)
-    new_prs = list()
+    new_prs: List[Any] = list()
     for row in prs:
         if row[1] not in sent_prs:
             new_prs.append(row)
     return new_prs
 
 
-def to_or_cc_contains(tocc, addrs):
+def to_or_cc_contains(tocc: List[str], addrs: str) -> bool:
     for addr in addrs.split(','):
         if addr.strip() in tocc:
             return True
@@ -590,11 +596,13 @@ def to_or_cc_contains(tocc, addrs):
     return False
 
 
-def format_addrs(pairs):
+def format_addrs(pairs: List[Tuple[str, str]]) -> str:
     return ', '.join([email.utils.formataddr(pair) for pair in pairs])
 
 
-def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id, config, dryrun, nomail):
+def thank_for_pr(c: sqlite3.Cursor, repo: str, refname: str, commit_id: str, projpath: str,
+                 pi_shard: int, msg_commit_id: str, config: Dict[str, str],
+                 dryrun: bool, nomail: bool) -> Optional[str]:
     # Make sure we haven't thanked for it already
     c.execute('SELECT sent_msgid FROM thanks WHERE pr_commit_id=? AND refname=?',
               (commit_id, refname))
@@ -650,10 +658,12 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     reqdate = orig.get('Date')
     if not reqdate:
         rechdr = orig.get('Received')
-        reqdate = time.strftime('%Y-%m-%d at %H:%M:%S',
-                                email.utils.parsedate(rechdr.split(';')[-1].strip()))
+        if rechdr:
+            parsed = email.utils.parsedate(rechdr.split(';')[-1].strip())
+            if parsed:
+                reqdate = time.strftime('%Y-%m-%d at %H:%M:%S', parsed)
 
-    msgvalues = dict()
+    msgvalues: Dict[str, str] = dict()
 
     merge_id = git_get_merge_id(repo, commit_id)
 
@@ -668,7 +678,7 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     if remoterepo is not None:
         msgvalues['remoteref'] = '%s %s' % (remoterepo, remoteref)
 
-    msgvalues['reqdate'] = reqdate
+    msgvalues['reqdate'] = reqdate or ''
     msgvalues['treename'] = ''
     if 'treename' in config:
         msgvalues['treename'] = config['treename']
@@ -744,7 +754,8 @@ def thank_for_pr(c, repo, refname, commit_id, projpath, pi_shard, msg_commit_id,
     return msg['Message-Id']
 
 
-def send_thanks(repo, pitopdir, cfgfile, cmdconfig, nomail, dryrun):
+def send_thanks(repo: str, pitopdir: str, cfgfile: Optional[str], cmdconfig: List[str],
+                nomail: bool, dryrun: bool) -> None:
     if dryrun:
         nomail = True
 
@@ -845,15 +856,15 @@ if __name__ == '__main__':
     logger.setLevel(logging.DEBUG)
 
     if cmdargs.logfile:
-        ch = logging.FileHandler(cmdargs.logfile)
-        formatter = logging.Formatter('[%(process)d] - %(asctime)s - %(message)s')
-        ch.setFormatter(formatter)
+        fh = logging.FileHandler(cmdargs.logfile)
+        fileformatter = logging.Formatter('[%(process)d] - %(asctime)s - %(message)s')
+        fh.setFormatter(fileformatter)
 
         if cmdargs.debug:
-            ch.setLevel(logging.DEBUG)
+            fh.setLevel(logging.DEBUG)
         else:
-            ch.setLevel(logging.INFO)
-        logger.addHandler(ch)
+            fh.setLevel(logging.INFO)
+        logger.addHandler(fh)
 
     ch = logging.StreamHandler()
     formatter = logging.Formatter('%(message)s')
