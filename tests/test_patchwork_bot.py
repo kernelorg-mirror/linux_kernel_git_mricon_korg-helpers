@@ -1086,7 +1086,7 @@ class TestGetProjectSeriesSince:
             ([{'id': 3}], 200),                        # index 3 ok
             ([], 500),                                 # index 4 is the poison -> skip
             ([{'id': 5}], 200),                        # index 5 ok
-            ([], 200),                                 # page 3 empty -> stop
+            ([], 404),                                 # page 3 past the end -> stop
         ])
         out = pwbot.get_project_series_since(rm, 1, 'since')
         assert [s['id'] for s in out] == [0, 1, 2, 3, 5]
@@ -1096,10 +1096,36 @@ class TestGetProjectSeriesSince:
             ([{'id': 0}, {'id': 1}, {'id': 2}], 200),  # page 1 (full)
             ([], 500),                                 # page 2 -> bisect
             ([{'id': 3}], 200),                        # index 3 ok
-            ([], 200),                                 # index 4 empty -> past the end
+            ([], 404),                                 # index 4 past the end
         ])
         out = pwbot.get_project_series_since(rm, 1, 'since')
         assert [s['id'] for s in out] == [0, 1, 2, 3]
+
+    def test_end_of_results_404_does_not_bisect(self):
+        """Patchwork answers a page past the last one with 404, not an empty
+        200. That is the end of the results, not an unserializable series, so it
+        must stop instead of running away bisecting a page that does not exist.
+        """
+        rm = self._rm([
+            ([{'id': 0}, {'id': 1}, {'id': 2}], 200),  # exactly one full page
+            ([], 404),                                 # page 2 past the end
+        ])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert [s['id'] for s in out] == [0, 1, 2]
+        # Must not have tried to isolate the (nonexistent) page 2 one item at a
+        # time; that is the infinite-loop regression.
+        assert rm.get_list_page.call_count == 2
+
+    def test_unexpected_status_stops(self):
+        """A non-5xx error (e.g. throttling) is not something we can step over
+        one series at a time, so stop rather than hammer the API."""
+        rm = self._rm([
+            ([{'id': 0}, {'id': 1}, {'id': 2}], 200),  # page 1 (full)
+            ([], 429),                                 # page 2 throttled
+        ])
+        out = pwbot.get_project_series_since(rm, 1, 'since')
+        assert [s['id'] for s in out] == [0, 1, 2]
+        assert rm.get_list_page.call_count == 2
 
     def test_connection_error_stops_gracefully(self):
         rm = self._rm([([], None)])

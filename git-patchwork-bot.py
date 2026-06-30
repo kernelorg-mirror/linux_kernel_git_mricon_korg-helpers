@@ -963,8 +963,22 @@ def get_project_series_since(rm: Restmaker, project_id: int, since_iso: str) -> 
                 break
             page += 1
             continue
+        if status == 404:
+            # Patchwork returns 404 for a page past the last one. That is simply
+            # the end of the results (the same signal get_unpaginated() relies
+            # on), not an unserializable series, so stop rather than trying to
+            # isolate a page that does not exist.
+            break
         if status is None:
             logger.info('Could not fetch series page %d for project %d, stopping', page, project_id)
+            break
+        if not 500 <= status < 600:
+            # Only a server error (5xx) means patchwork choked on serializing a
+            # series. Anything else unexpected (auth, throttling, ...) is not
+            # something we can step over one series at a time, so don't hammer
+            # the API; just stop.
+            logger.info('Series page %d for project %d returned HTTP %d, stopping',
+                        page, project_id, status)
             break
 
         # A series on this page cannot be serialized by patchwork. Re-fetch the
@@ -988,9 +1002,20 @@ def get_project_series_since(rm: Restmaker, project_id: int, since_iso: str) -> 
                     reached_end = True
                     break
                 collected.extend(one)
-            else:
+            elif one_status == 404:
+                # Walked past the last series in the result set; we're done.
+                reached_end = True
+                break
+            elif one_status is not None and 500 <= one_status < 600:
                 logger.info('  Skipping unserializable series at index %d (project %d, HTTP %s)',
                             base + offset, project_id, one_status)
+            else:
+                # Connection error or some other unexpected status: stop rather
+                # than spinning over the rest of the page.
+                logger.info('  Could not fetch series at index %d (project %d, HTTP %s), stopping',
+                            base + offset, project_id, one_status)
+                reached_end = True
+                break
         if reached_end:
             break
         page += 1
