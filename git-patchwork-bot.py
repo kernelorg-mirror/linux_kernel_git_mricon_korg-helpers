@@ -488,6 +488,22 @@ def git_get_new_revs(gitdir: str,
                 logger.debug('Excluding commits reachable from upstream %s (%s)',
                              upstream_ref, upstream_commit[:12])
 
+    if upstream_commit:
+        # The upstream SHA is resolved from the upstream repo, but git log runs
+        # in *this* repo. When the two share an object store (e.g. grokmirror
+        # alternates pointing both at one objstore), the SHA is present here and
+        # exclusion works. When they do not, the SHA is absent, and
+        # "git log ... ^<sha>" fails with "bad object", which
+        # git_get_command_lines() returns as an empty result -- silently
+        # skipping every ref. Guard against that: verify the object is present
+        # and, if not, fall back to the unconstrained range (the old behavior).
+        present = git_run_command(gitdir, ['rev-parse', '--verify', '--quiet',
+                                           upstream_commit + '^{commit}'])
+        if not present:
+            logger.info('Upstream commit %s not present in %s, proceeding without exclusion',
+                        upstream_commit[:12], gitdir)
+            upstream_commit = None
+
     for db_refrow in list(db_heads):
         if db_refrow in git_heads:
             logger.debug('No changes in %s', db_refrow[0])

@@ -614,7 +614,9 @@ class TestGitGetNewRevs:
             assert not any(a.startswith('^') for a in args)
 
     def test_upstream_commit_cached_across_calls(self):
-        """rev-parse must be called once; the second call uses the cache."""
+        """The upstream ref must be resolved against the upstream repo only
+        once; the second call uses the cache. (The per-repo presence check
+        still runs each time, so we count only the resolution calls.)"""
         UPSTREAM_SHA = 'cafef00d' * 5
         db_heads_1 = [('refs/heads/main', 'aaa')]
         git_heads_1 = [('refs/heads/main', 'bbb')]
@@ -622,7 +624,7 @@ class TestGitGetNewRevs:
         git_heads_2 = [('refs/heads/main', 'ccc')]
         with patch.object(pwbot, '_upstream_commit_cache', {}), \
              patch('os.path.isdir', return_value=True), \
-             patch.object(pwbot, 'git_run_command', return_value=UPSTREAM_SHA) as mock_revparse, \
+             patch.object(pwbot, 'git_run_command', return_value=UPSTREAM_SHA) as mock_git, \
              patch.object(pwbot, 'git_get_command_lines', return_value=[]):
             pwbot.git_get_new_revs('/fake/repo', db_heads_1, git_heads_1, [],
                                    upstream_gitdir='/fake/upstream',
@@ -630,7 +632,38 @@ class TestGitGetNewRevs:
             pwbot.git_get_new_revs('/fake/repo', db_heads_2, git_heads_2, [],
                                    upstream_gitdir='/fake/upstream',
                                    upstream_ref='refs/heads/master')
-            assert mock_revparse.call_count == 1
+            resolve_calls = [c for c in mock_git.call_args_list if c[0][0] == '/fake/upstream']
+            assert len(resolve_calls) == 1
+
+    def test_upstream_absent_in_target_repo_falls_back(self):
+        """If the upstream SHA resolves but is not present in the target repo
+        (the two do not share an object store), the ^sha must NOT be added --
+        otherwise git log fails with 'bad object' and every ref is silently
+        skipped. The range must fall back to the old behavior instead."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        UPSTREAM_SHA = 'feed1234' * 5
+
+        def fake_git(gitdir, args, stdin=None):
+            # Resolution against the upstream repo returns the SHA; the
+            # presence check (rev-parse --verify --quiet) in the target repo
+            # returns empty, i.e. the object is absent here.
+            if gitdir == '/fake/upstream':
+                return UPSTREAM_SHA
+            return ''
+
+        with patch.object(pwbot, '_upstream_commit_cache', {}), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(pwbot, 'git_run_command', side_effect=fake_git), \
+             patch.object(pwbot, 'git_get_command_lines',
+                          return_value=['deadbeef:A:a@b.com:Fix']) as mock_log:
+            result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [],
+                                            upstream_gitdir='/fake/upstream',
+                                            upstream_ref='refs/heads/master')
+            args = mock_log.call_args[0][1]
+            assert not any(a.startswith('^') for a in args)
+            # The ref must still be processed, not silently dropped.
+            assert 'refs/heads/main' in result
 
 
 class TestSendSummary:
