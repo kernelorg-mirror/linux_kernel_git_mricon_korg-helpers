@@ -65,6 +65,7 @@ CACHEDIR: str = os.path.expanduser('~/.cache/git-patchwork-bot')
 _project_cache: Dict[str, Tuple[Dict[str, Any], 'Restmaker', Dict[str, Any]]] = dict()
 _server_cache: Dict[str, Tuple['Restmaker', List[Dict[str, Any]]]] = dict()
 _rev_cache: Dict[str, Tuple[str, str, str, Optional[str], Optional[str]]] = dict()
+_upstream_commit_cache: Dict[Tuple[str, str], Optional[str]] = dict()
 
 logger = logging.getLogger('gitpwcron')
 
@@ -460,10 +461,33 @@ def git_get_new_revs(gitdir: str,
                      db_heads: List[Tuple[str, str]],
                      git_heads: List[Tuple[str, str]],
                      committers: List[str],
-                     merges: bool = False) -> Dict[str, List[Tuple[str, str, str]]]:
+                     merges: bool = False,
+                     upstream_gitdir: Optional[str] = None,
+                     upstream_ref: str = 'refs/heads/master') -> Dict[str, List[Tuple[str, str, str]]]:
     newrevs: Dict[str, List[Tuple[str, str, str]]] = dict()
     if committers:
         logger.debug('filtering by committers=%s', committers)
+
+    upstream_commit: Optional[str] = None
+    if upstream_gitdir:
+        cache_key = (upstream_gitdir, upstream_ref)
+        if cache_key in _upstream_commit_cache:
+            upstream_commit = _upstream_commit_cache[cache_key]
+        elif not os.path.isdir(upstream_gitdir):
+            logger.info('Upstream repo not found: %s, proceeding without exclusion', upstream_gitdir)
+            _upstream_commit_cache[cache_key] = None
+        else:
+            up_sha = git_run_command(upstream_gitdir, ['rev-parse', '--verify', upstream_ref])
+            if not up_sha:
+                logger.info('Could not resolve upstream ref %s in %s, proceeding without exclusion',
+                            upstream_ref, upstream_gitdir)
+                _upstream_commit_cache[cache_key] = None
+            else:
+                upstream_commit = up_sha
+                _upstream_commit_cache[cache_key] = upstream_commit
+                logger.debug('Excluding commits reachable from upstream %s (%s)',
+                             upstream_ref, upstream_commit[:12])
+
     for db_refrow in list(db_heads):
         if db_refrow in git_heads:
             logger.debug('No changes in %s', db_refrow[0])
@@ -491,10 +515,17 @@ def git_get_new_revs(gitdir: str,
             args += ['--no-merges']
 
         args += [rev_range, refname]
+        if upstream_commit:
+            # Exclude commits already in the upstream (mainline) tree. This
+            # matters after a post-merge-window rebase: the branch now contains
+            # all the mainline commits as direct ancestors, so the naive
+            # db_head..new_head range would include thousands of already-merged
+            # commits. ^upstream_commit cuts them out, leaving only the patches
+            # that are genuinely new to this branch.
+            args.append('^' + upstream_commit)
 
         lines = git_get_command_lines(gitdir, args)
         if not lines:
-            # TODO: Fix for rebased repositories
             continue
 
         revs: List[Tuple[str, str, str]] = list()
@@ -1309,7 +1340,18 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
     db_heads = db_get_repo_heads(c)
     climit = rsettings.get('committers', list())
 
-    newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=climit, merges=True)
+    upstream_gitdir: Optional[str] = None
+    upstream_ref = 'refs/heads/master'
+    upstream_str = rsettings.get('upstream')
+    if upstream_str and isinstance(cmdargs.reposdir, str):
+        parts = upstream_str.split(None, 1)
+        upstream_path = parts[0]
+        if len(parts) > 1:
+            upstream_ref = parts[1]
+        upstream_gitdir = os.path.join(cmdargs.reposdir.rstrip('/'), upstream_path.lstrip('/'))
+
+    newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=climit, merges=True,
+                                upstream_gitdir=upstream_gitdir, upstream_ref=upstream_ref)
     if not newrevs:
         # Save current heads if we limited by committers
         if climit and not DRYRUN:

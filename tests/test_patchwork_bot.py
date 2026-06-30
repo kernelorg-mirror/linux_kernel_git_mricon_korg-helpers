@@ -572,6 +572,66 @@ class TestGitGetNewRevs:
             result = pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [])
         assert result['refs/heads/main'][0][1] == 'net: fix: handle edge case'
 
+    def test_upstream_exclusion_appends_caret_sha(self):
+        """When upstream_gitdir is set, ^sha must appear in the git log args."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        UPSTREAM_SHA = 'feed1234' * 5  # realistic-length hex string
+        with patch.object(pwbot, '_upstream_commit_cache', {}), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(pwbot, 'git_run_command', return_value=UPSTREAM_SHA), \
+             patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_log:
+            pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [],
+                                   upstream_gitdir='/fake/upstream',
+                                   upstream_ref='refs/heads/master')
+            args = mock_log.call_args[0][1]
+            assert '^' + UPSTREAM_SHA in args
+
+    def test_upstream_exclusion_missing_repo_is_skipped(self):
+        """A non-existent upstream_gitdir must not add ^sha to git log args."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        with patch.object(pwbot, '_upstream_commit_cache', {}), \
+             patch('os.path.isdir', return_value=False), \
+             patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_log:
+            pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [],
+                                   upstream_gitdir='/nonexistent/upstream')
+            args = mock_log.call_args[0][1]
+            assert not any(a.startswith('^') for a in args)
+
+    def test_upstream_exclusion_unresolvable_ref_is_skipped(self):
+        """If rev-parse returns nothing, proceed without upstream exclusion."""
+        db_heads = [('refs/heads/main', 'aaa')]
+        git_heads = [('refs/heads/main', 'bbb')]
+        with patch.object(pwbot, '_upstream_commit_cache', {}), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(pwbot, 'git_run_command', return_value=''), \
+             patch.object(pwbot, 'git_get_command_lines', return_value=[]) as mock_log:
+            pwbot.git_get_new_revs('/fake/repo', db_heads, git_heads, [],
+                                   upstream_gitdir='/fake/upstream',
+                                   upstream_ref='refs/heads/nosuchbranch')
+            args = mock_log.call_args[0][1]
+            assert not any(a.startswith('^') for a in args)
+
+    def test_upstream_commit_cached_across_calls(self):
+        """rev-parse must be called once; the second call uses the cache."""
+        UPSTREAM_SHA = 'cafef00d' * 5
+        db_heads_1 = [('refs/heads/main', 'aaa')]
+        git_heads_1 = [('refs/heads/main', 'bbb')]
+        db_heads_2 = [('refs/heads/main', 'bbb')]
+        git_heads_2 = [('refs/heads/main', 'ccc')]
+        with patch.object(pwbot, '_upstream_commit_cache', {}), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(pwbot, 'git_run_command', return_value=UPSTREAM_SHA) as mock_revparse, \
+             patch.object(pwbot, 'git_get_command_lines', return_value=[]):
+            pwbot.git_get_new_revs('/fake/repo', db_heads_1, git_heads_1, [],
+                                   upstream_gitdir='/fake/upstream',
+                                   upstream_ref='refs/heads/master')
+            pwbot.git_get_new_revs('/fake/repo', db_heads_2, git_heads_2, [],
+                                   upstream_gitdir='/fake/upstream',
+                                   upstream_ref='refs/heads/master')
+            assert mock_revparse.call_count == 1
+
 
 class TestSendSummary:
     """Tests for send_summary() with mocked globals and SMTP."""
