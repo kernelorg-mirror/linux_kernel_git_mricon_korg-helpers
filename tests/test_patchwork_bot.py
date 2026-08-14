@@ -1224,3 +1224,228 @@ class TestGetProjectSeriesSince:
         rm = self._rm([([], None)])
         out = pwbot.get_project_series_since(rm, 1, 'since')
         assert out == []
+
+
+def _http_error(status):
+    """A RequestException carrying an HTTP status, as requests would raise."""
+    resp = MagicMock(status_code=status)
+    return pwbot.requests.exceptions.HTTPError(response=resp)
+
+
+class TestPatchworkFetchError:
+    """Skippable classification for single-object fetch failures."""
+
+    @pytest.mark.parametrize('status', [404, 500, 502, 503, 599])
+    def test_object_specific_statuses_are_skippable(self, status):
+        # 404: the object is gone. 5xx: patchwork cannot serialize it. Neither
+        # is fixed by retrying, so the run should step over the object.
+        assert pwbot.PatchworkFetchError('series', 1, status).skippable
+
+    @pytest.mark.parametrize('status', [400, 401, 403, 429, 301, None])
+    def test_api_wide_failures_are_not_skippable(self, status):
+        # These say something about the API or the network, not about this
+        # object. Swallowing them would turn a broken run into a quiet no-op.
+        assert not pwbot.PatchworkFetchError('series', 1, status).skippable
+
+    def test_is_a_keyerror(self):
+        # Callers written against the older getters caught a bare KeyError.
+        assert isinstance(pwbot.PatchworkFetchError('patch', 7, 500), KeyError)
+
+    def test_str_is_readable(self):
+        # KeyError.__str__ is repr(args[0]), which would add quotes.
+        ex = pwbot.PatchworkFetchError('series', 1109538, 500)
+        assert str(ex) == 'Not able to get series 1109538 (HTTP 500)'
+
+    def test_carries_status_and_id(self):
+        ex = pwbot.PatchworkFetchError('cover', 42, 503)
+        assert (ex.what, ex.obj_id, ex.status) == ('cover', 42, 503)
+
+
+class TestReraiseUnlessSkippable:
+    def test_returns_for_skippable(self):
+        pwbot.reraise_unless_skippable(pwbot.PatchworkFetchError('series', 1, 500))
+
+    def test_reraises_for_non_skippable(self):
+        ex = pwbot.PatchworkFetchError('series', 1, 403)
+        with pytest.raises(pwbot.PatchworkFetchError) as caught:
+            pwbot.reraise_unless_skippable(ex)
+        assert caught.value is ex
+
+
+class TestRestmakerFetchErrors:
+    """The single-object getters must report the HTTP status they hit."""
+
+    def _rm(self):
+        rm = pwbot.Restmaker.__new__(pwbot.Restmaker)
+        rm.session = MagicMock()
+        rm.series_url = 'http://x/series'
+        rm.patches_url = 'http://x/patches'
+        rm.covers_url = 'http://x/covers'
+        rm._patches = dict()
+        return rm
+
+    def test_get_series_raises_with_status(self):
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(500)
+        with pytest.raises(pwbot.PatchworkFetchError) as caught:
+            rm.get_series(1109538)
+        assert caught.value.status == 500
+        assert caught.value.skippable
+
+    def test_get_patch_raises_with_status(self):
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(404)
+        with pytest.raises(pwbot.PatchworkFetchError) as caught:
+            rm.get_patch(99)
+        assert caught.value.status == 404
+
+    def test_get_cover_raises_with_status(self):
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(503)
+        with pytest.raises(pwbot.PatchworkFetchError) as caught:
+            rm.get_cover(5)
+        assert caught.value.status == 503
+
+    def test_connection_error_has_no_status_and_is_not_skippable(self):
+        rm = self._rm()
+        rm.session.get.side_effect = pwbot.requests.exceptions.ConnectionError()
+        with pytest.raises(pwbot.PatchworkFetchError) as caught:
+            rm.get_series(1)
+        assert caught.value.status is None
+        assert not caught.value.skippable
+
+    def test_get_patch_caches_the_miss_when_skippable(self):
+        """A series with many patches must not re-request one patchwork
+        already refused; the second call returns the cached None."""
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(500)
+        with pytest.raises(pwbot.PatchworkFetchError):
+            rm.get_patch(99)
+        assert rm.get_patch(99) is None
+        assert rm.session.get.call_count == 1
+
+    def test_get_patch_does_not_cache_transient_failures(self):
+        """A connection blip must not poison the cache: the patch is still
+        unknown, not known-missing."""
+        rm = self._rm()
+        rm.session.get.side_effect = pwbot.requests.exceptions.ConnectionError()
+        with pytest.raises(pwbot.PatchworkFetchError):
+            rm.get_patch(99)
+        assert 99 not in rm._patches
+
+
+class TestPwrunSurvivesUnavailableObjects:
+    """pwrun() only saves the new repo heads once it reaches the end.
+
+    An exception escaping the middle of the run therefore does more than lose
+    one series: the heads are never advanced, so the next cron run re-walks the
+    same revisions, hits the same object, and dies again -- the bot stays
+    wedged until someone intervenes. These tests pin the boundary between what
+    is stepped over and what is still allowed to abort the run.
+    """
+
+    OLD_HEADS = [('refs/heads/main', 'aaaaaaa')]
+    NEW_HEADS = [('refs/heads/main', 'bbbbbbb')]
+    REV = 'deadbeefdeadbeef'
+    PATCH_ID = 555
+    SERIES_ID = 1109538
+
+    def _seed_db(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        c = conn.cursor()
+        pwbot.db_init_pw_sqlite_db(c)
+        pwbot.db_save_repo_heads(c, self.OLD_HEADS)
+        conn.commit()
+        conn.close()
+
+    def _read_heads(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        heads = pwbot.db_get_repo_heads(conn.cursor())
+        conn.close()
+        return heads
+
+    def _rsettings(self):
+        return {
+            'projects': {
+                'testproj': {
+                    'main': {'tostate': 'Accepted', 'fromstate': ['new']},
+                },
+            },
+        }
+
+    def _run(self, repo_dir, rm):
+        newrevs = {'refs/heads/main': [(self.REV, 'Some patch subject', 'Dev <dev@example.com>')]}
+        rev_cache = {self.REV: (self.REV, 'Some patch subject', 'Dev <dev@example.com>', 'pwhash1', None)}
+        orig_dryrun = pwbot.DRYRUN
+        pwbot.DRYRUN = False
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.NEW_HEADS), \
+                 patch.object(pwbot, 'git_get_new_revs', return_value=newrevs), \
+                 patch.object(pwbot, '_rev_cache', rev_cache), \
+                 patch.object(pwbot, 'project_by_name',
+                              return_value=({'id': 7}, rm, dict())), \
+                 patch.object(pwbot, 'get_patchwork_patches_by_project_hash',
+                              return_value=[self.PATCH_ID]):
+                pwbot.pwrun(str(repo_dir), self._rsettings())
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+
+    def _rm(self, series_side_effect):
+        rm = MagicMock()
+        rm.server = 'https://patchwork.example.com'
+        rm.get_patch.return_value = {
+            'id': self.PATCH_ID,
+            'state': 'new',
+            'series': [{'id': self.SERIES_ID}],
+        }
+        rm.get_series.side_effect = series_side_effect
+        return rm
+
+    def test_unserializable_series_does_not_wedge_the_run(self, tmp_path):
+        """The 500 that started all this: patchwork cannot serialize series
+        1109538. Skip it, but still advance the heads so the next run makes
+        progress instead of dying on the same revision forever."""
+        self._seed_db(tmp_path)
+        rm = self._rm(pwbot.PatchworkFetchError('series', self.SERIES_ID, 500))
+        self._run(tmp_path, rm)
+        assert self._read_heads(tmp_path) == self.NEW_HEADS
+        rm.update_patch.assert_not_called()
+
+    def test_missing_series_does_not_wedge_the_run(self, tmp_path):
+        self._seed_db(tmp_path)
+        rm = self._rm(pwbot.PatchworkFetchError('series', self.SERIES_ID, 404))
+        self._run(tmp_path, rm)
+        assert self._read_heads(tmp_path) == self.NEW_HEADS
+
+    def test_api_wide_failure_still_aborts_without_saving_heads(self, tmp_path):
+        """A 403 is not about this series -- every later request would fail the
+        same way. Skipping each object in turn would look like a clean run that
+        found nothing, so the error must propagate and the heads must NOT move:
+        the revisions genuinely have not been processed yet."""
+        self._seed_db(tmp_path)
+        rm = self._rm(pwbot.PatchworkFetchError('series', self.SERIES_ID, 403))
+        with pytest.raises(pwbot.PatchworkFetchError):
+            self._run(tmp_path, rm)
+        assert self._read_heads(tmp_path) == self.OLD_HEADS
+
+    def test_healthy_series_is_still_updated(self, tmp_path):
+        """Guard against the skip path swallowing the normal case."""
+        self._seed_db(tmp_path)
+        rm = self._rm(None)
+        rm.get_series.return_value = {
+            'id': self.SERIES_ID,
+            'name': 'A good series',
+            'patches': [{'id': self.PATCH_ID, 'name': 'A good patch'}],
+        }
+        self._run(tmp_path, rm)
+        rm.update_patch.assert_called_once_with(self.PATCH_ID, state='accepted', commit_ref=self.REV)
+        assert self._read_heads(tmp_path) == self.NEW_HEADS
+
+    def test_unavailable_patch_does_not_wedge_the_run(self, tmp_path):
+        """Same contract for the patch lookup that feeds the series loop."""
+        self._seed_db(tmp_path)
+        rm = self._rm(None)
+        rm.get_patch.side_effect = pwbot.PatchworkFetchError('patch', self.PATCH_ID, 500)
+        self._run(tmp_path, rm)
+        assert self._read_heads(tmp_path) == self.NEW_HEADS
+        rm.get_series.assert_not_called()

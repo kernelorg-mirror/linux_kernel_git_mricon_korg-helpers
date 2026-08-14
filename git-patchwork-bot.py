@@ -70,6 +70,66 @@ _upstream_commit_cache: Dict[Tuple[str, str], Optional[str]] = dict()
 logger = logging.getLogger('gitpwcron')
 
 
+class PatchworkFetchError(KeyError):
+    """Raised when a single patchwork object cannot be retrieved.
+
+    Subclasses KeyError so that callers written against the older getters,
+    which raised a bare KeyError, keep working unchanged. Carries the HTTP
+    status so callers can tell an error that is specific to *this* object from
+    one that affects every request we are about to make.
+    """
+
+    def __init__(self, what: str, obj_id: Any, status: Optional[int] = None) -> None:
+        self.what = what
+        self.obj_id = obj_id
+        self.status = status
+        super().__init__('Not able to get %s %s (HTTP %s)' % (what, obj_id, status))
+
+    @property
+    def skippable(self) -> bool:
+        """True when the failure is a property of this object, not of the API.
+
+        Patchwork answers 404 for an object that is gone and 5xx when it cannot
+        serialize one (e.g. a patch whose data breaks URL building). Neither
+        resolves on a retry, so the only useful thing to do is step over this
+        object and get on with the run. Every other status -- and a connection
+        failure, which has no status at all -- says something about the API or
+        the network rather than the object, so it must not be swallowed.
+        """
+        if self.status == 404:
+            return True
+        return self.status is not None and 500 <= self.status < 600
+
+    def __str__(self) -> str:
+        # KeyError.__str__ is repr(args[0]), which would wrap the message in
+        # quotes; we want it to read plainly in the logs.
+        return str(self.args[0])
+
+
+def _status_of(ex: requests.exceptions.RequestException) -> Optional[int]:
+    """HTTP status carried by a request exception, or None if it never got one."""
+    if ex.response is None:
+        return None
+    return int(ex.response.status_code)
+
+
+def reraise_unless_skippable(ex: PatchworkFetchError) -> None:
+    """Return if the caller may skip this object, otherwise re-raise.
+
+    Skipping an object patchwork cannot give us keeps the run going, which
+    matters because pwrun() only saves the new repo heads once it reaches the
+    end -- an escaping exception wedges the bot into re-walking, and re-failing
+    on, the same revisions on every subsequent run.
+
+    Blanket-swallowing is just as bad the other way: if the API starts refusing
+    every request, skipping each object in turn would look like a clean run
+    that simply found nothing to do. So anything that is not object-specific
+    keeps propagating.
+    """
+    if not ex.skippable:
+        raise ex
+
+
 class Restmaker:
     server: str
     url: str
@@ -147,7 +207,7 @@ class Restmaker:
             return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
-            raise KeyError('Not able to get cover %s', cover_id)
+            raise PatchworkFetchError('cover', cover_id, _status_of(ex))
 
     def get_patch(self, patch_id: int) -> Optional[Dict[str, Any]]:
         if patch_id not in self._patches:
@@ -160,8 +220,14 @@ class Restmaker:
                 self._patches[patch_id] = rsp.json()
             except requests.exceptions.RequestException as ex:
                 logger.info('REST error: %s', ex)
-                self._patches[patch_id] = None
-                raise KeyError('Not able to get patch_id %s', patch_id)
+                fetch_error = PatchworkFetchError('patch', patch_id, _status_of(ex))
+                if fetch_error.skippable:
+                    # Remember the miss so that a series with several patches
+                    # does not re-request one patchwork has already refused.
+                    # Only for skippable errors: a transient failure must not
+                    # poison the cache for the rest of the run.
+                    self._patches[patch_id] = None
+                raise fetch_error
 
         return self._patches[patch_id]
 
@@ -175,7 +241,7 @@ class Restmaker:
             return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
-            raise KeyError('Not able to get series %s', series_id)
+            raise PatchworkFetchError('series', series_id, _status_of(ex))
 
     def get_patches_list(self, params: List[Tuple[str, Any]],
                          unpaginated: bool = True) -> List[Dict[str, Any]]:
@@ -220,8 +286,7 @@ class Restmaker:
             return list(rsp.json()), status
         except requests.exceptions.RequestException as ex:
             logger.debug('REST error: %s', ex)
-            status = ex.response.status_code if ex.response is not None else None
-            return list(), status
+            return list(), _status_of(ex)
 
     def get_projects_list(self, params: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
         try:
@@ -826,8 +891,9 @@ def notify_submitters(serieslist: List[Dict[str, Any]],
                 fullcover = rm.get_cover(sdata.get('cover_letter', dict()).get('id'))
                 headers = {k.lower(): v for k, v in fullcover.get('headers', dict()).items()}
                 content = fullcover.get('content', '')
-            except KeyError:
-                logger.debug('Unable to get cover letter, will try first patch')
+            except PatchworkFetchError as ex:
+                reraise_unless_skippable(ex)
+                logger.debug('Unable to get cover letter (%s), will try first patch', ex)
         if not reference:
             reference = patches[0].get('msgid')
             try:
@@ -837,8 +903,9 @@ def notify_submitters(serieslist: List[Dict[str, Any]],
                     content = fullpatch.get('content', '')
                     if fullpatch.get('pull_url'):
                         is_pull_request = True
-            except KeyError:
-                logger.debug('Unable to get first patch reference, bailing on %s', sdata.get('id'))
+            except PatchworkFetchError as ex:
+                reraise_unless_skippable(ex)
+                logger.debug('Unable to get first patch reference (%s), bailing on %s', ex, sdata.get('id'))
                 continue
 
         submitter = sdata.get('submitter', dict())
@@ -1156,7 +1223,12 @@ def housekeeping(pname: str) -> None:
                 rev = items[v]['rev']
                 s_date = items[v]['date']
                 patch_id = items[v]['patches'][0]
-                patch = rm.get_patch(patch_id)
+                try:
+                    patch = rm.get_patch(patch_id)
+                except PatchworkFetchError as ex:
+                    reraise_unless_skippable(ex)
+                    logger.info('  Skipping unavailable patch %s: %s', patch_id, ex)
+                    continue
                 if not patch:
                     # Huh, what happened?
                     continue
@@ -1167,7 +1239,12 @@ def housekeeping(pname: str) -> None:
                     # Yes, we need to supersede these patches
                     for patch_id in items[v]['patches']:
                         logger.info('    Superseding patch: %d', patch_id)
-                        patch = rm.get_patch(patch_id)
+                        try:
+                            patch = rm.get_patch(patch_id)
+                        except PatchworkFetchError as ex:
+                            reraise_unless_skippable(ex)
+                            logger.info('    Skipping unavailable patch %s: %s', patch_id, ex)
+                            continue
                         if patch is None:
                             continue
                         patch_title = patch.get('name')
@@ -1497,7 +1574,12 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
                 for patch_id in patch_ids:
                     logger.info('   Matched: %s', patch_id)
-                    pdata = rm.get_patch(patch_id)
+                    try:
+                        pdata = rm.get_patch(patch_id)
+                    except PatchworkFetchError as ex:
+                        reraise_unless_skippable(ex)
+                        logger.info('   Ignoring unavailable patch: %s', ex)
+                        continue
                     if not pdata:
                         logger.info('   Ignoring due to REST error')
                         continue
@@ -1516,7 +1598,12 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     # we've already updated this series
                     logger.info('    Already applied as part of previous series')
                     continue
-                pdata = rm.get_patch(patch_id)
+                try:
+                    pdata = rm.get_patch(patch_id)
+                except PatchworkFetchError as ex:
+                    reraise_unless_skippable(ex)
+                    logger.info('    Skipping unavailable patch: %s', ex)
+                    continue
                 if pdata is None:
                     logger.info('    Patch not found on %s, skipping', rm.server)
                     continue
@@ -1529,7 +1616,15 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
                 for series in serieslist:
                     series_id = series.get('id')
-                    sdata = rm.get_series(series_id)
+                    try:
+                        sdata = rm.get_series(series_id)
+                    except PatchworkFetchError as ex:
+                        # Patchwork 500s on a series it cannot serialize. Letting
+                        # that escape aborts pwrun() before db_save_repo_heads(),
+                        # so the next run re-walks the same revs and dies again.
+                        reraise_unless_skippable(ex)
+                        logger.info('    Skipping unavailable series: %s', ex)
+                        continue
                     update_queue: List[Tuple[str, int, str, str]] = list()
                     for spatch in sdata.get('patches', dict()):
                         spatch_id = spatch.get('id')
@@ -1599,7 +1694,14 @@ def pwhash_differ() -> None:
         logger.info('Patchwork: %s', pw)
         for pname, _ in CONFIG['patchworks'][pw]['projects'].items():
             _, rm, _ = project_by_name(pname)
-            patch = rm.get_patch(check_patch_id)
+            try:
+                patch = rm.get_patch(check_patch_id)
+            except PatchworkFetchError as ex:
+                # Nothing to skip past here -- fetching this one patch is the
+                # whole job -- so report it cleanly instead of dumping a
+                # traceback at whoever ran the command.
+                logger.info('Could not get patch %d from %s: %s', check_patch_id, rm.server, ex)
+                sys.exit(1)
             if not patch:
                 logger.info('Patch %d not found on %s', check_patch_id, rm.server)
                 sys.exit(1)
