@@ -44,7 +44,7 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
-DB_VERSION: str = '1'
+DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
     r'^\s*Link:\s+\S+://patch\.msgid\.link/([^@]+@[^@\s/]+)$', flags=re.M | re.I
@@ -518,6 +518,55 @@ def db_get_repo_heads(c: sqlite3.Cursor) -> List[Tuple[str, str]]:
     return c.execute('SELECT refname, commit_id FROM heads').fetchall()
 
 
+def db_ensure_pending_ops(c: sqlite3.Cursor) -> None:
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_ops (
+            pname TEXT,
+            refname TEXT,
+            rev TEXT,
+            logline TEXT,
+            committer TEXT,
+            pwhash TEXT,
+            msgid TEXT,
+            stage TEXT,
+            note TEXT,
+            first_failed TEXT,
+            PRIMARY KEY (pname, refname, rev)
+        )''')
+
+
+def db_record_pending_op(c: sqlite3.Cursor, pname: str, refname: str,
+                          hashpair: Tuple[str, str, str, Optional[str], Optional[str]],
+                          stage: str, note: str) -> None:
+    rev, logline, committer, pwhash, msgid = hashpair
+    existing = c.execute(
+        'SELECT first_failed FROM pending_ops WHERE pname=? AND refname=? AND rev=?',
+        (pname, refname, rev)).fetchone()
+    first_failed = existing[0] if existing else datetime.datetime.now(datetime.timezone.utc).isoformat()
+    c.execute('''
+        INSERT INTO pending_ops (pname, refname, rev, logline, committer, pwhash, msgid, stage, note, first_failed)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(pname, refname, rev) DO UPDATE SET
+            logline=excluded.logline, committer=excluded.committer, pwhash=excluded.pwhash,
+            msgid=excluded.msgid, stage=excluded.stage, note=excluded.note
+        ''', (pname, refname, rev, logline, committer, pwhash, msgid, stage, note, first_failed))
+
+
+def db_clear_pending_op(c: sqlite3.Cursor, pname: str, refname: str, rev: str) -> None:
+    c.execute('DELETE FROM pending_ops WHERE pname=? AND refname=? AND rev=?', (pname, refname, rev))
+
+
+def db_get_pending_ops(c: sqlite3.Cursor,
+                        pname: str) -> Dict[str, Set[Tuple[str, str, str, Optional[str], Optional[str]]]]:
+    rows = c.execute(
+        'SELECT refname, rev, logline, committer, pwhash, msgid FROM pending_ops WHERE pname=?',
+        (pname,)).fetchall()
+    by_ref: Dict[str, Set[Tuple[str, str, str, Optional[str], Optional[str]]]] = dict()
+    for refname, rev, logline, committer, pwhash, msgid in rows:
+        by_ref.setdefault(refname, set()).add((rev, logline, committer, pwhash, msgid))
+    return by_ref
+
+
 def db_init_common_sqlite_db(c: sqlite3.Cursor) -> None:
     c.execute('''
         CREATE TABLE meta (
@@ -534,6 +583,7 @@ def db_init_pw_sqlite_db(c: sqlite3.Cursor) -> None:
             refname TEXT,
             commit_id TEXT
         )''')
+    db_ensure_pending_ops(c)
 
 
 def git_get_command_lines(gitdir: str, args: List[str]) -> List[str]:
@@ -1478,6 +1528,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
     db_exists = os.path.isfile(dbpath)
     dbconn = sqlite3.connect(dbpath, sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
     c = dbconn.cursor()
+    db_ensure_pending_ops(c)
 
     if not db_exists:
         db_init_pw_sqlite_db(c)
@@ -1507,7 +1558,8 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
     newrevs = git_get_new_revs(repo, db_heads, git_heads, committers=climit, merges=True,
                                 upstream_gitdir=upstream_gitdir, upstream_ref=upstream_ref)
-    if not newrevs:
+    have_pending_ops = c.execute('SELECT 1 FROM pending_ops LIMIT 1').fetchone() is not None
+    if not newrevs and not have_pending_ops:
         # Save current heads if we limited by committers
         if climit and not DRYRUN:
             db_save_repo_heads(c, git_heads)
@@ -1561,6 +1613,12 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
 
                 rpwhashes[refname].add(_rev_cache[rev])
 
+        # Re-inject revs that hit an isolated failure on a previous run
+        # (breaker not tripped at the time) so they get retried alongside
+        # anything freshly discovered this run.
+        for p_refname, pending_hashpairs in db_get_pending_ops(c, pname).items():
+            rpwhashes.setdefault(p_refname, set()).update(pending_hashpairs)
+
         if not wantstates:
             wantstates = ['new', 'under-review']
 
@@ -1585,6 +1643,13 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                 continue
             try:
                 logger.info('  Analyzing %d revisions in %s', len(hashpairs), refname)
+                # Per-rev ledger bookkeeping for isolated (non-systemic) failures --
+                # a rev that raises here gets a pending_ops row so a later run
+                # retries just that rev, instead of us re-walking the whole ref.
+                rev_hashpair: Dict[str, Tuple[str, str, str, Optional[str], Optional[str]]] = {
+                    hp[0]: hp for hp in hashpairs
+                }
+                revs_last_stage: Dict[str, Tuple[str, str]] = dict()
                 # Get our settings
                 hsettings = None
                 for wanthead, hsettings in psettings.items():
@@ -1649,6 +1714,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                         except PatchworkFetchError as ex:
                             reraise_unless_skippable(ex)
                             logger.info('   Ignoring unavailable patch: %s', ex)
+                            revs_last_stage[rev] = ('match', str(ex))
                             continue
                         if not pdata:
                             logger.info('   Ignoring due to REST error')
@@ -1673,6 +1739,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     except PatchworkFetchError as ex:
                         reraise_unless_skippable(ex)
                         logger.info('    Skipping unavailable patch: %s', ex)
+                        fail_rev = revs.get(patch_id)
+                        if fail_rev is not None:
+                            revs_last_stage[fail_rev] = ('resolve-patch', str(ex))
                         continue
                     if pdata is None:
                         logger.info('    Patch not found on %s, skipping', rm.server)
@@ -1694,6 +1763,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                             # so the next run re-walks the same revs and dies again.
                             reraise_unless_skippable(ex)
                             logger.info('    Skipping unavailable series: %s', ex)
+                            fail_rev = revs.get(patch_id)
+                            if fail_rev is not None:
+                                revs_last_stage[fail_rev] = ('resolve-series', str(ex))
                             continue
                         update_queue: List[Tuple[str, int, str, str]] = list()
                         for spatch in sdata.get('patches', dict()):
@@ -1716,6 +1788,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                                     except PatchworkFetchError as ex:
                                         reraise_unless_skippable(ex)
                                         logger.info('  Skipping update for %s: %s', sname, ex)
+                                        revs_last_stage[rev] = ('apply', str(ex))
                                         continue
                                 else:
                                     logger.info('  Updating (DRYRUN): %s', sname)
@@ -1724,6 +1797,14 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                     send_summary(updated_series, committers, to_state, refname, revs, pname, rsettings, hsettings)
                 if len(updated_series) and hsettings.get('notify_submitter', False):
                     notify_submitters(updated_series, committers, refname, revs, pname, rsettings, hsettings)
+
+                if not DRYRUN:
+                    for hp_rev, hp in rev_hashpair.items():
+                        if hp_rev in revs_last_stage:
+                            stage, note = revs_last_stage[hp_rev]
+                            db_record_pending_op(c, pname, refname, hp, stage, note)
+                        else:
+                            db_clear_pending_op(c, pname, refname, hp_rev)
             except CircuitOpenError as ex:
                 logger.warning('  %s; holding back head for %s this run', ex, refname)
                 failed_refs.add(refname)

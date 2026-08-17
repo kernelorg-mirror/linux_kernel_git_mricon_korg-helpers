@@ -1628,3 +1628,162 @@ class TestPwrunCircuitBreakerHoldsBackRefs:
         assert len(seen_series) == 3
         assert 9601 not in seen_series
         rm.update_patch.assert_not_called()
+
+
+class TestPwrunPendingOpsLedger:
+    """Tier 1 of the failure-handling design: an isolated failure on a single
+    rev (breaker not tripped) gets a pending_ops row instead of being lost,
+    so a later run retries just that rev. This is the fine-grained
+    complement to the coarse whole-ref holdback in
+    TestPwrunCircuitBreakerHoldsBackRefs, which covers the systemic case.
+    """
+
+    OLD_HEADS = [('refs/heads/main', 'aaaaaaa')]
+    NEW_HEADS = [('refs/heads/main', 'bbbbbbb')]
+    REFNAME = 'refs/heads/main'
+    PNAME = 'testproj'
+    REV = 'deadbeefdeadbeef'
+    LOGLINE = 'Some patch subject'
+    COMMITTER = 'Dev <dev@example.com>'
+    PWHASH = 'pwhash1'
+    PATCH_ID = 555
+    SERIES_ID = 1109538
+
+    def _seed_db(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        c = conn.cursor()
+        pwbot.db_init_pw_sqlite_db(c)
+        pwbot.db_save_repo_heads(c, self.OLD_HEADS)
+        conn.commit()
+        conn.close()
+
+    def _read_heads(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        heads = dict(pwbot.db_get_repo_heads(conn.cursor()))
+        conn.close()
+        return heads
+
+    def _read_pending(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        pending = pwbot.db_get_pending_ops(conn.cursor(), self.PNAME)
+        conn.close()
+        return pending
+
+    def _read_pending_row(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        row = conn.execute(
+            'SELECT stage, note, first_failed FROM pending_ops WHERE pname=? AND refname=? AND rev=?',
+            (self.PNAME, self.REFNAME, self.REV)).fetchone()
+        conn.close()
+        return row
+
+    def _seed_pending_op(self, repo_dir, stage='resolve-series', note='boom'):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        c = conn.cursor()
+        pwbot.db_record_pending_op(
+            c, self.PNAME, self.REFNAME,
+            (self.REV, self.LOGLINE, self.COMMITTER, self.PWHASH, None), stage, note)
+        conn.commit()
+        first_failed = c.execute(
+            'SELECT first_failed FROM pending_ops WHERE pname=? AND refname=? AND rev=?',
+            (self.PNAME, self.REFNAME, self.REV)).fetchone()[0]
+        conn.close()
+        return first_failed
+
+    def _rsettings(self):
+        return {
+            'projects': {
+                self.PNAME: {
+                    'main': {'tostate': 'Accepted', 'fromstate': ['new']},
+                },
+            },
+        }
+
+    def _run(self, repo_dir, rm, newrevs=None):
+        if newrevs is None:
+            newrevs = {self.REFNAME: [(self.REV, self.LOGLINE, self.COMMITTER)]}
+        rev_cache = {self.REV: (self.REV, self.LOGLINE, self.COMMITTER, self.PWHASH, None)}
+        orig_dryrun = pwbot.DRYRUN
+        pwbot.DRYRUN = False
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.NEW_HEADS), \
+                 patch.object(pwbot, 'git_get_new_revs', return_value=newrevs), \
+                 patch.object(pwbot, '_rev_cache', rev_cache), \
+                 patch.object(pwbot, 'project_by_name',
+                              return_value=({'id': 7}, rm, dict())), \
+                 patch.object(pwbot, 'get_patchwork_patches_by_project_hash',
+                              return_value=[self.PATCH_ID]):
+                pwbot.pwrun(str(repo_dir), self._rsettings())
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+
+    def _rm(self, series_side_effect=None):
+        rm = MagicMock()
+        rm.server = 'https://patchwork.example.com'
+        rm.circuit_open = False
+        rm.get_patch.return_value = {
+            'id': self.PATCH_ID,
+            'state': 'new',
+            'series': [{'id': self.SERIES_ID}],
+        }
+        if series_side_effect is not None:
+            rm.get_series.side_effect = series_side_effect
+        return rm
+
+    def test_isolated_failure_is_ledgered_and_head_still_advances(self, tmp_path):
+        self._seed_db(tmp_path)
+        rm = self._rm(pwbot.PatchworkFetchError('series', self.SERIES_ID, 500))
+        self._run(tmp_path, rm)
+
+        # An isolated failure (breaker never trips here) does not need to
+        # hold back the whole ref -- the head still advances normally.
+        assert self._read_heads(tmp_path) == dict(self.NEW_HEADS)
+        pending = self._read_pending(tmp_path)
+        assert pending == {
+            self.REFNAME: {(self.REV, self.LOGLINE, self.COMMITTER, self.PWHASH, None)},
+        }
+        row = self._read_pending_row(tmp_path)
+        assert row is not None
+        stage, note, _first_failed = row
+        assert stage == 'resolve-series'
+
+    def test_ledgered_rev_is_retried_and_cleared_on_success(self, tmp_path):
+        self._seed_db(tmp_path)
+        self._seed_pending_op(tmp_path)
+
+        rm = self._rm()
+        rm.get_series.return_value = {
+            'id': self.SERIES_ID,
+            'name': 'A good series',
+            'patches': [{'id': self.PATCH_ID, 'name': 'A good patch'}],
+        }
+        # No fresh git activity this run -- the retry must come purely from
+        # the ledger, not from newly-discovered commits.
+        self._run(tmp_path, rm, newrevs={})
+
+        rm.update_patch.assert_called_once_with(self.PATCH_ID, state='accepted', commit_ref=self.REV)
+        assert self._read_pending(tmp_path) == {}
+
+    def test_repeated_failure_preserves_first_failed_timestamp(self, tmp_path):
+        self._seed_db(tmp_path)
+        first_failed = self._seed_pending_op(tmp_path, stage='resolve-series', note='boom')
+
+        rm = self._rm(pwbot.PatchworkFetchError('series', self.SERIES_ID, 500))
+        self._run(tmp_path, rm, newrevs={})
+
+        row = self._read_pending_row(tmp_path)
+        assert row is not None
+        stage, note, refreshed_first_failed = row
+        assert stage == 'resolve-series'
+        assert refreshed_first_failed == first_failed
+
+    def test_breaker_trip_mid_ref_does_not_touch_the_ledger(self, tmp_path):
+        """A CircuitOpenError interrupts the try block before the
+        record-or-clear reconciliation runs -- Tier 2's whole-ref holdback
+        owns this case, not the per-rev ledger."""
+        self._seed_db(tmp_path)
+        rm = self._rm(pwbot.CircuitOpenError('circuit open for https://patchwork.example.com'))
+        self._run(tmp_path, rm)
+
+        assert self._read_heads(tmp_path) == dict(self.OLD_HEADS)
+        assert self._read_pending(tmp_path) == {}
