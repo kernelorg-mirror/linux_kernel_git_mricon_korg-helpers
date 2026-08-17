@@ -1282,6 +1282,8 @@ class TestRestmakerFetchErrors:
         rm.patches_url = 'http://x/patches'
         rm.covers_url = 'http://x/covers'
         rm._patches = dict()
+        rm.consecutive_failures = 0
+        rm.circuit_open = False
         return rm
 
     def test_get_series_raises_with_status(self):
@@ -1332,6 +1334,81 @@ class TestRestmakerFetchErrors:
         with pytest.raises(pwbot.PatchworkFetchError):
             rm.get_patch(99)
         assert 99 not in rm._patches
+
+
+class TestRestmakerCircuitBreaker:
+    """The breaker must trip on a real losing streak, not on isolated misses,
+    and once open it must refuse further requests without touching the
+    network."""
+
+    def _rm(self):
+        rm = pwbot.Restmaker.__new__(pwbot.Restmaker)
+        rm.server = 'http://x'
+        rm.session = MagicMock()
+        rm.series_url = 'http://x/series'
+        rm.patches_url = 'http://x/patches'
+        rm.covers_url = 'http://x/covers'
+        rm._patches = dict()
+        rm.consecutive_failures = 0
+        rm.circuit_open = False
+        return rm
+
+    def test_trips_after_threshold_consecutive_5xx(self):
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(500)
+        for _ in range(rm.CIRCUIT_BREAKER_THRESHOLD):
+            with pytest.raises(pwbot.PatchworkFetchError):
+                rm.get_series(1)
+        assert rm.circuit_open
+
+    def test_open_circuit_refuses_without_a_request(self):
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(500)
+        for _ in range(rm.CIRCUIT_BREAKER_THRESHOLD):
+            with pytest.raises(pwbot.PatchworkFetchError):
+                rm.get_series(1)
+        calls_before = rm.session.get.call_count
+        with pytest.raises(pwbot.CircuitOpenError):
+            rm.get_series(2)
+        assert rm.session.get.call_count == calls_before
+
+    def test_connection_errors_also_count_toward_the_trip(self):
+        rm = self._rm()
+        rm.session.get.side_effect = pwbot.requests.exceptions.ConnectionError()
+        for _ in range(rm.CIRCUIT_BREAKER_THRESHOLD):
+            with pytest.raises(pwbot.PatchworkFetchError):
+                rm.get_series(1)
+        assert rm.circuit_open
+
+    def test_404_does_not_count_toward_the_trip(self):
+        # A run of "object not found" says nothing about the server itself.
+        rm = self._rm()
+        rm.session.get.side_effect = _http_error(404)
+        for _ in range(rm.CIRCUIT_BREAKER_THRESHOLD + 5):
+            with pytest.raises(pwbot.PatchworkFetchError):
+                rm.get_series(1)
+        assert not rm.circuit_open
+
+    def test_intermittent_success_prevents_the_trip(self):
+        # The pattern that motivated this design: a handful of failures with
+        # an occasional success sprinkled in must never accumulate into a
+        # trip, because each success resets the streak.
+        rm = self._rm()
+        responses = []
+        for _ in range(20):
+            responses += [_http_error(500), _http_error(500)]
+            good = MagicMock(status_code=200)
+            good.raise_for_status.return_value = None
+            good.json.return_value = {'id': 1}
+            responses.append(good)
+        rm.session.get.side_effect = responses
+        for resp in responses:
+            if isinstance(resp, Exception):
+                with pytest.raises(pwbot.PatchworkFetchError):
+                    rm.get_series(1)
+            else:
+                rm.get_series(1)
+        assert not rm.circuit_open
 
 
 class TestPwrunSurvivesUnavailableObjects:
@@ -1393,6 +1470,7 @@ class TestPwrunSurvivesUnavailableObjects:
     def _rm(self, series_side_effect):
         rm = MagicMock()
         rm.server = 'https://patchwork.example.com'
+        rm.circuit_open = False
         rm.get_patch.return_value = {
             'id': self.PATCH_ID,
             'state': 'new',
@@ -1449,3 +1527,104 @@ class TestPwrunSurvivesUnavailableObjects:
         self._run(tmp_path, rm)
         assert self._read_heads(tmp_path) == self.NEW_HEADS
         rm.get_series.assert_not_called()
+
+
+class TestPwrunCircuitBreakerHoldsBackRefs:
+    """Once too many consecutive failures say the server itself is in
+    trouble, pwrun() must stop making requests immediately rather than
+    ledgering every remaining revision one by one -- a single bulk push can
+    carry hundreds of them. The ref whose processing was interrupted, and any
+    ref not yet reached, simply keep their old head so the next run's plain
+    git diff picks the whole gap back up for free.
+    """
+
+    OLD_HEADS = [('refs/heads/main', 'aaaaaaa'), ('refs/heads/next', 'xxxxxxx')]
+    NEW_HEADS = [('refs/heads/main', 'bbbbbbb'), ('refs/heads/next', 'yyyyyyy')]
+
+    def _seed_db(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        c = conn.cursor()
+        pwbot.db_init_pw_sqlite_db(c)
+        pwbot.db_save_repo_heads(c, self.OLD_HEADS)
+        conn.commit()
+        conn.close()
+
+    def _read_heads(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        heads = dict(pwbot.db_get_repo_heads(conn.cursor()))
+        conn.close()
+        return heads
+
+    def test_trip_mid_ref_holds_back_that_ref_and_skips_the_rest(self, tmp_path):
+        self._seed_db(tmp_path)
+
+        committer = 'Dev <dev@example.com>'
+        revs_main = [(f'rev{i}', f'Patch {i}', committer) for i in range(1, 5)]
+        revs_next = [('revx', 'Patch X', committer)]
+        newrevs = {
+            'refs/heads/main': revs_main,
+            'refs/heads/next': revs_next,
+        }
+        rev_cache = {
+            rev: (rev, logline, committer, f'hash-{rev}', None)
+            for rev, logline, committer in revs_main + revs_next
+        }
+        patch_id_by_hash = {'hash-rev1': 501, 'hash-rev2': 502, 'hash-rev3': 503,
+                            'hash-rev4': 504, 'hash-revx': 601}
+        series_id_by_patch = {501: 9501, 502: 9502, 503: 9503, 504: 9504, 601: 9601}
+
+        rm = MagicMock()
+        rm.server = 'https://patchwork.example.com'
+        rm.circuit_open = False
+
+        def get_patch(patch_id):
+            return {'id': patch_id, 'state': 'new', 'series': [{'id': series_id_by_patch[patch_id]}]}
+        rm.get_patch.side_effect = get_patch
+
+        seen_series: list = []
+
+        def get_series(series_id):
+            if rm.circuit_open:
+                raise pwbot.CircuitOpenError(f'circuit open for {rm.server}')
+            seen_series.append(series_id)
+            if len(seen_series) >= 3:
+                # This is the failure that would cross CIRCUIT_BREAKER_THRESHOLD
+                # inside the real Restmaker.
+                rm.circuit_open = True
+            raise pwbot.PatchworkFetchError('series', series_id, 500)
+        rm.get_series.side_effect = get_series
+
+        def get_hash(_rm, _project_id, pwhash):
+            return [patch_id_by_hash[pwhash]]
+
+        orig_dryrun = pwbot.DRYRUN
+        pwbot.DRYRUN = False
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.NEW_HEADS), \
+                 patch.object(pwbot, 'git_get_new_revs', return_value=newrevs), \
+                 patch.object(pwbot, '_rev_cache', rev_cache), \
+                 patch.object(pwbot, 'project_by_name', return_value=({'id': 7}, rm, dict())), \
+                 patch.object(pwbot, 'get_patchwork_patches_by_project_hash', side_effect=get_hash):
+                rsettings = {
+                    'projects': {
+                        'testproj': {
+                            'main': {'tostate': 'Accepted', 'fromstate': ['new']},
+                            'next': {'tostate': 'Accepted', 'fromstate': ['new']},
+                        },
+                    },
+                }
+                pwbot.pwrun(str(tmp_path), rsettings)
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+
+        heads = self._read_heads(tmp_path)
+        # Both refs held back: "main" tripped the breaker partway through its
+        # four revisions, "next" was never attempted at all once the breaker
+        # was already open when its turn came up.
+        assert heads == dict(self.OLD_HEADS)
+        # Only three real attempts were made against the (simulated) server
+        # for "main" before the breaker closed the door on the fourth --
+        # and "next" never got a single one.
+        assert len(seen_series) == 3
+        assert 9601 not in seen_series
+        rm.update_patch.assert_not_called()

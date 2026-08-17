@@ -113,6 +113,21 @@ def _status_of(ex: requests.exceptions.RequestException) -> Optional[int]:
     return int(ex.response.status_code)
 
 
+class CircuitOpenError(Exception):
+    """Raised instead of making a request once a server has tripped its breaker.
+
+    Patchwork answering 5xx (or not answering at all) for several requests in
+    a row means the server itself is struggling, not that we hit a run of bad
+    objects. Skipping each failure in turn at that point just adds more load
+    to a server that is already not coping, and -- because pwrun() has no
+    per-object memory of what it attempted -- would silently and permanently
+    drop whatever it could not fetch. Once the breaker trips, every further
+    call to that server is refused locally, with no network round trip, so
+    the caller can stop cleanly instead of grinding through the rest of the
+    batch one failure at a time.
+    """
+
+
 def reraise_unless_skippable(ex: PatchworkFetchError) -> None:
     """Return if the caller may skip this object, otherwise re-raise.
 
@@ -139,6 +154,12 @@ class Restmaker:
     session: requests.Session
     _patches: Dict[int, Optional[Dict[str, Any]]]
 
+    # Consecutive server-side failures (5xx or no response at all) before we
+    # stop making requests to this server for the rest of the process. Kept
+    # low: our own run is itself extra load on a server that is, by
+    # definition, already struggling by the time this counts as "consecutive."
+    CIRCUIT_BREAKER_THRESHOLD: int = 3
+
     def __init__(self, server: str) -> None:
         self.server = server
         self.url = '/'.join((server.rstrip('/'), 'api', REST_API_VERSION))
@@ -150,6 +171,12 @@ class Restmaker:
 
         # Simple local cache
         self._patches = dict()
+
+        # Circuit breaker state. Shared across every project/repo that talks
+        # to this server, because _server_cache hands out one Restmaker per
+        # server URL for the life of the process.
+        self.consecutive_failures = 0
+        self.circuit_open = False
 
         self.session = requests.session()
         retry = Retry(connect=3, backoff_factor=0.5)
@@ -170,6 +197,25 @@ class Restmaker:
             sys.exit(1)
         headers['Authorization'] = f'Token {apitoken}'
         self.session.headers.update(headers)
+
+    def _check_circuit(self) -> None:
+        if self.circuit_open:
+            raise CircuitOpenError(f'Circuit open for {self.server}, refusing to make further requests')
+
+    def _note_success(self) -> None:
+        self.consecutive_failures = 0
+
+    def _note_failure(self, status: Optional[int]) -> None:
+        # A 404 (or any other non-5xx status) says something about the object
+        # we asked for, not about the server, so it neither builds toward
+        # tripping the breaker nor resets a streak that is already building.
+        if status is not None and not (500 <= status < 600):
+            return
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.CIRCUIT_BREAKER_THRESHOLD and not self.circuit_open:
+            self.circuit_open = True
+            logger.critical('%d consecutive failures talking to %s, opening circuit breaker',
+                            self.consecutive_failures, self.server)
 
     def get_unpaginated(self, url: str, params: List[Tuple[str, Any]]) -> List[Dict[str, Any]]:
         # Caller should catch RequestException
@@ -198,28 +244,34 @@ class Restmaker:
         return results
 
     def get_cover(self, cover_id: int) -> Dict[str, Any]:
+        self._check_circuit()
         try:
             logger.debug('Grabbing cover %d', cover_id)
             url = '/'.join((self.covers_url, str(cover_id), ''))
             logger.debug('url=%s', url)
             rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
+            self._note_success()
             return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
+            self._note_failure(_status_of(ex))
             raise PatchworkFetchError('cover', cover_id, _status_of(ex))
 
     def get_patch(self, patch_id: int) -> Optional[Dict[str, Any]]:
         if patch_id not in self._patches:
+            self._check_circuit()
             try:
                 logger.debug('Grabbing patch %d', patch_id)
                 url = '/'.join((self.patches_url, str(patch_id), ''))
                 logger.debug('url=%s', url)
                 rsp = self.session.get(url, stream=False)
                 rsp.raise_for_status()
+                self._note_success()
                 self._patches[patch_id] = rsp.json()
             except requests.exceptions.RequestException as ex:
                 logger.info('REST error: %s', ex)
+                self._note_failure(_status_of(ex))
                 fetch_error = PatchworkFetchError('patch', patch_id, _status_of(ex))
                 if fetch_error.skippable:
                     # Remember the miss so that a series with several patches
@@ -232,15 +284,18 @@ class Restmaker:
         return self._patches[patch_id]
 
     def get_series(self, series_id: int) -> Dict[str, Any]:
+        self._check_circuit()
         try:
             logger.debug('Grabbing series %d', series_id)
             url = '/'.join((self.series_url, str(series_id), ''))
             logger.debug('url=%s', url)
             rsp = self.session.get(url, stream=False)
             rsp.raise_for_status()
+            self._note_success()
             return dict(rsp.json())
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
+            self._note_failure(_status_of(ex))
             raise PatchworkFetchError('series', series_id, _status_of(ex))
 
     def get_patches_list(self, params: List[Tuple[str, Any]],
@@ -297,6 +352,7 @@ class Restmaker:
 
     def update_patch(self, patch_id: int, state: Optional[str] = None, archived: bool = False,
                      commit_ref: Optional[str] = None) -> List[Tuple[str, Union[str, bool]]]:
+        self._check_circuit()
         # Clear it out of the cache
         if patch_id in self._patches:
             del self._patches[patch_id]
@@ -318,9 +374,11 @@ class Restmaker:
 
             rsp = self.session.patch(url, data=data, stream=False)
             rsp.raise_for_status()
+            self._note_success()
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
-            raise RuntimeError('Unable to update patch %s', patch_id)
+            self._note_failure(_status_of(ex))
+            raise PatchworkFetchError('patch update', patch_id, _status_of(ex))
 
         return list(rsp.json())
 
@@ -1431,6 +1489,10 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         return
 
     db_heads = db_get_repo_heads(c)
+    # git_get_new_revs() mutates db_heads (drops rows for refs gone from
+    # git), so snapshot the old commit_id per ref now -- it is what we fall
+    # back to for any ref the circuit breaker interrupts below.
+    db_heads_by_ref: Dict[str, str] = dict(db_heads)
     climit = rsettings.get('committers', list())
 
     upstream_gitdir: Optional[str] = None
@@ -1456,6 +1518,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
     logger.info('Processing: %s', repo)
 
     count = 0
+    # Refs whose processing was interrupted by an open circuit breaker.
+    # Their heads must not advance -- see the end-of-run head-save below.
+    failed_refs: Set[str] = set()
     for pname, psettings in rsettings['projects'].items():
         rpwhashes: Dict[str, Set[Tuple[str, str, str, Optional[str], Optional[str]]]] = dict()
         wantstates: List[str] = list()
@@ -1514,141 +1579,155 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             prs = set()
 
         for refname, hashpairs in rpwhashes.items():
-            logger.info('  Analyzing %d revisions in %s', len(hashpairs), refname)
-            # Get our settings
-            hsettings = None
-            for wanthead, hsettings in psettings.items():
-                if refname.endswith(wanthead) or fnmatch.fnmatch(refname, wanthead):
-                    break
-            if hsettings is None:
+            if rm.circuit_open:
+                logger.warning('  Circuit open for %s, holding back head for %s this run', rm.server, refname)
+                failed_refs.add(refname)
                 continue
-            # Patchwork lowercases state name and replaces spaces with dashes
-            to_state = hsettings['tostate'].lower().replace(' ', '-')
-            fromstate: List[str] = list()
-            for fs in hsettings.get('fromstate', list()):
-                fromstate.append(fs.lower().replace(' ', '-'))
-            if not fromstate:
-                fromstate = list(wantstates)
+            try:
+                logger.info('  Analyzing %d revisions in %s', len(hashpairs), refname)
+                # Get our settings
+                hsettings = None
+                for wanthead, hsettings in psettings.items():
+                    if refname.endswith(wanthead) or fnmatch.fnmatch(refname, wanthead):
+                        break
+                if hsettings is None:
+                    continue
+                # Patchwork lowercases state name and replaces spaces with dashes
+                to_state = hsettings['tostate'].lower().replace(' ', '-')
+                fromstate: List[str] = list()
+                for fs in hsettings.get('fromstate', list()):
+                    fromstate.append(fs.lower().replace(' ', '-'))
+                if not fromstate:
+                    fromstate = list(wantstates)
 
-            # We create patch_id->rev mapping first
-            revs: Dict[int, str] = dict()
-            committers: Dict[int, str] = dict()
-            for rev, logline, committer, pwhash, msgid in hashpairs:
-                if have_prs and pwhash is None:
-                    parsed = parse_merge_logline(logline)
-                    if parsed is None:
+                # We create patch_id->rev mapping first
+                revs: Dict[int, str] = dict()
+                committers: Dict[int, str] = dict()
+                for rev, logline, committer, pwhash, msgid in hashpairs:
+                    if have_prs and pwhash is None:
+                        parsed = parse_merge_logline(logline)
+                        if parsed is None:
+                            continue
+                        m_refname, m_host = parsed
+
+                        logger.debug('Looking for ref %s host %s', m_refname, m_host)
+
+                        patch_id = find_matching_pr(m_host, m_refname, prs)
+                        if patch_id is not None:
+                            logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
+                            revs[patch_id] = rev
+                            committers[patch_id] = committer
                         continue
-                    m_refname, m_host = parsed
 
-                    logger.debug('Looking for ref %s host %s', m_refname, m_host)
+                    # Do we have a matching hash on the server?
+                    if pwhash is None:
+                        logger.info('  No pwhash for %s, skipping', rev)
+                        continue
+                    logger.info('  Matching by hash: %s (%s)', pwhash, logline)
+                    patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, pwhash)
+                    if not patch_ids and msgid:
+                        # Match by message-id, if we have it
+                        logger.info('  Matching by msgid: %s (%s)', msgid, logline)
+                        patch_ids = get_patchwork_patches_by_project_msgid(rm, project_id, msgid)
+                    if not patch_ids:
+                        logger.info('  Regenerating %s using --histogram diff algorithm', rev)
+                        info = git_get_rev_info(repo, rev, algorithm='histogram')
+                        hpwhash = get_patchwork_hash(info)
+                        if hpwhash != pwhash:
+                            logger.info('  Matching by --histogram hash: %s (%s)', hpwhash, logline)
+                            patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, hpwhash)
+                        else:
+                            logger.info('    diff --histogram resulted in the same hash, ignoring')
+                    if not patch_ids:
+                        logger.info('    No match for: %s', logline)
+                        continue
 
-                    patch_id = find_matching_pr(m_host, m_refname, prs)
-                    if patch_id is not None:
-                        logger.info('  Found matching pull request in %s (id: %s)', logline, patch_id)
+                    for patch_id in patch_ids:
+                        logger.info('   Matched: %s', patch_id)
+                        try:
+                            pdata = rm.get_patch(patch_id)
+                        except PatchworkFetchError as ex:
+                            reraise_unless_skippable(ex)
+                            logger.info('   Ignoring unavailable patch: %s', ex)
+                            continue
+                        if not pdata:
+                            logger.info('   Ignoring due to REST error')
+                            continue
+                        if pdata.get('state') not in fromstate:
+                            logger.info('   Ignoring due to state=%s', pdata.get('state'))
+                            continue
                         revs[patch_id] = rev
                         committers[patch_id] = committer
-                    continue
 
-                # Do we have a matching hash on the server?
-                if pwhash is None:
-                    logger.info('  No pwhash for %s, skipping', rev)
-                    continue
-                logger.info('  Matching by hash: %s (%s)', pwhash, logline)
-                patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, pwhash)
-                if not patch_ids and msgid:
-                    # Match by message-id, if we have it
-                    logger.info('  Matching by msgid: %s (%s)', msgid, logline)
-                    patch_ids = get_patchwork_patches_by_project_msgid(rm, project_id, msgid)
-                if not patch_ids:
-                    logger.info('  Regenerating %s using --histogram diff algorithm', rev)
-                    info = git_get_rev_info(repo, rev, algorithm='histogram')
-                    hpwhash = get_patchwork_hash(info)
-                    if hpwhash != pwhash:
-                        logger.info('  Matching by --histogram hash: %s (%s)', hpwhash, logline)
-                        patch_ids = get_patchwork_patches_by_project_hash(rm, project_id, hpwhash)
-                    else:
-                        logger.info('    diff --histogram resulted in the same hash, ignoring')
-                if not patch_ids:
-                    logger.info('    No match for: %s', logline)
-                    continue
-
-                for patch_id in patch_ids:
-                    logger.info('   Matched: %s', patch_id)
+                # Now we iterate through it
+                updated_series: List[Dict[str, Any]] = list()
+                done_patches: Set[int] = set()
+                for patch_id in list(revs.keys()):
+                    logger.info('   Processing: %s', patch_id)
+                    if patch_id in done_patches:
+                        # we've already updated this series
+                        logger.info('    Already applied as part of previous series')
+                        continue
                     try:
                         pdata = rm.get_patch(patch_id)
                     except PatchworkFetchError as ex:
                         reraise_unless_skippable(ex)
-                        logger.info('   Ignoring unavailable patch: %s', ex)
+                        logger.info('    Skipping unavailable patch: %s', ex)
                         continue
-                    if not pdata:
-                        logger.info('   Ignoring due to REST error')
+                    if pdata is None:
+                        logger.info('    Patch not found on %s, skipping', rm.server)
                         continue
-                    if pdata.get('state') not in fromstate:
-                        logger.info('   Ignoring due to state=%s', pdata.get('state'))
+                    serieslist = pdata.get('series', None)
+                    if not serieslist:
+                        # This is probably from the time before patchwork-2 migration.
+                        # We'll just ignore those.
+                        logger.info('    A patch without an associated series? Woah.')
                         continue
-                    revs[patch_id] = rev
-                    committers[patch_id] = committer
 
-            # Now we iterate through it
-            updated_series: List[Dict[str, Any]] = list()
-            done_patches: Set[int] = set()
-            for patch_id in list(revs.keys()):
-                logger.info('   Processing: %s', patch_id)
-                if patch_id in done_patches:
-                    # we've already updated this series
-                    logger.info('    Already applied as part of previous series')
-                    continue
-                try:
-                    pdata = rm.get_patch(patch_id)
-                except PatchworkFetchError as ex:
-                    reraise_unless_skippable(ex)
-                    logger.info('    Skipping unavailable patch: %s', ex)
-                    continue
-                if pdata is None:
-                    logger.info('    Patch not found on %s, skipping', rm.server)
-                    continue
-                serieslist = pdata.get('series', None)
-                if not serieslist:
-                    # This is probably from the time before patchwork-2 migration.
-                    # We'll just ignore those.
-                    logger.info('    A patch without an associated series? Woah.')
-                    continue
+                    for series in serieslist:
+                        series_id = series.get('id')
+                        try:
+                            sdata = rm.get_series(series_id)
+                        except PatchworkFetchError as ex:
+                            # Patchwork 500s on a series it cannot serialize. Letting
+                            # that escape aborts pwrun() before db_save_repo_heads(),
+                            # so the next run re-walks the same revs and dies again.
+                            reraise_unless_skippable(ex)
+                            logger.info('    Skipping unavailable series: %s', ex)
+                            continue
+                        update_queue: List[Tuple[str, int, str, str]] = list()
+                        for spatch in sdata.get('patches', dict()):
+                            spatch_id = spatch.get('id')
 
-                for series in serieslist:
-                    series_id = series.get('id')
-                    try:
-                        sdata = rm.get_series(series_id)
-                    except PatchworkFetchError as ex:
-                        # Patchwork 500s on a series it cannot serialize. Letting
-                        # that escape aborts pwrun() before db_save_repo_heads(),
-                        # so the next run re-walks the same revs and dies again.
-                        reraise_unless_skippable(ex)
-                        logger.info('    Skipping unavailable series: %s', ex)
-                        continue
-                    update_queue: List[Tuple[str, int, str, str]] = list()
-                    for spatch in sdata.get('patches', dict()):
-                        spatch_id = spatch.get('id')
+                            if spatch_id in revs:
+                                rev = revs[spatch_id]
+                                update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
 
-                        if spatch_id in revs:
-                            rev = revs[spatch_id]
-                            update_queue.append((spatch.get('name'), spatch_id, to_state, rev))
+                        if update_queue:
+                            logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
+                            updated_series.append(sdata)
+                            for sname, spatch_id, to_state, rev in update_queue:
+                                count += 1
+                                done_patches.update([spatch_id])
+                                if not DRYRUN:
+                                    logger.info('  Updating: %s', sname)
+                                    try:
+                                        rm.update_patch(spatch_id, state=to_state, commit_ref=rev)
+                                    except PatchworkFetchError as ex:
+                                        reraise_unless_skippable(ex)
+                                        logger.info('  Skipping update for %s: %s', sname, ex)
+                                        continue
+                                else:
+                                    logger.info('  Updating (DRYRUN): %s', sname)
 
-                    if update_queue:
-                        logger.info('Marking series "%s": %s', to_state, sdata.get('name'))
-                        updated_series.append(sdata)
-                        for sname, spatch_id, to_state, rev in update_queue:
-                            count += 1
-                            done_patches.update([spatch_id])
-                            if not DRYRUN:
-                                logger.info('  Updating: %s', sname)
-                                rm.update_patch(spatch_id, state=to_state, commit_ref=rev)
-                            else:
-                                logger.info('  Updating (DRYRUN): %s', sname)
-
-            if len(updated_series) and hsettings.get('send_summary', False):
-                send_summary(updated_series, committers, to_state, refname, revs, pname, rsettings, hsettings)
-            if len(updated_series) and hsettings.get('notify_submitter', False):
-                notify_submitters(updated_series, committers, refname, revs, pname, rsettings, hsettings)
+                if len(updated_series) and hsettings.get('send_summary', False):
+                    send_summary(updated_series, committers, to_state, refname, revs, pname, rsettings, hsettings)
+                if len(updated_series) and hsettings.get('notify_submitter', False):
+                    notify_submitters(updated_series, committers, refname, revs, pname, rsettings, hsettings)
+            except CircuitOpenError as ex:
+                logger.warning('  %s; holding back head for %s this run', ex, refname)
+                failed_refs.add(refname)
+                continue
 
         if count:
             logger.info('Updated %d patches on %s', count, rm.server)
@@ -1656,7 +1735,22 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             logger.info('No patches updated on %s', rm.server)
 
     if not DRYRUN:
-        db_save_repo_heads(c, git_heads)
+        heads_to_save: List[Tuple[str, str]] = list()
+        for refname, commit_id in git_heads:
+            old_commit_id = db_heads_by_ref.get(refname) if refname in failed_refs else None
+            if old_commit_id is not None:
+                # The circuit breaker interrupted this ref before it finished,
+                # so its head stays put -- the next run's plain git diff picks
+                # up the whole gap (whatever we already applied here included,
+                # since we have no per-commit record of that) rather than us
+                # trying to enumerate what's left, which for a bulk push can
+                # be hundreds of revisions.
+                logger.info('Holding back head for %s at %s (would have advanced to %s)',
+                            refname, old_commit_id, commit_id)
+                heads_to_save.append((refname, old_commit_id))
+            else:
+                heads_to_save.append((refname, commit_id))
+        db_save_repo_heads(c, heads_to_save)
         dbconn.commit()
 
 
