@@ -1493,16 +1493,20 @@ def housekeeping(pname: str) -> Dict[str, int]:
         if not report:
             return hk_stats
 
-        summary_lines = []
-        if autosupersede_elapsed is not None:
-            summary_lines.append('Checked %d series in %.2f seconds.' %
-                                 (hk_stats['series_checked'], autosupersede_elapsed))
-
         total_patches = rm.get_list_count(rm.patches_url, [('project', project_id)])
         total_series = rm.get_list_count(rm.series_url, [('project', project_id)])
-        if total_patches is not None and total_series is not None:
-            summary_lines.append('This project currently has %d patches in %d series.' %
-                                 (total_patches, total_series))
+
+        summary_lines = []
+        if autosupersede_elapsed is not None:
+            if total_series is not None:
+                summary_lines.append('Checked %d of %d series in %.2f seconds.' %
+                                     (hk_stats['series_checked'], total_series, autosupersede_elapsed))
+            else:
+                summary_lines.append('Checked %d series in %.2f seconds.' %
+                                     (hk_stats['series_checked'], autosupersede_elapsed))
+
+        if total_patches is not None:
+            summary_lines.append('This project currently has %d patches.' % total_patches)
 
         if summary_lines:
             report += '\n'.join(summary_lines) + '\n\n'

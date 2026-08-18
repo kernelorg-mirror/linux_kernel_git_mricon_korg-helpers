@@ -1254,9 +1254,9 @@ class TestHousekeepingReportStats:
                 hk_stats = pwbot.housekeeping('test-project')
 
         assert hk_stats['series_checked'] == 1
-        match = re.search(r'Checked 1 series in \d+\.\d{2} seconds\.', caplog.text)
+        match = re.search(r'Checked 1 of 45 series in \d+\.\d{2} seconds\.', caplog.text)
         assert match is not None
-        totals_pos = caplog.text.index('This project currently has 123 patches in 45 series.')
+        totals_pos = caplog.text.index('This project currently has 123 patches.')
         # The summary belongs at the bottom, after the per-series detail and
         # before the signature, not up at the top of the message.
         assert caplog.text.index('Latest series:') < match.start() < totals_pos
@@ -1281,6 +1281,9 @@ class TestHousekeepingReportStats:
                 pwbot.housekeeping('test-project')
 
         assert 'currently has' not in caplog.text
+        # Falls back to the plain wording when the total isn't available.
+        assert re.search(r'Checked 1 series in \d+\.\d{2} seconds\.', caplog.text) is not None
+        assert ' of ' not in caplog.text
 
 
 class TestGetProjectSeriesSince:
