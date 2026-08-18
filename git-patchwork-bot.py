@@ -35,6 +35,7 @@ from email.utils import formatdate, getaddresses, make_msgid
 from fcntl import LOCK_EX, LOCK_NB, lockf
 from string import Template
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import yaml as pyyaml
@@ -44,13 +45,14 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
-BOT_VERSION: str = '2026081801'
+BOT_VERSION: str = '2026081802'
 DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
     r'^\s*Link:\s+\S+://patch\.msgid\.link/([^@]+@[^@\s/]+)$', flags=re.M | re.I
 )
 HUNK_RE: re.Pattern[str] = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
+LINK_HEADER_RE: re.Pattern[str] = re.compile(r'<([^>]+)>;\s*rel="(\w+)"')
 FILENAME_RE: re.Pattern[str] = re.compile(r'^(---|\+\+\+) (\S+)')
 REST_PER_PAGE: int = 100
 
@@ -350,6 +352,39 @@ class Restmaker:
         except requests.exceptions.RequestException as ex:
             logger.info('REST error: %s', ex)
             return list()
+
+    def get_list_count(self, url: str, params: List[Tuple[str, Any]]) -> Optional[int]:
+        """Get the total number of items matching params, cheaply.
+
+        Asks for a single item per page and reads the "last" page number off
+        the Link response header, which patchwork sets to the total item
+        count in that case. This is a single lightweight request instead of
+        paging through the whole result set just to count it. Returns None
+        if the count could not be determined (e.g. a REST error).
+        """
+        _params = list(params) + [('per_page', 1), ('page', 1)]
+        try:
+            rsp = self.session.get(url, params=_params, stream=False)
+            rsp.raise_for_status()
+        except requests.exceptions.RequestException as ex:
+            logger.info('REST error getting list count: %s', ex)
+            return None
+
+        for linkurl, rel in LINK_HEADER_RE.findall(rsp.headers.get('Link', '')):
+            if rel == 'last':
+                qs = parse_qs(urlparse(linkurl).query)
+                page = qs.get('page')
+                if page:
+                    try:
+                        return int(page[0])
+                    except ValueError:
+                        return None
+
+        # No Link header means there's just the one page we already have.
+        try:
+            return len(rsp.json())
+        except ValueError:
+            return None
 
     def update_patch(self, patch_id: int, state: Optional[str] = None, archived: bool = False,
                      commit_ref: Optional[str] = None) -> List[Tuple[str, Union[str, bool]]]:
@@ -1248,7 +1283,7 @@ def get_project_series_since(rm: Restmaker, project_id: int, since_iso: str) -> 
 
 
 def housekeeping(pname: str) -> Dict[str, int]:
-    hk_stats = {'superseded': 0, 'archived': 0}
+    hk_stats = {'superseded': 0, 'archived': 0, 'series_checked': 0}
 
     project, rm, pconfig = project_by_name(pname)
     if 'housekeeping' not in pconfig:
@@ -1313,6 +1348,8 @@ def housekeeping(pname: str) -> Dict[str, int]:
                 'rev': ver,
             }
             logger.debug('Processed id=%s (%s)', s_id, s_name)
+
+        hk_stats['series_checked'] = len(series)
 
         for key, items in series.items():
             if len(items) < 2:
@@ -1450,6 +1487,19 @@ def housekeeping(pname: str) -> Dict[str, int]:
 
         if not report:
             return hk_stats
+
+        summary_lines = []
+        if hk_stats['series_checked']:
+            summary_lines.append('Checked %d series for supersession.' % hk_stats['series_checked'])
+
+        total_patches = rm.get_list_count(rm.patches_url, [('project', project_id)])
+        total_series = rm.get_list_count(rm.series_url, [('project', project_id)])
+        if total_patches is not None and total_series is not None:
+            summary_lines.append('This project currently has %d patches in %d series.' %
+                                 (total_patches, total_series))
+
+        if summary_lines:
+            report = '\n'.join(summary_lines) + '\n\n' + report
 
         if 'summaryto' not in pconfig:
             logger.info('Report follows')
@@ -2022,7 +2072,7 @@ if __name__ == '__main__':
 
     if cmdargs.housekeeping or cmdargs.pwhash:
         logger.info('=== starting housekeeping run (bot version %s) ===', BOT_VERSION)
-        _hk_totals = {'superseded': 0, 'archived': 0}
+        _hk_totals = {'superseded': 0, 'archived': 0, 'series_checked': 0}
         _hk_projects = 0
         for _pserver, _sconfig in CONFIG['patchworks'].items():
             for _pname in _sconfig['projects']:
@@ -2030,9 +2080,10 @@ if __name__ == '__main__':
                 _hk_projects += 1
                 for _key in _hk_totals:
                     _hk_totals[_key] += _hk_stats[_key]
-        logger.info('=== finished housekeeping run: %d projects processed, %d series superseded, '
-                    '%d patches archived ===',
-                    _hk_projects, _hk_totals['superseded'], _hk_totals['archived'])
+        logger.info('=== finished housekeeping run: %d projects processed, %d series checked, '
+                    '%d series superseded, %d patches archived ===',
+                    _hk_projects, _hk_totals['series_checked'], _hk_totals['superseded'],
+                    _hk_totals['archived'])
     else:
         if not cmdargs.reposdir:
             logger.critical('-r is required for this mode')

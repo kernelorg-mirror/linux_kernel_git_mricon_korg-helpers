@@ -1146,6 +1146,137 @@ class TestGetListPage:
         assert status is None
 
 
+class TestGetListCount:
+    """Tests for Restmaker.get_list_count(), which reads the total item
+    count off the Link response header instead of paging through results."""
+
+    def _rm(self):
+        # Bypass __init__, which needs a full CONFIG; we only exercise session.
+        rm = pwbot.Restmaker.__new__(pwbot.Restmaker)
+        rm.session = MagicMock()
+        return rm
+
+    def test_reads_last_page_from_link_header(self):
+        rm = self._rm()
+        resp = MagicMock(status_code=200)
+        resp.headers = {
+            'Link': ('<http://x/series/?page=2&per_page=1>; rel="next", '
+                     '<http://x/series/?page=1&per_page=1>; rel="first", '
+                     '<http://x/series/?page=6309&per_page=1>; rel="last"')
+        }
+        resp.json.return_value = [{'id': 1}]
+        rm.session.get.return_value = resp
+        count = rm.get_list_count('http://x/series/', [('project', 2)])
+        assert count == 6309
+
+    def test_no_link_header_falls_back_to_body_length(self):
+        rm = self._rm()
+        resp = MagicMock(status_code=200)
+        resp.headers = {}
+        resp.json.return_value = []
+        rm.session.get.return_value = resp
+        count = rm.get_list_count('http://x/series/', [('project', 2)])
+        assert count == 0
+
+    def test_request_error_returns_none(self):
+        rm = self._rm()
+        rm.session.get.side_effect = pwbot.requests.exceptions.ConnectionError()
+        count = rm.get_list_count('http://x/series/', [('project', 2)])
+        assert count is None
+
+    def test_http_error_returns_none(self):
+        rm = self._rm()
+        resp = MagicMock(status_code=500)
+        resp.raise_for_status.side_effect = pwbot.requests.exceptions.HTTPError(response=resp)
+        rm.session.get.return_value = resp
+        count = rm.get_list_count('http://x/series/', [('project', 2)])
+        assert count is None
+
+
+class TestHousekeepingReportStats:
+    """Tests that the maintainer summary report includes how many series
+    were checked plus the project's overall patch/series totals.
+
+    autoarchive must also be configured, since housekeeping() only builds
+    and sends the report from inside that branch.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_globals(self):
+        orig_dryrun = pwbot.DRYRUN
+        orig_nomail = pwbot.NOMAIL
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        pwbot.DRYRUN = False
+        pwbot.NOMAIL = True
+        pwbot.CONFIG = {'templates': {'signature': 'sig'}}
+        yield
+        pwbot.DRYRUN = orig_dryrun
+        pwbot.NOMAIL = orig_nomail
+        if orig_config is not None:
+            pwbot.CONFIG = orig_config
+
+    def _series_entry(self, s_id, version, patch_id, iso_date):
+        return {
+            'id': s_id,
+            'name': 'some feature',
+            'version': version,
+            'date': iso_date,
+            'received_all': True,
+            'submitter': {'id': 1},
+            'patches': [{'id': patch_id}],
+        }
+
+    def _rm(self):
+        rm = MagicMock()
+        rm.patches_url = 'http://x/patches/'
+        rm.series_url = 'http://x/series/'
+        rm.get_patches_list.return_value = []  # nothing to autoarchive
+        rm.get_list_count.side_effect = lambda url, params: (
+            123 if url == rm.patches_url else 45
+        )
+        return rm
+
+    def test_report_includes_series_checked_and_totals(self, caplog):
+        rm = self._rm()
+        rm.get_patch.side_effect = lambda pid: {'id': pid, 'name': 'a patch', 'state': 'new'}
+        hconfig = {'autosupersede': 90, 'autoarchive': 180}
+        pconfig = {'housekeeping': hconfig, 'from': 'project@example.com',
+                   'summaryto': 'maintainer@example.com'}
+        project = {'id': 7}
+
+        with patch.object(pwbot, 'project_by_name', return_value=(project, rm, pconfig)), \
+             patch.object(pwbot, 'get_project_series_since', return_value=[
+                 self._series_entry(1, 1, 10, '2026-01-01T00:00:00'),
+                 self._series_entry(2, 2, 20, '2026-01-02T00:00:00'),
+             ]):
+            with caplog.at_level(logging.INFO):
+                hk_stats = pwbot.housekeeping('test-project')
+
+        assert hk_stats['series_checked'] == 1
+        assert 'Checked 1 series for supersession.' in caplog.text
+        assert 'This project currently has 123 patches in 45 series.' in caplog.text
+
+    def test_no_totals_available_omits_that_line(self, caplog):
+        rm = self._rm()
+        rm.get_list_count.side_effect = None
+        rm.get_list_count.return_value = None
+        rm.get_patch.side_effect = lambda pid: {'id': pid, 'name': 'a patch', 'state': 'new'}
+        hconfig = {'autosupersede': 90, 'autoarchive': 180}
+        pconfig = {'housekeeping': hconfig, 'from': 'project@example.com',
+                   'summaryto': 'maintainer@example.com'}
+        project = {'id': 7}
+
+        with patch.object(pwbot, 'project_by_name', return_value=(project, rm, pconfig)), \
+             patch.object(pwbot, 'get_project_series_since', return_value=[
+                 self._series_entry(1, 1, 10, '2026-01-01T00:00:00'),
+                 self._series_entry(2, 2, 20, '2026-01-02T00:00:00'),
+             ]):
+            with caplog.at_level(logging.INFO):
+                pwbot.housekeeping('test-project')
+
+        assert 'currently has' not in caplog.text
+
+
 class TestGetProjectSeriesSince:
     """Tests for get_project_series_since() resilient pagination.
 
