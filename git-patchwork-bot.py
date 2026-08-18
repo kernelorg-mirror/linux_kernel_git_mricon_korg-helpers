@@ -44,6 +44,7 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
+BOT_VERSION: str = '2026081801'
 DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
@@ -552,8 +553,9 @@ def db_record_pending_op(c: sqlite3.Cursor, pname: str, refname: str,
         ''', (pname, refname, rev, logline, committer, pwhash, msgid, stage, note, first_failed))
 
 
-def db_clear_pending_op(c: sqlite3.Cursor, pname: str, refname: str, rev: str) -> None:
+def db_clear_pending_op(c: sqlite3.Cursor, pname: str, refname: str, rev: str) -> bool:
     c.execute('DELETE FROM pending_ops WHERE pname=? AND refname=? AND rev=?', (pname, refname, rev))
+    return c.rowcount > 0
 
 
 def db_get_pending_ops(c: sqlite3.Cursor,
@@ -1245,10 +1247,12 @@ def get_project_series_since(rm: Restmaker, project_id: int, since_iso: str) -> 
     return collected
 
 
-def housekeeping(pname: str) -> None:
+def housekeeping(pname: str) -> Dict[str, int]:
+    hk_stats = {'superseded': 0, 'archived': 0}
+
     project, rm, pconfig = project_by_name(pname)
     if 'housekeeping' not in pconfig:
-        return
+        return hk_stats
 
     project_id = project['id']
 
@@ -1361,6 +1365,7 @@ def housekeeping(pname: str) -> None:
                             logger.info('    Patch already set to superseded, skipping')
                             continue
                         sreport.append('    %s' % patch_title)
+                        hk_stats['superseded'] += 1
                         if not DRYRUN:
                             rm.update_patch(patch_id, state='superseded')
                         else:
@@ -1439,11 +1444,12 @@ def housekeeping(pname: str) -> None:
             else:
                 logger.info('  Dryrun: Not actually archiving')
 
+        hk_stats['archived'] = archived
         if archived:
             logger.info('Archived %d total patches', archived)
 
         if not report:
-            return
+            return hk_stats
 
         if 'summaryto' not in pconfig:
             logger.info('Report follows')
@@ -1451,7 +1457,7 @@ def housekeeping(pname: str) -> None:
             logger.info(report)
             logger.info('------------------------------')
             logger.debug('summaryto not set, not sending report')
-            return
+            return hk_stats
 
         report += '\n-- \n' + CONFIG['templates']['signature']
 
@@ -1485,9 +1491,18 @@ def housekeeping(pname: str) -> None:
             logger.info(msg.as_string())
             logger.info('------------------------------')
 
+    return hk_stats
 
-def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
+
+def pwrun(repo: str, rsettings: Dict[str, Any]) -> Dict[str, int]:
     global _rev_cache
+
+    stats: Dict[str, int] = {
+        'patches_updated': 0,
+        'refs_held_back': 0,
+        'pending_recorded': 0,
+        'pending_cleared': 0,
+    }
 
     branch = rsettings.get('branch', '--heads')
     if not isinstance(branch, str):
@@ -1537,7 +1552,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         db_save_repo_heads(c, initial_git_heads)
         # Exit early
         dbconn.commit()
-        return
+        return stats
 
     db_heads = db_get_repo_heads(c)
     # git_get_new_revs() mutates db_heads (drops rows for refs gone from
@@ -1565,7 +1580,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             db_save_repo_heads(c, git_heads)
             dbconn.commit()
         logger.debug('No new revs in %s', repo)
-        return
+        return stats
 
     logger.info('Processing: %s', repo)
 
@@ -1803,8 +1818,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
                         if hp_rev in revs_last_stage:
                             stage, note = revs_last_stage[hp_rev]
                             db_record_pending_op(c, pname, refname, hp, stage, note)
-                        else:
-                            db_clear_pending_op(c, pname, refname, hp_rev)
+                            stats['pending_recorded'] += 1
+                        elif db_clear_pending_op(c, pname, refname, hp_rev):
+                            stats['pending_cleared'] += 1
             except CircuitOpenError as ex:
                 logger.warning('  %s; holding back head for %s this run', ex, refname)
                 failed_refs.add(refname)
@@ -1814,6 +1830,9 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
             logger.info('Updated %d patches on %s', count, rm.server)
         else:
             logger.info('No patches updated on %s', rm.server)
+
+    stats['patches_updated'] = count
+    stats['refs_held_back'] = len(failed_refs)
 
     if not DRYRUN:
         heads_to_save: List[Tuple[str, str]] = list()
@@ -1834,8 +1853,12 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> None:
         db_save_repo_heads(c, heads_to_save)
         dbconn.commit()
 
+    return stats
+
 
 def check_repos() -> None:
+    logger.info('=== starting regular run (bot version %s) ===', BOT_VERSION)
+
     # Use a global lock to make sure only a single process is running
     try:
         lockfh = open(os.path.join(CACHEDIR, 'patchwork-bot.global.lock'), 'w')
@@ -1848,6 +1871,13 @@ def check_repos() -> None:
         logger.critical('reposdir must be a string')
         sys.exit(1)
 
+    repos_processed = 0
+    totals: Dict[str, int] = {
+        'patches_updated': 0,
+        'refs_held_back': 0,
+        'pending_recorded': 0,
+        'pending_cleared': 0,
+    }
     for repo in CONFIG.get('repos', list()):
         fullpath = os.path.join(cmdargs.reposdir.rstrip('/'), repo.lstrip('/'))
         if not os.path.exists(fullpath):
@@ -1857,7 +1887,15 @@ def check_repos() -> None:
         if not os.path.isdir(fullpath) and not settings.get('branch'):
             logger.info('Worktree must specify "branch" setting: %s', repo)
             continue
-        pwrun(fullpath, settings)
+        repo_stats = pwrun(fullpath, settings)
+        repos_processed += 1
+        for key in totals:
+            totals[key] += repo_stats[key]
+
+    logger.info('=== finished regular run: %d repos processed, %d patches updated, '
+                '%d refs held back, %d pending ops recorded, %d pending ops cleared ===',
+                repos_processed, totals['patches_updated'], totals['refs_held_back'],
+                totals['pending_recorded'], totals['pending_cleared'])
 
 
 def pwhash_differ() -> None:
@@ -1983,9 +2021,18 @@ if __name__ == '__main__':
         sys.exit(0)
 
     if cmdargs.housekeeping or cmdargs.pwhash:
+        logger.info('=== starting housekeeping run (bot version %s) ===', BOT_VERSION)
+        _hk_totals = {'superseded': 0, 'archived': 0}
+        _hk_projects = 0
         for _pserver, _sconfig in CONFIG['patchworks'].items():
             for _pname in _sconfig['projects']:
-                housekeeping(_pname)
+                _hk_stats = housekeeping(_pname)
+                _hk_projects += 1
+                for _key in _hk_totals:
+                    _hk_totals[_key] += _hk_stats[_key]
+        logger.info('=== finished housekeeping run: %d projects processed, %d series superseded, '
+                    '%d patches archived ===',
+                    _hk_projects, _hk_totals['superseded'], _hk_totals['archived'])
     else:
         if not cmdargs.reposdir:
             logger.critical('-r is required for this mode')

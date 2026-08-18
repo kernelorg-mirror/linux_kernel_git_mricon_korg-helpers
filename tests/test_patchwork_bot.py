@@ -1,7 +1,9 @@
 """Tests for git-patchwork-bot.py."""
 
 import datetime
+import logging
 import sqlite3
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1787,3 +1789,167 @@ class TestPwrunPendingOpsLedger:
 
         assert self._read_heads(tmp_path) == dict(self.OLD_HEADS)
         assert self._read_pending(tmp_path) == {}
+
+
+class TestPwrunReturnsStats:
+    """pwrun() now returns a small stats dict instead of None, so
+    check_repos() can log a per-run summary. Pin the shape and the values
+    for a run that both updates a patch and hits an isolated failure.
+    """
+
+    OLD_HEADS = [('refs/heads/main', 'aaaaaaa')]
+    NEW_HEADS = [('refs/heads/main', 'bbbbbbb')]
+
+    def _seed_db(self, repo_dir):
+        conn = sqlite3.connect(str(repo_dir / 'pw.db'))
+        c = conn.cursor()
+        pwbot.db_init_pw_sqlite_db(c)
+        pwbot.db_save_repo_heads(c, self.OLD_HEADS)
+        conn.commit()
+        conn.close()
+
+    def test_fresh_db_returns_zeroed_stats(self, tmp_path):
+        orig_dryrun = pwbot.DRYRUN
+        orig_cmdargs = getattr(pwbot, 'cmdargs', None)
+        pwbot.DRYRUN = False
+        pwbot.cmdargs = SimpleNamespace(ancestors=None)
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.NEW_HEADS):
+                stats = pwbot.pwrun(str(tmp_path), {'projects': {}})
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+            pwbot.cmdargs = orig_cmdargs
+        assert stats == {
+            'patches_updated': 0,
+            'refs_held_back': 0,
+            'pending_recorded': 0,
+            'pending_cleared': 0,
+        }
+
+    def test_no_new_revs_returns_zeroed_stats(self, tmp_path):
+        self._seed_db(tmp_path)
+        orig_dryrun = pwbot.DRYRUN
+        pwbot.DRYRUN = False
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.OLD_HEADS), \
+                 patch.object(pwbot, 'git_get_new_revs', return_value={}):
+                stats = pwbot.pwrun(str(tmp_path), {'projects': {}})
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+        assert stats == {
+            'patches_updated': 0,
+            'refs_held_back': 0,
+            'pending_recorded': 0,
+            'pending_cleared': 0,
+        }
+
+    def test_isolated_failure_and_success_are_both_counted(self, tmp_path):
+        self._seed_db(tmp_path)
+        rev_ok, rev_fail = 'aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb'
+        committer = 'Dev <dev@example.com>'
+        newrevs = {'refs/heads/main': [
+            (rev_ok, 'A good patch', committer),
+            (rev_fail, 'A flaky patch', committer),
+        ]}
+        rev_cache = {
+            rev_ok: (rev_ok, 'A good patch', committer, 'hash-ok', None),
+            rev_fail: (rev_fail, 'A flaky patch', committer, 'hash-fail', None),
+        }
+        patch_id_by_hash = {'hash-ok': 701, 'hash-fail': 702}
+        series_id_by_patch = {701: 8701, 702: 8702}
+
+        rm = MagicMock()
+        rm.server = 'https://patchwork.example.com'
+        rm.circuit_open = False
+        rm.get_patch.side_effect = lambda patch_id: {
+            'id': patch_id, 'state': 'new', 'series': [{'id': series_id_by_patch[patch_id]}],
+        }
+
+        def get_series(series_id):
+            if series_id == 8702:
+                raise pwbot.PatchworkFetchError('series', series_id, 500)
+            return {'id': series_id, 'name': 'A good series', 'patches': [{'id': 701, 'name': 'p'}]}
+        rm.get_series.side_effect = get_series
+
+        def get_hash(_rm, _project_id, pwhash):
+            return [patch_id_by_hash[pwhash]]
+
+        orig_dryrun = pwbot.DRYRUN
+        pwbot.DRYRUN = False
+        try:
+            with patch.object(pwbot, 'git_get_repo_heads', return_value=self.NEW_HEADS), \
+                 patch.object(pwbot, 'git_get_new_revs', return_value=newrevs), \
+                 patch.object(pwbot, '_rev_cache', rev_cache), \
+                 patch.object(pwbot, 'project_by_name', return_value=({'id': 7}, rm, dict())), \
+                 patch.object(pwbot, 'get_patchwork_patches_by_project_hash', side_effect=get_hash):
+                rsettings = {'projects': {'testproj': {
+                    'main': {'tostate': 'Accepted', 'fromstate': ['new']},
+                }}}
+                stats = pwbot.pwrun(str(tmp_path), rsettings)
+        finally:
+            pwbot.DRYRUN = orig_dryrun
+
+        # rev_ok never had a ledger row, so clearing it is a no-op that
+        # does not count -- only the flaky rev leaves a mark this run.
+        assert stats == {
+            'patches_updated': 1,
+            'refs_held_back': 0,
+            'pending_recorded': 1,
+            'pending_cleared': 0,
+        }
+
+
+class TestCheckReposLogging:
+    """check_repos() must announce its start/end and a bot version, and
+    aggregate per-repo stats into a run summary -- that summary is the
+    thing to grep for when checking whether a run happened and what it did.
+    """
+
+    def test_start_and_finish_lines_include_bot_version_and_totals(self, tmp_path, caplog):
+        orig_cmdargs = getattr(pwbot, 'cmdargs', None)
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        orig_cachedir = pwbot.CACHEDIR
+        pwbot.cmdargs = SimpleNamespace(reposdir=str(tmp_path))
+        pwbot.CONFIG = {'repos': {}}
+        pwbot.CACHEDIR = str(tmp_path)
+        caplog.set_level(logging.INFO, logger='gitpwcron')
+        try:
+            pwbot.check_repos()
+        finally:
+            pwbot.cmdargs = orig_cmdargs
+            pwbot.CONFIG = orig_config
+            pwbot.CACHEDIR = orig_cachedir
+
+        assert f'starting regular run (bot version {pwbot.BOT_VERSION})' in caplog.text
+        assert 'finished regular run: 0 repos processed, 0 patches updated, ' \
+               '0 refs held back, 0 pending ops recorded, 0 pending ops cleared' in caplog.text
+
+    def test_totals_aggregate_across_repos(self, tmp_path, caplog):
+        orig_cmdargs = getattr(pwbot, 'cmdargs', None)
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        orig_cachedir = pwbot.CACHEDIR
+        repo_a = tmp_path / 'repo-a'
+        repo_b = tmp_path / 'repo-b'
+        repo_a.mkdir()
+        repo_b.mkdir()
+        pwbot.cmdargs = SimpleNamespace(reposdir=str(tmp_path))
+        pwbot.CONFIG = {'repos': {'repo-a': {}, 'repo-b': {}}}
+        pwbot.CACHEDIR = str(tmp_path)
+        caplog.set_level(logging.INFO, logger='gitpwcron')
+
+        stats_by_repo = {
+            str(repo_a): {'patches_updated': 2, 'refs_held_back': 1,
+                          'pending_recorded': 1, 'pending_cleared': 0},
+            str(repo_b): {'patches_updated': 3, 'refs_held_back': 0,
+                          'pending_recorded': 0, 'pending_cleared': 2},
+        }
+        try:
+            with patch.object(pwbot, 'pwrun', side_effect=lambda repo, _settings: stats_by_repo[repo]):
+                pwbot.check_repos()
+        finally:
+            pwbot.cmdargs = orig_cmdargs
+            pwbot.CONFIG = orig_config
+            pwbot.CACHEDIR = orig_cachedir
+
+        assert 'finished regular run: 2 repos processed, 5 patches updated, ' \
+               '1 refs held back, 1 pending ops recorded, 2 pending ops cleared' in caplog.text
