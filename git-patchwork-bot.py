@@ -26,6 +26,7 @@ import smtplib
 import sqlite3
 import subprocess
 import sys
+import time
 
 # Send all email 8-bit, this is not 1999
 from email import charset
@@ -1295,8 +1296,10 @@ def housekeeping(pname: str) -> Dict[str, int]:
     hconfig = pconfig['housekeeping']
     cutoffdays = 90
     report = ''
+    autosupersede_elapsed: Optional[float] = None
 
     if 'autosupersede' in hconfig:
+        autosupersede_start = time.monotonic()
         logger.info('Getting series from %s/%s', rm.server, pname)
         try:
             cutoffdays = int(hconfig['autosupersede'])
@@ -1414,6 +1417,8 @@ def housekeeping(pname: str) -> Dict[str, int]:
                 report += '\n'.join(sreport)
                 report += '\n\n'
 
+        autosupersede_elapsed = time.monotonic() - autosupersede_start
+
     if 'autoarchive' in hconfig:
         logger.info('Auto-archiving old patches in %s/%s', rm.server, pname)
         try:
@@ -1489,8 +1494,9 @@ def housekeeping(pname: str) -> Dict[str, int]:
             return hk_stats
 
         summary_lines = []
-        if hk_stats['series_checked']:
-            summary_lines.append('Checked %d series for supersession.' % hk_stats['series_checked'])
+        if autosupersede_elapsed is not None:
+            summary_lines.append('Checked %d series in %.2f seconds.' %
+                                 (hk_stats['series_checked'], autosupersede_elapsed))
 
         total_patches = rm.get_list_count(rm.patches_url, [('project', project_id)])
         total_series = rm.get_list_count(rm.series_url, [('project', project_id)])
@@ -1499,7 +1505,7 @@ def housekeeping(pname: str) -> Dict[str, int]:
                                  (total_patches, total_series))
 
         if summary_lines:
-            report = '\n'.join(summary_lines) + '\n\n' + report
+            report += '\n'.join(summary_lines) + '\n\n'
 
         if 'summaryto' not in pconfig:
             logger.info('Report follows')

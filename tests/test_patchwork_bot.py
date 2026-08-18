@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+import re
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1253,8 +1254,13 @@ class TestHousekeepingReportStats:
                 hk_stats = pwbot.housekeeping('test-project')
 
         assert hk_stats['series_checked'] == 1
-        assert 'Checked 1 series for supersession.' in caplog.text
-        assert 'This project currently has 123 patches in 45 series.' in caplog.text
+        match = re.search(r'Checked 1 series in \d+\.\d{2} seconds\.', caplog.text)
+        assert match is not None
+        totals_pos = caplog.text.index('This project currently has 123 patches in 45 series.')
+        # The summary belongs at the bottom, after the per-series detail and
+        # before the signature, not up at the top of the message.
+        assert caplog.text.index('Latest series:') < match.start() < totals_pos
+        assert totals_pos < caplog.text.index('sig')
 
     def test_no_totals_available_omits_that_line(self, caplog):
         rm = self._rm()
