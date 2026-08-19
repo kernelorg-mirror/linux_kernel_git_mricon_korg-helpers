@@ -1256,11 +1256,15 @@ class TestHousekeepingReportStats:
         assert hk_stats['series_checked'] == 1
         match = re.search(r'Checked 1 of 45 series in \d+\.\d{2} seconds\.', caplog.text)
         assert match is not None
-        totals_pos = caplog.text.index('This project currently has 123 patches.')
+        totals_pos = caplog.text.index('This project currently has 123 active patches.')
         # The summary belongs at the bottom, after the per-series detail and
         # before the signature, not up at the top of the message.
         assert caplog.text.index('Latest series:') < match.start() < totals_pos
         assert totals_pos < caplog.text.index('sig')
+
+        patches_call = next(c for c in rm.get_list_count.call_args_list
+                            if c.args[0] == rm.patches_url)
+        assert dict(patches_call.args[1])['archived'] == 'false'
 
     def test_no_totals_available_omits_that_line(self, caplog):
         rm = self._rm()
