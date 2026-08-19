@@ -1196,7 +1196,11 @@ class TestGetListCount:
 
 class TestHousekeepingReportStats:
     """Tests that the maintainer summary report includes how many series
-    were checked plus the project's overall patch/series totals.
+    were checked, how long that took, and the project's active patch total.
+
+    There is no active-series total: patchwork's Series model has no
+    archived (or similar) field to filter on, unlike Patch, so a series
+    total would just be the all-time count and isn't reported here.
 
     autoarchive must also be configured, since housekeeping() only builds
     and sends the report from inside that branch.
@@ -1232,12 +1236,10 @@ class TestHousekeepingReportStats:
         rm.patches_url = 'http://x/patches/'
         rm.series_url = 'http://x/series/'
         rm.get_patches_list.return_value = []  # nothing to autoarchive
-        rm.get_list_count.side_effect = lambda url, params: (
-            123 if url == rm.patches_url else 45
-        )
+        rm.get_list_count.return_value = 123
         return rm
 
-    def test_report_includes_series_checked_and_totals(self, caplog):
+    def test_report_includes_series_checked_and_active_patches(self, caplog):
         rm = self._rm()
         rm.get_patch.side_effect = lambda pid: {'id': pid, 'name': 'a patch', 'state': 'new'}
         hconfig = {'autosupersede': 90, 'autoarchive': 180}
@@ -1254,7 +1256,7 @@ class TestHousekeepingReportStats:
                 hk_stats = pwbot.housekeeping('test-project')
 
         assert hk_stats['series_checked'] == 1
-        match = re.search(r'Checked 1 of 45 series in \d+\.\d{2} seconds\.', caplog.text)
+        match = re.search(r'Checked 1 series in \d+\.\d{2} seconds\.', caplog.text)
         assert match is not None
         totals_pos = caplog.text.index('This project currently has 123 active patches.')
         # The summary belongs at the bottom, after the per-series detail and
@@ -1265,10 +1267,12 @@ class TestHousekeepingReportStats:
         patches_call = next(c for c in rm.get_list_count.call_args_list
                             if c.args[0] == rm.patches_url)
         assert dict(patches_call.args[1])['archived'] == 'false'
+        # No series-total query: patchwork has no way to filter series by
+        # an active/archived state, so any total would be misleading.
+        assert not any(c.args[0] == rm.series_url for c in rm.get_list_count.call_args_list)
 
-    def test_no_totals_available_omits_that_line(self, caplog):
+    def test_no_patch_total_omits_that_line(self, caplog):
         rm = self._rm()
-        rm.get_list_count.side_effect = None
         rm.get_list_count.return_value = None
         rm.get_patch.side_effect = lambda pid: {'id': pid, 'name': 'a patch', 'state': 'new'}
         hconfig = {'autosupersede': 90, 'autoarchive': 180}
@@ -1285,9 +1289,7 @@ class TestHousekeepingReportStats:
                 pwbot.housekeeping('test-project')
 
         assert 'currently has' not in caplog.text
-        # Falls back to the plain wording when the total isn't available.
         assert re.search(r'Checked 1 series in \d+\.\d{2} seconds\.', caplog.text) is not None
-        assert ' of ' not in caplog.text
 
 
 class TestGetProjectSeriesSince:
