@@ -645,7 +645,7 @@ class TestWriteIndexFile:
         (tmp_path / 'v6.x').mkdir()
         (tmp_path / 'README').write_text('hi')
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README'], ['v6.x'],
-                                   self._status(README=2), 'sha256')
+                                   self._status(README=2), 'sha256', [])
         names = [line.split('"')[1] for line in
                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
         assert names == ['../', 'v6.x/', 'README']
@@ -654,7 +654,7 @@ class TestWriteIndexFile:
         # sign_tree hands us files in sums-file order; we must not reshuffle.
         files = ['linux-6.2.tar.xz', 'linux-6.10.tar.xz']
         dirsigner.write_index_file(str(tmp_path), '/pub/', files, [],
-                                   self._status(**{f: 1 for f in files}), 'sha256')
+                                   self._status(**{f: 1 for f in files}), 'sha256', [])
         names = [line.split('"')[1] for line in
                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
         assert names == ['../'] + files
@@ -662,33 +662,33 @@ class TestWriteIndexFile:
     def test_lists_the_sums_file_last(self, tmp_path: Path) -> None:
         (tmp_path / 'sha256sums.asc').write_text('signed stuff')
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README'], [],
-                                   self._status(README=2), 'sha256')
+                                   self._status(README=2), 'sha256', [])
         names = [line.split('"')[1] for line in
                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
         assert names == ['../', 'README', 'sha256sums.asc']
 
     def test_does_not_list_a_sums_file_that_is_not_there(self, tmp_path: Path) -> None:
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README'], [],
-                                   self._status(README=2), 'sha256')
+                                   self._status(README=2), 'sha256', [])
         assert 'sums.asc' not in (tmp_path / 'index.html').read_text()
 
     def test_dotfiles_are_left_out(self, tmp_path: Path) -> None:
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['.htaccess', 'README'], [],
-                                   self._status(**{'.htaccess': 1, 'README': 2}), 'sha256')
+                                   self._status(**{'.htaccess': 1, 'README': 2}), 'sha256', [])
         assert '.htaccess' not in (tmp_path / 'index.html').read_text()
 
     def test_nothing_to_list_writes_no_index(self, tmp_path: Path) -> None:
-        dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256')
+        dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256', [])
         assert not (tmp_path / 'index.html').exists()
 
     def test_nothing_to_list_removes_a_stale_index(self, tmp_path: Path) -> None:
         (tmp_path / 'index.html').write_text('stale')
-        dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256')
+        dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256', [])
         assert not (tmp_path / 'index.html').exists()
 
     def test_unchanged_index_is_not_rewritten(self, tmp_path: Path) -> None:
         args: tuple[object, ...] = (str(tmp_path), '/pub/', ['README'], [],
-                                    self._status(README=2), 'sha256')
+                                    self._status(README=2), 'sha256', [])
         dirsigner.write_index_file(*args)
         index = tmp_path / 'index.html'
         before = index.stat().st_mtime_ns
@@ -699,9 +699,9 @@ class TestWriteIndexFile:
 
     def test_changed_index_is_rewritten(self, tmp_path: Path) -> None:
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README'], [],
-                                   self._status(README=2), 'sha256')
+                                   self._status(README=2), 'sha256', [])
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README', 'NEWS'], [],
-                                   self._status(README=2, NEWS=3), 'sha256')
+                                   self._status(README=2, NEWS=3), 'sha256', [])
         assert 'NEWS' in (tmp_path / 'index.html').read_text()
 
     def test_sizes_and_mtimes_come_from_the_status(self, tmp_path: Path) -> None:
@@ -709,12 +709,12 @@ class TestWriteIndexFile:
         # we are not stat()ing files we already know about.
         (tmp_path / 'blob').write_text('')
         status = {'blob': {'mtime': utc('10-Aug-2026 19:00'), 'size': 40 * 1024, 'hash': 'x'}}
-        dirsigner.write_index_file(str(tmp_path), '/pub/', ['blob'], [], status, 'sha256')
+        dirsigner.write_index_file(str(tmp_path), '/pub/', ['blob'], [], status, 'sha256', [])
         assert '10-Aug-2026 19:00     40K' in (tmp_path / 'index.html').read_text()
 
     def test_unstatable_subdirectory_is_skipped(self, tmp_path: Path) -> None:
         dirsigner.write_index_file(str(tmp_path), '/pub/', ['README'], ['vanished'],
-                                   self._status(README=2), 'sha256')
+                                   self._status(README=2), 'sha256', [])
         assert 'vanished' not in (tmp_path / 'index.html').read_text()
 
 
@@ -827,3 +827,142 @@ class TestSignTreeIndex:
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
         assert not (tmp_path / 'sha256sums.asc').exists()
         assert '<a href="sub/">' in (tmp_path / 'index.html').read_text()
+
+
+class TestStatIndexEntry:
+    """Tests for the on-disk lookup used for dirs, symlinks and the sums file."""
+
+    def test_plain_file(self, tmp_path: Path) -> None:
+        (tmp_path / 'blob').write_bytes(b'x' * 40960)
+        os.utime(tmp_path / 'blob', (0, utc('10-Aug-2026 19:00')))
+        entry = dirsigner.stat_index_entry(str(tmp_path), 'blob')
+        assert entry is not None
+        assert '10-Aug-2026 19:00     40K' in entry
+
+    def test_directory_gets_a_slash_and_a_dash(self, tmp_path: Path) -> None:
+        (tmp_path / 'v6.x').mkdir()
+        entry = dirsigner.stat_index_entry(str(tmp_path), 'v6.x')
+        assert entry is not None
+        assert entry.startswith('<a href="v6.x/">v6.x/</a>')
+        assert entry.endswith('       -')
+
+    def test_symlink_shows_the_target(self, tmp_path: Path) -> None:
+        (tmp_path / 'linux-6.12.tar.xz').write_bytes(b'x' * 40960)
+        os.utime(tmp_path / 'linux-6.12.tar.xz', (0, utc('10-Aug-2026 19:00')))
+        (tmp_path / 'linux-latest.tar.xz').symlink_to('linux-6.12.tar.xz')
+        entry = dirsigner.stat_index_entry(str(tmp_path), 'linux-latest.tar.xz')
+        assert entry is not None
+        # The link's own name, but the target's size and mtime
+        assert entry.startswith('<a href="linux-latest.tar.xz">linux-latest.tar.xz</a>')
+        assert '10-Aug-2026 19:00     40K' in entry
+
+    def test_symlink_to_a_directory_is_listed_as_one(self, tmp_path: Path) -> None:
+        (tmp_path / 'v6.12').mkdir()
+        (tmp_path / 'latest').symlink_to(tmp_path / 'v6.12')
+        entry = dirsigner.stat_index_entry(str(tmp_path), 'latest')
+        assert entry is not None
+        assert entry.startswith('<a href="latest/">latest/</a>')
+        assert entry.endswith('       -')
+
+    def test_dangling_symlink_falls_back_to_the_link(self, tmp_path: Path) -> None:
+        (tmp_path / 'broken').symlink_to('nowhere-at-all')
+        entry = dirsigner.stat_index_entry(str(tmp_path), 'broken')
+        assert entry is not None
+        assert entry.startswith('<a href="broken">broken</a>')
+        # The size is the length of the target path, which is what lstat says
+        assert entry.endswith('%8d' % len('nowhere-at-all'))
+
+    def test_missing_name_returns_none(self, tmp_path: Path) -> None:
+        assert dirsigner.stat_index_entry(str(tmp_path), 'not-there') is None
+
+
+class TestSymlinksInIndex:
+    """Symlinks are listed, but never checksummed."""
+
+    def test_symlink_is_listed_but_not_signed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'linux-6.12.tar.xz': 'content'})
+        (tmp_path / 'linux-latest.tar.xz').symlink_to('linux-6.12.tar.xz')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+
+        signed = [line.split('  ')[1] for line in read_sums(tmp_path / 'sha256sums.asc')]
+        assert signed == ['linux-6.12.tar.xz'], 'symlinks must stay out of the sums file'
+        assert list(read_status(tmp_path).keys()) == ['linux-6.12.tar.xz']
+
+        listed = [line.split('"')[1] for line in
+                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
+        assert listed == ['../', 'linux-6.12.tar.xz', 'linux-latest.tar.xz', 'sha256sums.asc']
+
+    def test_symlinks_come_after_the_signed_files(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'linux-6.2.tar.xz': 'a', 'linux-6.10.tar.xz': 'b'})
+        (tmp_path / 'linux-6.20.tar.xz').symlink_to('linux-6.2.tar.xz')
+        (tmp_path / 'linux-6.3.tar.xz').symlink_to('linux-6.2.tar.xz')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True, vsort=True)
+        listed = [line.split('"')[1] for line in
+                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
+        assert listed == ['../',
+                          'linux-6.2.tar.xz', 'linux-6.10.tar.xz',      # signed, version sorted
+                          'linux-6.3.tar.xz', 'linux-6.20.tar.xz',      # links, version sorted
+                          'sha256sums.asc']
+
+    def test_symlink_to_a_subdirectory_is_listed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'v6.12/blob': 'content'})
+        (tmp_path / 'latest').symlink_to(tmp_path / 'v6.12')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        listed = [line.split('"')[1] for line in
+                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
+        assert listed == ['../', 'latest/', 'v6.12/']
+
+    def test_symlinked_directory_is_not_descended_into(self, tmp_path: Path) -> None:
+        # os.walk does not follow directory symlinks, so the target is visited
+        # once, under its real name, and gets a single index.html.
+        make_tree(tmp_path, {'v6.12/blob': 'content'})
+        (tmp_path / 'latest').symlink_to(tmp_path / 'v6.12')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        written = [os.path.join(root, dirsigner.INDEX_FILE) for root, _, files
+                   in os.walk(str(tmp_path)) if dirsigner.INDEX_FILE in files]
+        assert written == [str(tmp_path / 'index.html'), str(tmp_path / 'v6.12' / 'index.html')]
+
+    def test_excluded_symlinks_are_not_listed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'blob': 'content'})
+        (tmp_path / 'skip.txt').symlink_to('blob')
+        dirsigner.sign_tree(str(tmp_path), ['*.txt'], 'sha256', index=True)
+        assert 'skip.txt' not in (tmp_path / 'index.html').read_text()
+
+    def test_a_stray_index_html_symlink_is_excluded(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'blob': 'content'})
+        (tmp_path / 'index.html').symlink_to('blob')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        # The link got replaced by our own listing, not listed inside it
+        assert not (tmp_path / 'index.html').is_symlink()
+        assert 'index.html' not in (tmp_path / 'index.html').read_text()
+        # ...and writing the listing did not clobber what the link pointed at
+        assert (tmp_path / 'blob').read_text() == 'content'
+
+    def test_dangling_symlink_is_listed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'blob': 'content'})
+        (tmp_path / 'broken').symlink_to('gone')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert '<a href="broken">' in (tmp_path / 'index.html').read_text()
+
+    def test_a_file_that_becomes_a_symlink_stops_being_signed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'linux-latest.tar.xz': 'real file', 'linux-6.12.tar.xz': 'content'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert 'linux-latest.tar.xz' in read_status(tmp_path)
+
+        os.unlink(tmp_path / 'linux-latest.tar.xz')
+        (tmp_path / 'linux-latest.tar.xz').symlink_to('linux-6.12.tar.xz')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert list(read_status(tmp_path).keys()) == ['linux-6.12.tar.xz']
+        assert 'linux-latest.tar.xz' in (tmp_path / 'index.html').read_text()
+
+    def test_second_run_changes_nothing_with_symlinks(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'blob': 'content', 'sub/inner': 'inner'})
+        (tmp_path / 'link').symlink_to('blob')
+        (tmp_path / 'dirlink').symlink_to(tmp_path / 'sub')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        before = {p: p.read_bytes() for p in sorted(tmp_path.rglob('*'))
+                  if p.is_file() and not p.is_symlink()}
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        after = {p: p.read_bytes() for p in sorted(tmp_path.rglob('*'))
+                 if p.is_file() and not p.is_symlink()}
+        assert before == after

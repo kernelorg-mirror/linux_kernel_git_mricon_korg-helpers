@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import time
 import urllib.parse
@@ -255,6 +256,30 @@ def format_index_entry(name: str, mtime: int, size: Optional[int]) -> str:
     return '<a href="%s">%s</a>%s %s%8s' % (urllib.parse.quote(name), shown, padding, stamp, column)
 
 
+def stat_index_entry(root: str, name: str) -> Optional[str]:
+    """Format an index entry for something we have to look at on disk.
+
+    Symlinks are followed, the way the server's autoindex followed them, so
+    a link shows its target's size and mtime and a link to a directory is
+    listed as one. A dangling link falls back to the link itself. Returns
+    None if we can't stat it at all.
+    """
+    full_path = os.path.join(root, name)
+    try:
+        fstat = os.stat(full_path)
+    except OSError:
+        try:
+            fstat = os.lstat(full_path)
+        except OSError:
+            logger.debug('Was not able to stat %s, leaving it out of the index' % full_path)
+            return None
+
+    if stat.S_ISDIR(fstat.st_mode):
+        return format_index_entry(name + '/', int(fstat.st_mtime), None)
+
+    return format_index_entry(name, int(fstat.st_mtime), fstat.st_size)
+
+
 def render_index(urlpath: str, entries: list[str]) -> bytes:
     """Wrap formatted entries in the page nginx would have served."""
     title = html.escape(urlpath, quote=False)
@@ -271,55 +296,66 @@ def render_index(urlpath: str, entries: list[str]) -> bytes:
 
 
 def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: list[str],
-                     status: dict[str, FileStatus], hash_algorithm: str) -> None:
+                     status: dict[str, FileStatus], hash_algorithm: str,
+                     symlinks: list[str]) -> None:
     """Write index.html for a single directory.
 
     Subdirectories come first, then the files in the same order they appear
-    in the sums file, then the sums file itself. Dotfiles are left out, the
-    way nginx leaves them out. Sizes and mtimes come from the status we
-    already collected, so this costs no extra stat calls beyond the
-    subdirectories and the sums file.
+    in the sums file, then any symlinks, then the sums file itself. Dotfiles
+    are left out, the way nginx leaves them out. Sizes and mtimes for the
+    checksummed files come from the status we already collected, so the only
+    stat calls here are for subdirectories, symlinks and the sums file.
     """
     index_file = os.path.join(root, INDEX_FILE)
     entries = []
 
     for name in subdirs:
-        try:
-            dstat = os.lstat(os.path.join(root, name))
-        except OSError:
-            logger.debug('Was not able to stat %s, leaving it out of the index' % name)
-            continue
-        entries.append(format_index_entry(name + '/', int(dstat.st_mtime), None))
+        entry = stat_index_entry(root, name)
+        if entry is not None:
+            entries.append(entry)
 
-    listed = [name for name in found_files if not name.startswith('.')]
+    for name in found_files:
+        if name.startswith('.'):
+            continue
+        if name in status:
+            entries.append(format_index_entry(name, status[name]['mtime'], status[name]['size']))
+            continue
+        entry = stat_index_entry(root, name)
+        if entry is not None:
+            entries.append(entry)
+
+    # Symlinks are listed but never checksummed, so they are not in status
+    # and we have to look at them on disk.
+    for name in symlinks:
+        if name.startswith('.'):
+            continue
+        entry = stat_index_entry(root, name)
+        if entry is not None:
+            entries.append(entry)
 
     # The sums file is excluded from its own checksums, but it should still
     # show up in the listing, same as it did with the server's autoindex.
     sums_name = hash_algorithm + 'sums.asc'
     if os.path.exists(os.path.join(root, sums_name)):
-        listed.append(sums_name)
-
-    for name in listed:
-        if name in status:
-            entries.append(format_index_entry(name, status[name]['mtime'], status[name]['size']))
-            continue
-        try:
-            fstat = os.lstat(os.path.join(root, name))
-        except OSError:
-            logger.debug('Was not able to stat %s, leaving it out of the index' % name)
-            continue
-        entries.append(format_index_entry(name, int(fstat.st_mtime), fstat.st_size))
+        entry = stat_index_entry(root, sums_name)
+        if entry is not None:
+            entries.append(entry)
 
     if not entries:
-        if os.path.exists(index_file):
+        if os.path.lexists(index_file):
             logger.info('Removing obsolete %s' % index_file)
             os.unlink(index_file)
         return
 
     contents = render_index(urlpath, entries)
 
-    # Only write when something actually changed, so we don't churn mtimes
-    if os.path.exists(index_file):
+    if os.path.islink(index_file):
+        # Never write through a link: the target could be anything, even
+        # something outside the tree entirely.
+        logger.info('Replacing symlink %s' % index_file)
+        os.unlink(index_file)
+    elif os.path.exists(index_file):
+        # Only write when something actually changed, so we don't churn mtimes
         with open(index_file, 'rb') as ifh:
             if ifh.read() == contents:
                 logger.debug('%s is already up to date' % index_file)
@@ -386,13 +422,11 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
         status = load_status(statusfile)
 
         found_files: list[str] = []
+        found_links: list[str] = []
         dir_changed = False
 
         for name in files:
             full_path = os.path.join(root, name)
-            if os.path.islink(full_path):
-                logger.debug('Ignoring symlink %s' % name)
-                continue
 
             # Does it match excludes?
             excluded = False
@@ -402,6 +436,13 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
                     excluded = True
                     break
             if excluded:
+                continue
+
+            if os.path.islink(full_path):
+                # Listed in the index, but never checksummed: the target is
+                # either elsewhere in the tree and signed there, or outside it.
+                logger.debug('Not checksumming symlink %s' % name)
+                found_links.append(name)
                 continue
 
             # Get stats on the file and compare to what we have in the status
@@ -509,9 +550,14 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             # version 0. Sorting also makes the walk order stable.
             dirs.sort()
 
+            # Symlinks were never in a sums file, so unlike the files above
+            # there is no published order to preserve and we can just sort.
+            found_links.sort(key=functools.cmp_to_key(version_sort) if vsort else None)
+
             relpath = os.path.relpath(root, tree)
             urlpath = prefix if relpath == '.' else prefix + relpath + '/'
-            write_index_file(root, urlpath, found_files, dirs, status, hash_algorithm)
+            write_index_file(root, urlpath, found_files, dirs, status, hash_algorithm,
+                             found_links)
 
 
 def main() -> None:
