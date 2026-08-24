@@ -1,5 +1,6 @@
 """Tests for dirsigner.py."""
 
+import builtins
 import calendar
 import hashlib
 import importlib.util
@@ -469,6 +470,75 @@ class TestSignTree:
         make_tree(tmp_path, {'blob': 'content'})
         dirsigner.sign_tree(str(tmp_path), excludes, 'sha256')
         assert '*.txt' in excludes
+
+
+class TestFsChurn:
+    """A run over an unchanged tree must not touch the filesystem."""
+
+    def test_default_chunk_size_is_not_tiny(self) -> None:
+        # 8K meant 24k read() calls to hash a 200MB tarball
+        assert dirsigner.CHUNK_SIZE >= 65536
+
+    def test_unchanged_run_opens_nothing_for_writing(self, tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+        make_tree(tmp_path, {'a/linux-6.1.tar.xz': 'one', 'a/linux-6.2.tar.xz': 'two',
+                             'b/patch-6.1.xz': 'three', 'b/sub/deep': 'four'})
+        (tmp_path / 'a' / 'latest.tar.xz').symlink_to('linux-6.2.tar.xz')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True, vsort=True)
+
+        opened: list[tuple[str, str]] = []
+        real_open = builtins.open
+
+        def spy(path: object, mode: str = 'r', *args: object, **kwargs: object) -> object:
+            opened.append((str(path), mode))
+            return real_open(path, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+        monkeypatch.setattr(builtins, 'open', spy)
+        unlinked: list[str] = []
+        monkeypatch.setattr(dirsigner.os, 'unlink', lambda p: unlinked.append(str(p)))
+
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True, vsort=True)
+
+        writes = [path for path, mode in opened if 'w' in mode or 'a' in mode]
+        assert writes == [], 'nothing changed, so nothing should be rewritten'
+        assert unlinked == [], 'nothing changed, so nothing should be removed'
+
+    def test_unchanged_run_reads_each_file_at_most_once(self, tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+        # Files must not be reopened for hashing when the status still matches
+        make_tree(tmp_path, {'linux-6.1.tar.xz': 'one', 'linux-6.2.tar.xz': 'two'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+
+        hashed: list[str] = []
+
+        def spy_hash(full_path: str, hash_algorithm: str) -> str:
+            hashed.append(full_path)
+            return 'deadbeef'
+
+        monkeypatch.setattr(dirsigner, 'get_file_hash', spy_hash)
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert hashed == [], 'unchanged files must not be rehashed'
+
+    def test_stat_calls_stay_near_one_per_file(self, tmp_path: Path,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+        make_tree(tmp_path, {'f-%d.txt' % i: 'x' for i in range(50)})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+
+        counts = {'stat': 0, 'lstat': 0}
+        for fn in ('stat', 'lstat'):
+            real = getattr(os, fn)
+
+            def wrap(path: object, *a: object, _r: object = real, _n: str = fn,
+                     **kw: object) -> object:
+                counts[_n] += 1
+                return _r(path, *a, **kw)  # type: ignore[operator]
+
+            monkeypatch.setattr(os, fn, wrap)
+
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        total = counts['stat'] + counts['lstat']
+        # 50 files plus a handful for the directory, its status, sums and index
+        assert total <= 60, 'got %d stat calls for 50 files: %r' % (total, counts)
 
 
 class TestParseArgs:

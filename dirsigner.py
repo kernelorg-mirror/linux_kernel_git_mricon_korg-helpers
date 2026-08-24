@@ -37,7 +37,9 @@ import gpg.constants.sig
 from packaging.version import InvalidVersion, Version
 
 VERSION = '0.2'
-CHUNK_SIZE = 8192
+# Big enough that hashing a multi-gigabyte tarball is not dominated by read()
+# syscalls. Overridable with -b, but there is rarely a reason to.
+CHUNK_SIZE = 262144
 HASH_ALGORITHMS = ('md5', 'sha1', 'sha256', 'sha512')
 
 INDEX_FILE = 'index.html'
@@ -149,16 +151,18 @@ def get_version_info(filen: str) -> tuple[str, Version, str]:
 
 
 def load_status(statusfile: str) -> dict[str, FileStatus]:
-    if os.path.exists(statusfile):
-        logger.debug('Reading status file from %s' % statusfile)
-        fh = open(statusfile, 'r')
-        contents = fh.read()
-        fh.close()
-        status: dict[str, FileStatus] = json.loads(contents)
-        logger.debug('Status file contains %d entries' % len(status.keys()))
-    else:
+    # Opened without checking first: the open tells us whether it is there,
+    # and this runs once per directory in the tree.
+    try:
+        with open(statusfile, 'r') as fh:
+            contents = fh.read()
+    except FileNotFoundError:
         logger.debug('No status file found, assuming initial run')
-        status = {}
+        return {}
+
+    logger.debug('Read status file from %s' % statusfile)
+    status: dict[str, FileStatus] = json.loads(contents)
+    logger.debug('Status file contains %d entries' % len(status.keys()))
 
     return status
 
@@ -166,9 +170,11 @@ def load_status(statusfile: str) -> dict[str, FileStatus]:
 def save_status(statusfile: str, status: dict[str, FileStatus]) -> None:
     if not len(status):
         # Nothing left to remember, so don't leave an empty stub behind
-        if os.path.exists(statusfile):
-            logger.debug('Removing obsolete %s' % statusfile)
+        try:
             os.unlink(statusfile)
+            logger.debug('Removed obsolete %s' % statusfile)
+        except FileNotFoundError:
+            pass
         return
 
     logger.debug('Saving status into %s' % statusfile)
@@ -317,25 +323,32 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
     # The sums file is excluded from its own checksums, but it should still
     # show up in the listing, same as it did with the server's autoindex.
     sums_name = hash_algorithm + 'sums.asc'
-    if os.path.exists(os.path.join(root, sums_name)):
-        entry = stat_index_entry(root, sums_name)
-        if entry is not None:
-            entries.append(entry)
+    entry = stat_index_entry(root, sums_name)
+    if entry is not None:
+        entries.append(entry)
 
     if not entries:
-        if os.path.lexists(index_file):
-            logger.info('Removing obsolete %s' % index_file)
+        try:
             os.unlink(index_file)
+            logger.info('Removed obsolete %s' % index_file)
+        except FileNotFoundError:
+            pass
         return
 
     contents = render_index(urlpath, entries)
 
-    if os.path.islink(index_file):
+    # A single lstat answers both "is it there" and "is it a symlink"
+    try:
+        istat: Optional[os.stat_result] = os.lstat(index_file)
+    except OSError:
+        istat = None
+
+    if istat is not None and stat.S_ISLNK(istat.st_mode):
         # Never write through a link: the target could be anything, even
         # something outside the tree entirely.
         logger.info('Replacing symlink %s' % index_file)
         os.unlink(index_file)
-    elif os.path.exists(index_file):
+    elif istat is not None:
         # Only write when something actually changed, so we don't churn mtimes
         with open(index_file, 'rb') as ifh:
             if ifh.read() == contents:
@@ -350,11 +363,15 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
 
 def write_sums_file(root: str, found_files: list[str], status: dict[str, FileStatus],
                     hash_algorithm: str) -> None:
-    # Clean out any stale sums files
+    # Clean out any stale sums files, including the one we are about to
+    # replace. Unlinked blind rather than stat'ed first: most of these four
+    # are not there, and the unlink tells us that just as well.
     for supported_algorithm in HASH_ALGORITHMS:
         sums_file = os.path.join(root, supported_algorithm + 'sums.asc')
-        if os.path.exists(sums_file):
+        try:
             os.unlink(sums_file)
+        except FileNotFoundError:
+            pass
 
     if not len(found_files):
         return
