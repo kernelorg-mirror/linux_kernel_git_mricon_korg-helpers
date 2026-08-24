@@ -27,6 +27,7 @@ import re
 import sys
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, lockf
 from io import BytesIO
+from typing import TypedDict
 
 import gpg
 import gpg.constants.sig
@@ -39,14 +40,27 @@ HASH_ALGORITHMS = ('md5', 'sha1', 'sha256', 'sha512')
 logger = logging.getLogger('dirsigner')
 
 
-def _safe_version(s):
+class FileStatus(TypedDict):
+    """What we remember about a file between runs.
+
+    If any of ctime, mtime, size or inode changed, the file is rehashed.
+    """
+
+    ctime: int
+    mtime: int
+    size: int
+    inode: int
+    hash: str
+
+
+def _safe_version(s: str) -> Version:
     try:
         return Version(s)
     except InvalidVersion:
         return Version('0')
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     global CHUNK_SIZE
 
     parser = argparse.ArgumentParser(
@@ -94,7 +108,7 @@ def parse_args():
     return opts
 
 
-def get_version_info(filen):
+def get_version_info(filen: str) -> tuple[str, Version, str]:
     basen = os.path.basename(filen)
     # split by last dash
     nv = basen.rsplit('-', 1)
@@ -104,7 +118,7 @@ def get_version_info(filen):
     name, end = nv
 
     chunks = end.split('.')
-    tail = list()
+    tail: list[str] = list()
     while len(chunks):
         if re.search(r'\D', chunks[-1]):
             tail.append(chunks.pop(-1))
@@ -119,7 +133,7 @@ def get_version_info(filen):
     return name, ver, '.'.join(tail)
 
 
-def version_sort(x, y):
+def version_sort(x: str, y: str) -> int:
     namex, verx, tailx = get_version_info(x)
     namey, very, taily = get_version_info(y)
     if namex > namey:
@@ -137,13 +151,13 @@ def version_sort(x, y):
     return 0
 
 
-def load_status(statusfile):
+def load_status(statusfile: str) -> dict[str, FileStatus]:
     if os.path.exists(statusfile):
         logger.debug('Reading status file from %s' % statusfile)
         fh = open(statusfile, 'r')
         contents = fh.read()
         fh.close()
-        status = json.loads(contents)
+        status: dict[str, FileStatus] = json.loads(contents)
         logger.debug('Status file contains %d entries' % len(status.keys()))
     else:
         logger.debug('No status file found, assuming initial run')
@@ -152,10 +166,12 @@ def load_status(statusfile):
     return status
 
 
-def save_status(statusfile, status):
-    if not len(status) and os.path.exists(statusfile):
-        logger.debug('Removing obsolete %s' % statusfile)
-        os.unlink(statusfile)
+def save_status(statusfile: str, status: dict[str, FileStatus]) -> None:
+    if not len(status):
+        # Nothing left to remember, so don't leave an empty stub behind
+        if os.path.exists(statusfile):
+            logger.debug('Removing obsolete %s' % statusfile)
+            os.unlink(statusfile)
         return
 
     logger.debug('Saving status into %s' % statusfile)
@@ -166,7 +182,7 @@ def save_status(statusfile, status):
     fh.close()
 
 
-def get_file_hash(full_path, hash_algorithm):
+def get_file_hash(full_path: str, hash_algorithm: str) -> str:
     if hash_algorithm == 'md5':
         m = hashlib.md5()
     elif hash_algorithm == 'sha1':
@@ -184,7 +200,8 @@ def get_file_hash(full_path, hash_algorithm):
     return m.hexdigest()
 
 
-def write_sums_file(root, found_files, status, hash_algorithm, vsort=False):
+def write_sums_file(root: str, found_files: list[str], status: dict[str, FileStatus],
+                    hash_algorithm: str, vsort: bool = False) -> None:
     # Clean out any stale sums files
     for supported_algorithm in HASH_ALGORITHMS:
         sums_file = os.path.join(root, supported_algorithm + 'sums.asc')
@@ -198,9 +215,8 @@ def write_sums_file(root, found_files, status, hash_algorithm, vsort=False):
     if vsort:
         logger.info('Version-sorting %s', root)
         found_files.sort(key=functools.cmp_to_key(version_sort))
-    for full_path in found_files:
-        filename = os.path.basename(full_path)
-        checksum = status[full_path]['hash']
+    for filename in found_files:
+        checksum = status[filename]['hash']
         tfh.write(('%s  %s\n' % (checksum, filename)).encode('utf-8'))
 
     tfh.seek(0)
@@ -216,7 +232,7 @@ def write_sums_file(root, found_files, status, hash_algorithm, vsort=False):
     logger.info('Wrote %s' % sums_file)
 
 
-def sign_tree(tree, excludes, hash_algorithm, vsort=False):
+def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool = False) -> None:
     logger.info('Recursively scanning %s' % tree)
 
     # Make sure '*sums.asc' and .dirsigner.* are always in excludes
@@ -231,9 +247,9 @@ def sign_tree(tree, excludes, hash_algorithm, vsort=False):
         logger.debug('Entered %s' % root)
 
         statusfile = os.path.join(root, '.dirsigner.status.js')
-        status = None
+        status = load_status(statusfile)
 
-        found_files = []
+        found_files: list[str] = []
         dir_changed = False
 
         for name in files:
@@ -260,14 +276,15 @@ def sign_tree(tree, excludes, hash_algorithm, vsort=False):
                 continue
 
             found_files.append(name)
-            (ctime, mtime, size, inode) = (fstat[9], fstat[8], fstat[6], fstat[1])
+            # Whole seconds only, which is what the tuple form of stat used to give us
+            ctime = int(fstat.st_ctime)
+            mtime = int(fstat.st_mtime)
+            size = fstat.st_size
+            inode = fstat.st_ino
 
             # Is this path in status?
             changed = False
-            if status is None:
-                status = load_status(statusfile)
-
-            if name in status.keys():
+            if name in status:
                 # Do ctime, mtime and size match?
                 # A bit verbose, but lets us log the exact reason
                 if status[name]['ctime'] != ctime:
@@ -300,16 +317,12 @@ def sign_tree(tree, excludes, hash_algorithm, vsort=False):
                     'hash': file_hash,
                     }
 
-        # Weed out our existing status entries, if we have any
-        if os.path.exists(statusfile):
-            if status is None:
-                status = load_status(statusfile)
-
-            for entry in list(status.keys()):
-                if entry not in found_files:
-                    logger.info('File %s from status is no longer there' % entry)
-                    del(status[entry])
-                    dir_changed = True
+        # Weed out status entries for files that are no longer there
+        for entry in list(status.keys()):
+            if entry not in found_files:
+                logger.info('File %s from status is no longer there' % entry)
+                del status[entry]
+                dir_changed = True
 
         sums_file = os.path.join(root, hash_algorithm + 'sums.asc')
         if len(found_files) and not os.path.exists(sums_file):
@@ -322,7 +335,7 @@ def sign_tree(tree, excludes, hash_algorithm, vsort=False):
             save_status(statusfile, status)
 
         # Look at dirs and see if we need to exclude any of them
-        to_rm = []
+        to_rm: list[str] = []
         for name in dirs:
             full_path = os.path.join(root, name)
 
@@ -344,7 +357,7 @@ def sign_tree(tree, excludes, hash_algorithm, vsort=False):
             dirs.remove(name)
 
 
-def main():
+def main() -> None:
     opts = parse_args()
 
     logger.setLevel(logging.DEBUG)
@@ -361,16 +374,16 @@ def main():
     logger.addHandler(ch)
 
     if opts.logfile is not None:
-        ch = logging.FileHandler(opts.logfile)
+        fh = logging.FileHandler(opts.logfile)
         formatter = logging.Formatter("[%(process)d] %(asctime)s - %(levelname)s - %(message)s")
-        ch.setFormatter(formatter)
+        fh.setFormatter(formatter)
 
         if opts.debug:
-            ch.setLevel(logging.DEBUG)
+            fh.setLevel(logging.DEBUG)
         else:
-            ch.setLevel(logging.INFO)
+            fh.setLevel(logging.INFO)
 
-        logger.addHandler(ch)
+        logger.addHandler(fh)
 
     if opts.gnupghome is not None:
         logger.info('Setting GNUPGHOME to %s' % opts.gnupghome)
@@ -380,7 +393,7 @@ def main():
     logger.debug('Obtaining exclusive lock for %s' % opts.lockfile)
 
     try:
-        lockf(lock_fh, LOCK_EX|LOCK_NB)
+        lockf(lock_fh, LOCK_EX | LOCK_NB)
     except IOError:
         logger.info('Could not obtain exclusive lock, assuming another process is running.')
         sys.exit(128)

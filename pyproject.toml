@@ -9,3 +9,8 @@ select = ["E", "F", "W", "I"]
 
 [tool.mypy]
 strict = true
+
+# The gpgme python bindings ship no type information and have no stubs on PyPI.
+[[tool.mypy.overrides]]
+module = "gpg.*"
+ignore_missing_imports = true
