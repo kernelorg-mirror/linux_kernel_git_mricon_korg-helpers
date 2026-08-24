@@ -371,6 +371,8 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
     entries = []
 
     for name in subdirs:
+        if name.startswith('.'):
+            continue
         entry = stat_index_entry(root, name)
         if entry is not None:
             entries.append(entry)

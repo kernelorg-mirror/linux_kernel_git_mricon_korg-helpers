@@ -1097,6 +1097,26 @@ class TestSignTreeIndex:
         assert '<a href="sub/">' in (tmp_path / 'index.html').read_text()
 
 
+class TestDottedEntriesAreHidden:
+    """Dotfiles and dot-directories stay out of the listing, as nginx did."""
+
+    def test_dotted_subdirectory_is_not_listed(self, tmp_path: Path,
+                                              fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'.pc/patch': 'x', 'v6.x/blob': 'y'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '<a href="v6.x/">' in page
+        assert '.pc' not in page
+
+    def test_dotted_file_is_not_listed(self, tmp_path: Path,
+                                       fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'.hidden': 'x', 'blob': 'y'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '<a href="blob">' in page
+        assert '.hidden' not in page
+
+
 class TestStatIndexEntry:
     """Tests for the on-disk lookup used for dirs, symlinks and the sums file."""
 
