@@ -472,6 +472,98 @@ class TestSignTree:
         assert '*.txt' in excludes
 
 
+class TestReadOurIndex:
+    """Tests for telling our own listings apart from hand-written ones."""
+
+    def test_missing_file_is_none(self, tmp_path: Path) -> None:
+        assert dirsigner.read_our_index(str(tmp_path / 'index.html')) is None
+
+    def test_our_own_page_comes_back(self, tmp_path: Path) -> None:
+        target = tmp_path / 'index.html'
+        page = dirsigner.render_index('/pub/', [])
+        target.write_bytes(page)
+        assert dirsigner.read_our_index(str(target)) == page
+
+    def test_hand_written_page_is_not_ours(self, tmp_path: Path) -> None:
+        target = tmp_path / 'index.html'
+        target.write_text('<html><body>Please read the README first</body></html>')
+        assert dirsigner.read_our_index(str(target)) is dirsigner.NOT_OURS
+
+    def test_marker_must_be_on_the_first_line(self, tmp_path: Path) -> None:
+        # Buried further down it does not count, so a page that merely quotes
+        # the marker cannot trick us into overwriting it
+        target = tmp_path / 'index.html'
+        target.write_bytes(b'<html>\r\n' + dirsigner.INDEX_MARKER + b'\r\n')
+        assert dirsigner.read_our_index(str(target)) is dirsigner.NOT_OURS
+
+    def test_symlink_is_not_ours(self, tmp_path: Path) -> None:
+        # Even one pointing at a page that does carry the marker: we never
+        # create symlinks, so it is not our doing
+        (tmp_path / 'real.html').write_bytes(dirsigner.render_index('/pub/', []))
+        target = tmp_path / 'index.html'
+        target.symlink_to('real.html')
+        assert dirsigner.read_our_index(str(target)) is dirsigner.NOT_OURS
+
+    def test_empty_file_is_not_ours(self, tmp_path: Path) -> None:
+        target = tmp_path / 'index.html'
+        target.write_bytes(b'')
+        assert dirsigner.read_our_index(str(target)) is dirsigner.NOT_OURS
+
+    def test_unreadable_file_is_not_ours(self, tmp_path: Path) -> None:
+        target = tmp_path / 'index.html'
+        target.write_bytes(dirsigner.render_index('/pub/', []))
+        target.chmod(0o000)
+        try:
+            if os.access(str(target), os.R_OK):
+                pytest.skip('running as root, so permissions do not bite')
+            assert dirsigner.read_our_index(str(target)) is dirsigner.NOT_OURS
+        finally:
+            target.chmod(0o644)
+
+
+class TestHandWrittenIndex:
+    """A page we did not generate must survive untouched."""
+
+    def test_hand_written_index_is_not_overwritten(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'linux-6.12.tar.xz': 'content'})
+        page = '<html><body>See the README before downloading</body></html>'
+        (tmp_path / 'index.html').write_text(page)
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert (tmp_path / 'index.html').read_text() == page
+
+    def test_the_rest_of_the_directory_is_still_signed(self, tmp_path: Path) -> None:
+        # Refusing to touch the listing must not stop us doing our real job
+        make_tree(tmp_path, {'linux-6.12.tar.xz': 'content'})
+        (tmp_path / 'index.html').write_text('<html>hands off</html>')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        signed = [line.split('  ')[1] for line in read_sums(tmp_path / 'sha256sums.asc')]
+        assert signed == ['linux-6.12.tar.xz']
+
+    def test_hand_written_index_survives_repeated_runs(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'blob': 'content'})
+        page = '<html><body>mine</body></html>'
+        (tmp_path / 'index.html').write_text(page)
+        for _ in range(3):
+            dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert (tmp_path / 'index.html').read_text() == page
+
+    def test_a_subdirectory_with_a_hand_written_index_is_still_listed(self, tmp_path: Path) -> None:
+        # The parent's listing does not care who wrote the child's page
+        make_tree(tmp_path, {'sub/blob': 'content'})
+        (tmp_path / 'sub' / 'index.html').write_text('<html>mine</html>')
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert '<a href="sub/">' in (tmp_path / 'index.html').read_text()
+
+    def test_our_own_page_is_replaced_when_it_changes(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'linux-6.12.tar.xz': 'content'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert (tmp_path / 'index.html').read_bytes().startswith(dirsigner.INDEX_MARKER)
+
+        make_tree(tmp_path, {'linux-6.13.tar.xz': 'more'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert 'linux-6.13.tar.xz' in (tmp_path / 'index.html').read_text()
+
+
 class TestFsChurn:
     """A run over an unchanged tree must not touch the filesystem."""
 
@@ -611,6 +703,12 @@ NGINX_DEVEL = (
 ).encode('utf-8')
 
 
+def without_marker(page: bytes) -> bytes:
+    """Strip our marker line, leaving what nginx itself would have served."""
+    assert page.startswith(dirsigner.INDEX_MARKER + b'\r\n'), 'marker must be the first line'
+    return page[len(dirsigner.INDEX_MARKER) + 2:]
+
+
 def visible(line: str) -> str:
     """Strip anchor markup from an index line, leaving what a browser shows."""
     text = re.sub(r'</?a[^>]*>', '', line)
@@ -700,14 +798,16 @@ class TestRenderIndex:
             dirsigner.format_index_entry('liblore-0.9.0.tar.xz', utc('13-Aug-2026 01:05'), 111 * 1024),
             dirsigner.format_index_entry('sha256sums.asc', utc('13-Aug-2026 01:05'), 1578),
         ]
-        assert dirsigner.render_index('/pub/software/devel/liblore/', entries) == NGINX_LIBLORE
+        assert without_marker(dirsigner.render_index(
+            '/pub/software/devel/liblore/', entries)) == NGINX_LIBLORE
 
     def test_matches_a_real_nginx_directory_listing(self) -> None:
         entries = [
             dirsigner.format_index_entry('b4/', utc('10-Aug-2026 19:05'), None),
             dirsigner.format_index_entry('liblore/', utc('13-Aug-2026 01:05'), None),
         ]
-        assert dirsigner.render_index('/pub/software/devel/', entries) == NGINX_DEVEL
+        assert without_marker(dirsigner.render_index(
+            '/pub/software/devel/', entries)) == NGINX_DEVEL
 
     def test_uses_crlf_line_endings(self) -> None:
         page = dirsigner.render_index('/', [])
@@ -761,14 +861,24 @@ class TestWriteIndexFile:
                                    self._status(**{'.htaccess': 1, 'README': 2}), 'sha256', [])
         assert '.htaccess' not in (tmp_path / 'index.html').read_text()
 
-    def test_nothing_to_list_writes_no_index(self, tmp_path: Path) -> None:
+    def test_nothing_to_list_still_writes_a_bare_index(self, tmp_path: Path) -> None:
+        # autoindex served a page with just the parent link for an empty
+        # directory, so leaving none behind would turn those into a 404
         dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256', [])
-        assert not (tmp_path / 'index.html').exists()
+        written = (tmp_path / 'index.html').read_bytes()
+        assert without_marker(written) == (
+            b'<html>\r\n'
+            b'<head><title>Index of /pub/</title></head>\r\n'
+            b'<body>\r\n'
+            b'<h1>Index of /pub/</h1><hr><pre><a href="../">../</a>\r\n'
+            b'</pre><hr></body>\r\n'
+            b'</html>\r\n'
+        )
 
-    def test_nothing_to_list_removes_a_stale_index(self, tmp_path: Path) -> None:
-        (tmp_path / 'index.html').write_text('stale')
+    def test_nothing_to_list_replaces_our_own_stale_index(self, tmp_path: Path) -> None:
+        (tmp_path / 'index.html').write_bytes(dirsigner.INDEX_MARKER + b'\r\nstale')
         dirsigner.write_index_file(str(tmp_path), '/pub/', [], [], {}, 'sha256', [])
-        assert not (tmp_path / 'index.html').exists()
+        assert b'Index of /pub/' in (tmp_path / 'index.html').read_bytes()
 
     def test_unchanged_index_is_not_rewritten(self, tmp_path: Path) -> None:
         args: tuple[object, ...] = (str(tmp_path), '/pub/', ['README'], [],
@@ -897,12 +1007,17 @@ class TestSignTreeIndex:
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
         assert 'goes' not in (tmp_path / 'index.html').read_text()
 
-    def test_emptied_directory_loses_its_index(self, tmp_path: Path) -> None:
+    def test_emptied_directory_keeps_a_bare_index(self, tmp_path: Path) -> None:
         make_tree(tmp_path, {'blob': 'content'})
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
         os.unlink(tmp_path / 'blob')
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
-        assert list(tmp_path.iterdir()) == []
+        # The sums file and the status file go, but the listing stays, now
+        # holding nothing but the link to the parent
+        assert [p.name for p in tmp_path.iterdir()] == ['index.html']
+        listed = [line.split('"')[1] for line in
+                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
+        assert listed == ['../']
 
     def test_directory_with_only_subdirectories_gets_an_index(self, tmp_path: Path) -> None:
         # There is no sums file here, so this only works because the index is
@@ -1020,14 +1135,14 @@ class TestSymlinksInIndex:
         dirsigner.sign_tree(str(tmp_path), ['*.txt'], 'sha256', index=True)
         assert 'skip.txt' not in (tmp_path / 'index.html').read_text()
 
-    def test_a_stray_index_html_symlink_is_excluded(self, tmp_path: Path) -> None:
+    def test_an_index_html_symlink_is_left_alone(self, tmp_path: Path) -> None:
         make_tree(tmp_path, {'blob': 'content'})
         (tmp_path / 'index.html').symlink_to('blob')
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
-        # The link got replaced by our own listing, not listed inside it
-        assert not (tmp_path / 'index.html').is_symlink()
-        assert 'index.html' not in (tmp_path / 'index.html').read_text()
-        # ...and writing the listing did not clobber what the link pointed at
+        # We never create a symlink, so one here is somebody else's doing
+        assert (tmp_path / 'index.html').is_symlink()
+        assert (tmp_path / 'index.html').readlink().name == 'blob'
+        # ...and nothing was written through it
         assert (tmp_path / 'blob').read_text() == 'content'
 
     def test_dangling_symlink_is_listed(self, tmp_path: Path) -> None:
