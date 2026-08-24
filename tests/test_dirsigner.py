@@ -5,6 +5,7 @@ import calendar
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import sys
@@ -1095,6 +1096,86 @@ class TestSignTreeIndex:
         dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
         assert not (tmp_path / 'sha256sums.asc').exists()
         assert '<a href="sub/">' in (tmp_path / 'index.html').read_text()
+
+
+class TestFormatDuration:
+    """Tests for the elapsed time in the end-of-run summary."""
+
+    def test_under_a_minute_keeps_a_decimal(self) -> None:
+        assert dirsigner.format_duration(3.74) == '3.7s'
+        assert dirsigner.format_duration(59.9) == '59.9s'
+
+    def test_minutes_are_zero_padded(self) -> None:
+        assert dirsigner.format_duration(60) == '1m00s'
+        assert dirsigner.format_duration(2461) == '41m01s'
+
+    def test_hours(self) -> None:
+        assert dirsigner.format_duration(3600) == '1h00m00s'
+        assert dirsigner.format_duration(7325.4) == '2h02m05s'
+
+    def test_boundaries_do_not_overflow_a_column(self) -> None:
+        assert dirsigner.format_duration(3599) == '59m59s'
+
+
+class TestRunSummary:
+    """The log has to say a run finished, and what it did."""
+
+    @staticmethod
+    def summary(caplog: pytest.LogCaptureFixture) -> str:
+        """Return just the counts, not the whole line.
+
+        The tree path is in there too, and pytest names its temporary
+        directories after the test, so matching against the whole line means
+        a test can match its own name.
+        """
+        lines = [r.message for r in caplog.records if r.message.startswith('Finished ')]
+        assert len(lines) == 1, 'expected exactly one summary, got %r' % lines
+        return lines[0].rsplit(': ', 1)[1]
+
+    def test_reports_what_a_first_run_did(self, tmp_path: Path, fake_gpg: list[SignCall],
+                                         caplog: pytest.LogCaptureFixture) -> None:
+        make_tree(tmp_path, {'blob': 'x', 'sub/other': 'y'})
+        with caplog.at_level(logging.INFO, logger='dirsigner'):
+            dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        line = self.summary(caplog)
+        assert '2 directories' in line
+        assert '2 files hashed' in line
+        assert '2 checksum files' in line
+        assert '2 listings' in line
+
+    def test_a_converged_run_reports_zeroes(self, tmp_path: Path, fake_gpg: list[SignCall],
+                                            caplog: pytest.LogCaptureFixture) -> None:
+        make_tree(tmp_path, {'blob': 'x'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        with caplog.at_level(logging.INFO, logger='dirsigner'):
+            dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        line = self.summary(caplog)
+        assert '0 checksum files' in line
+        assert '0 listings' in line
+        # Nothing to hash, so the count is left off rather than reported as 0
+        assert 'hashed' not in line
+
+    def test_listings_are_not_mentioned_without_index(self, tmp_path: Path,
+                                                     fake_gpg: list[SignCall],
+                                                     caplog: pytest.LogCaptureFixture) -> None:
+        make_tree(tmp_path, {'blob': 'x'})
+        with caplog.at_level(logging.INFO, logger='dirsigner'):
+            dirsigner.sign_tree(str(tmp_path), [], 'sha256')
+        assert 'listings' not in self.summary(caplog)
+
+    def test_no_summary_when_the_run_dies(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                          caplog: pytest.LogCaptureFixture) -> None:
+        """The absence of the line is the signal, so it must really be absent."""
+        make_tree(tmp_path, {'blob': 'x'})
+
+        def boom(*args: object, **kwargs: object) -> str:
+            raise OSError('disk on fire')
+
+        monkeypatch.setattr(dirsigner, 'get_file_hash', boom)
+        with caplog.at_level(logging.INFO, logger='dirsigner'):
+            with pytest.raises(OSError):
+                dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        assert not [r for r in caplog.records if r.message.startswith('Finished ')]
 
 
 class TestExcludedFilesAreStillListed:

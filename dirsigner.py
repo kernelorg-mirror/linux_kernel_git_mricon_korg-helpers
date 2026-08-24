@@ -234,6 +234,22 @@ def format_size(size: int) -> str:
     return '%d%s' % (scaled, unit)
 
 
+def format_duration(seconds: float) -> str:
+    """Format an elapsed time for the end-of-run summary.
+
+    A run over a large tree can take the better part of an hour, and a bare
+    count of seconds stops being readable well before that.
+    """
+    if seconds < 60:
+        return '%.1fs' % seconds
+    whole = int(seconds)
+    minutes, secs = divmod(whole, 60)
+    if minutes < 60:
+        return '%dm%02ds' % (minutes, secs)
+    hours, minutes = divmod(minutes, 60)
+    return '%dh%02dm%02ds' % (hours, minutes, secs)
+
+
 def format_index_entry(name: str, mtime: int, size: int | None) -> str:
     """Format one line of a directory index, nginx autoindex style.
 
@@ -364,7 +380,7 @@ def matches_any(name: str, full_path: str, patterns: list[str]) -> bool:
 
 def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: list[str],
                      status: dict[str, FileStatus], hash_algorithm: str,
-                     symlinks: list[str]) -> None:
+                     symlinks: list[str]) -> bool:
     """Write index.html for a single directory.
 
     Subdirectories come first, then the files, then any symlinks, then the
@@ -374,7 +390,8 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
     -x kept out of the checksums, is looked at on disk.
 
     A hand-written index.html is left exactly as it is, so this never
-    destroys a page somebody put there on purpose.
+    destroys a page somebody put there on purpose. Returns True if it
+    wrote a file.
     """
     index_file = os.path.join(root, INDEX_FILE)
     entries = []
@@ -416,20 +433,22 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
 
     existing = read_our_index(index_file)
     if existing is NOT_OURS:
-        return
+        return False
     if existing == contents:
         # Only write when something actually changed, so we don't churn mtimes
         logger.debug('%s is already up to date' % index_file)
-        return
+        return False
 
     with open(index_file, 'wb') as ifh:
         ifh.write(contents)
 
     logger.info('Wrote %s' % index_file)
+    return True
 
 
 def write_sums_file(root: str, found_files: list[str], status: dict[str, FileStatus],
-                    hash_algorithm: str) -> None:
+                    hash_algorithm: str) -> bool:
+    """Sign the checksums for one directory. Returns True if it wrote a file."""
     # Clean out any stale sums files, including the one we are about to
     # replace. Unlinked blind rather than stat'ed first: most of these four
     # are not there, and the unlink tells us that just as well.
@@ -441,7 +460,7 @@ def write_sums_file(root: str, found_files: list[str], status: dict[str, FileSta
             pass
 
     if not len(found_files):
-        return
+        return False
 
     tfh = BytesIO()
     for filename in found_files:
@@ -459,11 +478,17 @@ def write_sums_file(root: str, found_files: list[str], status: dict[str, FileSta
     tfh.close()
     cfh.close()
     logger.info('Wrote %s' % sums_file)
+    return True
 
 
 def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool = False,
               index: bool = False, urlprefix: str = '/') -> None:
     logger.info('Recursively scanning %s' % tree)
+    started = time.monotonic()
+    # Counted so the log says what a run did, and says that it finished at
+    # all. There is no other way to tell a completed run from one that died
+    # or is still going.
+    n_dirs = n_hashed = n_sums = n_index = 0
 
     # Our own bookkeeping files, which are neither checksummed nor listed.
     # Kept apart from the caller's excludes because those two are not the
@@ -486,6 +511,7 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
     for root, dirs, files in os.walk(tree, topdown=True):
         logger.debug('Entered %s' % root)
+        n_dirs += 1
 
         statusfile = os.path.join(root, '.dirsigner.status.js')
         status = load_status(statusfile)
@@ -558,6 +584,7 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
             if changed:
                 file_hash = get_file_hash(full_path, hash_algorithm)
+                n_hashed += 1
 
                 dir_changed = True
                 logger.info('%s hash of %s is: %s' % (hash_algorithm, full_path, file_hash))
@@ -596,7 +623,8 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             found_files.sort(key=get_version_info)
 
         if dir_changed:
-            write_sums_file(root, found_files, status, hash_algorithm)
+            if write_sums_file(root, found_files, status, hash_algorithm):
+                n_sums += 1
             # Save status after each changed dir
             save_status(statusfile, status)
 
@@ -641,8 +669,20 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
             relpath = os.path.relpath(root, tree)
             urlpath = prefix if relpath == '.' else prefix + relpath + '/'
-            write_index_file(root, urlpath, listed, dirs, status, hash_algorithm,
-                             found_links)
+            if write_index_file(root, urlpath, listed, dirs, status, hash_algorithm,
+                                found_links):
+                n_index += 1
+
+    # Bottom-of-run summary. Only printed on the way out, so a log without
+    # one means the run died or has not finished yet.
+    summary = ['%d directories' % n_dirs]
+    if n_hashed:
+        summary.append('%d files hashed' % n_hashed)
+    summary.append('%d checksum files' % n_sums)
+    if index:
+        summary.append('%d listings' % n_index)
+    logger.info('Finished %s in %s: %s'
+                % (tree, format_duration(time.monotonic() - started), ', '.join(summary)))
 
 
 def main() -> None:
