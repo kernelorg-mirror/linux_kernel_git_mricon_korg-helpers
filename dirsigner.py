@@ -353,16 +353,25 @@ def read_our_index(index_file: str) -> bytes | None:
     return contents
 
 
+def matches_any(name: str, full_path: str, patterns: list[str]) -> bool:
+    """Does this file match any of these globs, by name or by full path?"""
+    for pattern in patterns:
+        if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(full_path, pattern):
+            logger.debug('%s matches %s' % (full_path, pattern))
+            return True
+    return False
+
+
 def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: list[str],
                      status: dict[str, FileStatus], hash_algorithm: str,
                      symlinks: list[str]) -> None:
     """Write index.html for a single directory.
 
-    Subdirectories come first, then the files in the same order they appear
-    in the sums file, then any symlinks, then the sums file itself. Dotfiles
-    are left out, the way nginx leaves them out. Sizes and mtimes for the
-    checksummed files come from the status we already collected, so the only
-    stat calls here are for subdirectories, symlinks and the sums file.
+    Subdirectories come first, then the files, then any symlinks, then the
+    sums file itself. Dotfiles are left out, the way nginx leaves them out.
+    Sizes and mtimes for the checksummed files come from the status we
+    already collected; anything else in the file list, such as a .sign that
+    -x kept out of the checksums, is looked at on disk.
 
     A hand-written index.html is left exactly as it is, so this never
     destroys a page somebody put there on purpose.
@@ -456,16 +465,20 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
               index: bool = False, urlprefix: str = '/') -> None:
     logger.info('Recursively scanning %s' % tree)
 
-    # Make sure '*sums.asc' and .dirsigner.* are always in excludes
-    if '*sums.asc' not in excludes:
-        excludes.append('*sums.asc')
-    if '.dirsigner.*' not in excludes:
-        excludes.append('.dirsigner.*')
-    # index.html is written after the sums file, so it can never be in it
-    if index and INDEX_FILE not in excludes:
-        excludes.append(INDEX_FILE)
+    # Our own bookkeeping files, which are neither checksummed nor listed.
+    # Kept apart from the caller's excludes because those two are not the
+    # same thing: -x keeps a file out of the sums file, but the file is still
+    # there and the server used to list it, so we list it too. The sums file
+    # is the exception and gets added back to the listing by hand, since a
+    # listing that omitted it would be odd.
+    internal = ['*sums.asc', '.dirsigner.*']
+    if index:
+        # Written after the sums file, so it can never be in it, and listing
+        # it would make the page describe itself and never settle
+        internal.append(INDEX_FILE)
 
-    logger.debug('Exclude list: %s' % ' '.join(excludes))
+    logger.debug('Not checksummed or listed: %s' % ' '.join(internal))
+    logger.debug('Not checksummed: %s' % ' '.join(excludes))
 
     prefix = '/' + urlprefix.strip('/')
     if not prefix.endswith('/'):
@@ -479,19 +492,23 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
         found_files: list[str] = []
         found_links: list[str] = []
+        # Excluded from the sums file but still listed, .sign files being the
+        # reason this exists
+        found_unsigned: list[str] = []
         dir_changed = False
 
         for name in files:
             full_path = os.path.join(root, name)
 
-            # Does it match excludes?
-            excluded = False
-            for exclude in excludes:
-                if fnmatch.fnmatch(name, exclude) or fnmatch.fnmatch(full_path, exclude):
-                    logger.debug('Excluding %s because it matches %s' % (full_path, exclude))
-                    excluded = True
-                    break
-            if excluded:
+            # Ours to hide entirely?
+            if matches_any(name, full_path, internal):
+                continue
+
+            # Excluded from the checksums, but still a file the server would
+            # have listed, so remember it for the index and move on
+            if matches_any(name, full_path, excludes):
+                logger.debug('Not checksumming excluded %s' % full_path)
+                found_unsigned.append(name)
                 continue
 
             # Get stats on the file and compare to what we have in the status.
@@ -591,13 +608,10 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             # No islink check here: os.walk never descends into a symlinked
             # directory anyway, and skipping the exclude check for one meant
             # -x could not keep it out of the index.
-            excluded = False
-            for exclude in excludes:
-                if fnmatch.fnmatch(name, exclude) or fnmatch.fnmatch(full_path, exclude):
-                    logger.debug('Excluding %s because it matches %s' % (full_path, exclude))
-                    excluded = True
-                    break
-            if excluded:
+            # Unlike a file, an excluded directory is dropped from the
+            # listing as well: we do not walk into it, so we have nothing
+            # to say about what is in there.
+            if matches_any(name, full_path, excludes + internal):
                 to_rm.append(name)
                 continue
 
@@ -615,9 +629,19 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             # there is no published order to preserve and we can just sort.
             found_links.sort(key=get_version_info if vsort else None)
 
+            # Files excluded from the checksums still belong in the listing.
+            # With vsort they get merged in and sorted alongside the rest, so
+            # a .sign lands next to the tarball it signs. Without it we have
+            # to append: found_files is in filesystem order, which we must
+            # not disturb, so there is nowhere sensible to slot them in.
+            if vsort:
+                listed = sorted(found_files + found_unsigned, key=get_version_info)
+            else:
+                listed = found_files + sorted(found_unsigned)
+
             relpath = os.path.relpath(root, tree)
             urlpath = prefix if relpath == '.' else prefix + relpath + '/'
-            write_index_file(root, urlpath, found_files, dirs, status, hash_algorithm,
+            write_index_file(root, urlpath, listed, dirs, status, hash_algorithm,
                              found_links)
 
 

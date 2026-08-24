@@ -1097,6 +1097,75 @@ class TestSignTreeIndex:
         assert '<a href="sub/">' in (tmp_path / 'index.html').read_text()
 
 
+class TestExcludedFilesAreStillListed:
+    """-x keeps a file out of the sums file, not out of the listing."""
+
+    @staticmethod
+    def sums(tmp_path: Path) -> str:
+        return (tmp_path / 'sha256sums.asc').read_text()
+
+    def test_sign_files_are_listed_but_not_checksummed(self, tmp_path: Path,
+                                                      fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'linux-6.12.tar.xz': 'tarball',
+                             'linux-6.12.tar.sign': 'signature'})
+        dirsigner.sign_tree(str(tmp_path), ['*.sign'], 'sha256', index=True)
+
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '<a href="linux-6.12.tar.sign">' in page
+        assert '<a href="linux-6.12.tar.xz">' in page
+
+        signed = fake_gpg[0].payload.decode('utf-8')
+        assert 'linux-6.12.tar.xz' in signed
+        assert 'linux-6.12.tar.sign' not in signed
+
+    def test_a_sign_file_sits_next_to_its_tarball(self, tmp_path: Path,
+                                                 fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'linux-6.11.tar.xz': 'a', 'linux-6.11.tar.sign': 'b',
+                             'linux-6.12.tar.xz': 'c', 'linux-6.12.tar.sign': 'd'})
+        dirsigner.sign_tree(str(tmp_path), ['*.sign'], 'sha256', index=True, vsort=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        names = re.findall(r'<a href="(linux[^"]+)">', page)
+        assert names == ['linux-6.11.tar.sign', 'linux-6.11.tar.xz',
+                         'linux-6.12.tar.sign', 'linux-6.12.tar.xz']
+
+    def test_an_excluded_file_shows_its_real_size(self, tmp_path: Path,
+                                                 fake_gpg: list[SignCall]) -> None:
+        # It is not in status, so the size has to come off the disk
+        (tmp_path / 'linux-6.12.tar.sign').write_bytes(b'x' * 40960)
+        os.utime(tmp_path / 'linux-6.12.tar.sign', (0, utc('10-Aug-2026 19:00')))
+        dirsigner.sign_tree(str(tmp_path), ['*.sign'], 'sha256', index=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '10-Aug-2026 19:00     40K' in page
+
+    def test_excluding_everything_leaves_no_sums_file(self, tmp_path: Path,
+                                                     fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'a.sign': 'x', 'b.sign': 'y'})
+        dirsigner.sign_tree(str(tmp_path), ['*.sign'], 'sha256', index=True)
+        assert not (tmp_path / 'sha256sums.asc').exists()
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '<a href="a.sign">' in page and '<a href="b.sign">' in page
+
+    def test_our_own_bookkeeping_is_never_listed(self, tmp_path: Path,
+                                                fake_gpg: list[SignCall]) -> None:
+        make_tree(tmp_path, {'blob': 'content'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        # The sums file is added back deliberately; the rest stays hidden
+        assert '<a href="sha256sums.asc">' in page
+        assert dirsigner.INDEX_FILE not in page
+        assert '.dirsigner' not in page
+
+    def test_an_excluded_directory_is_still_dropped(self, tmp_path: Path,
+                                                   fake_gpg: list[SignCall]) -> None:
+        # Unlike a file: we never walk into it, so we have nothing to say
+        # about what is in there
+        make_tree(tmp_path, {'skipme/blob': 'x', 'keep/blob': 'y'})
+        dirsigner.sign_tree(str(tmp_path), ['skipme'], 'sha256', index=True)
+        page = (tmp_path / dirsigner.INDEX_FILE).read_text()
+        assert '<a href="keep/">' in page
+        assert 'skipme' not in page
+
+
 class TestDottedEntriesAreHidden:
     """Dotfiles and dot-directories stay out of the listing, as nginx did."""
 
@@ -1218,11 +1287,14 @@ class TestSymlinksInIndex:
                   (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
         assert listed == ['../', 'keep/', 'real/'], 'excludes must apply to symlinked dirs'
 
-    def test_excluded_symlinks_are_not_listed(self, tmp_path: Path) -> None:
+    def test_excluded_symlinks_are_still_listed(self, tmp_path: Path) -> None:
+        # -x governs the checksums, and a symlink never had one anyway, so
+        # there is nothing for it to exclude here: the link exists and the
+        # server listed it, so we list it.
         make_tree(tmp_path, {'blob': 'content'})
         (tmp_path / 'skip.txt').symlink_to('blob')
         dirsigner.sign_tree(str(tmp_path), ['*.txt'], 'sha256', index=True)
-        assert 'skip.txt' not in (tmp_path / 'index.html').read_text()
+        assert 'skip.txt' in (tmp_path / 'index.html').read_text()
 
     def test_an_index_html_symlink_is_left_alone(self, tmp_path: Path) -> None:
         make_tree(tmp_path, {'blob': 'content'})
