@@ -567,6 +567,45 @@ class TestHandWrittenIndex:
 class TestFsChurn:
     """A run over an unchanged tree must not touch the filesystem."""
 
+    def test_writing_a_child_index_does_not_dirty_the_parent(self, tmp_path: Path,
+                                                             fake_gpg: list[SignCall]) -> None:
+        """One pass has to be enough, however deep the tree goes.
+
+        Creating index.html inside a directory moves that directory's mtime.
+        Back when we listed directory timestamps, that made every parent page
+        stale the moment we wrote a child, so a single run left the whole tree
+        needing another one, and the rewrites rippled upwards for as many runs
+        as the tree was deep.
+        """
+        make_tree(tmp_path, {'a/b/c/d/blob': 'content'})
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+
+        pages = {}
+        for root, _dirs, files in os.walk(tmp_path):
+            if dirsigner.INDEX_FILE in files:
+                index = os.path.join(root, dirsigner.INDEX_FILE)
+                pages[index] = (open(index, 'rb').read(), os.stat(index).st_mtime_ns)
+        assert len(pages) == 5, 'expected an index in every directory'
+
+        # Move a subdirectory's mtime, which is exactly what creating or
+        # removing index.html inside it does. Done explicitly because a real
+        # create and the run that follows it usually land in the same minute,
+        # and the stamp only ever had minute resolution.
+        os.utime(tmp_path / 'a', (0, utc('10-Aug-2026 19:05')))
+
+        # A second pass must find every single one of them already correct
+        dirsigner.sign_tree(str(tmp_path), [], 'sha256', index=True)
+        for index, (contents, mtime_ns) in pages.items():
+            assert open(index, 'rb').read() == contents, '%s was rewritten' % index
+            assert os.stat(index).st_mtime_ns == mtime_ns, '%s was touched' % index
+
+    def test_a_directory_line_ignores_the_directory_mtime(self, tmp_path: Path) -> None:
+        """The property the test above depends on, checked on its own."""
+        (tmp_path / 'v6.x').mkdir()
+        before = dirsigner.stat_index_entry(str(tmp_path), 'v6.x')
+        os.utime(tmp_path / 'v6.x', (0, utc('10-Aug-2026 19:05')))
+        assert dirsigner.stat_index_entry(str(tmp_path), 'v6.x') == before
+
     def test_default_chunk_size_is_not_tiny(self) -> None:
         # 8K meant 24k read() calls to hash a 200MB tarball
         assert dirsigner.CHUNK_SIZE >= 65536
@@ -709,6 +748,24 @@ def without_marker(page: bytes) -> bytes:
     return page[len(dirsigner.INDEX_MARKER) + 2:]
 
 
+def blank_dir_stamps(page: bytes) -> bytes:
+    """Blank the timestamp on every directory line of a captured nginx page.
+
+    We deliberately leave directory timestamps off, because a directory's
+    mtime moves whenever we write index.html inside it and listing it made
+    one change cascade into rewrites all the way up the tree. Everything
+    else about the page still has to match autoindex byte for byte, which
+    is what this lets the fidelity tests check.
+    """
+    out = []
+    for line in page.split(b'\r\n'):
+        if line.endswith(b'       -') and b'</a>' in line:
+            stamp = b' ' * dirsigner.INDEX_STAMP_WIDTH
+            line = line[:-dirsigner.INDEX_STAMP_WIDTH - 8] + stamp + line[-8:]
+        out.append(line)
+    return b'\r\n'.join(out)
+
+
 def visible(line: str) -> str:
     """Strip anchor markup from an index line, leaving what a browser shows."""
     text = re.sub(r'</?a[^>]*>', '', line)
@@ -756,7 +813,19 @@ class TestFormatIndexEntry:
     def test_directory_entry_has_a_dash_for_size(self) -> None:
         line = dirsigner.format_index_entry('b4/', utc('10-Aug-2026 19:05'), None)
         assert line == ('<a href="b4/">b4/</a>'
-                        '                                                10-Aug-2026 19:05       -')
+                        '                                                                        -')
+
+    def test_directory_entry_carries_no_timestamp(self) -> None:
+        # Deliberate: a directory mtime moves whenever we write index.html
+        # inside it, so listing it turned one change into a cascade.
+        line = dirsigner.format_index_entry('b4/', utc('10-Aug-2026 19:05'), None)
+        assert '2026' not in line
+        assert '19:05' not in line
+
+    def test_directory_and_file_lines_still_line_up(self) -> None:
+        d = visible(dirsigner.format_index_entry('b4/', utc('10-Aug-2026 19:05'), None))
+        f = visible(dirsigner.format_index_entry('b4.tar', utc('10-Aug-2026 19:05'), 40960))
+        assert len(d) == len(f)
 
     def test_columns_line_up(self) -> None:
         rendered = [visible(dirsigner.format_index_entry(name, 0, 1))
@@ -807,7 +876,7 @@ class TestRenderIndex:
             dirsigner.format_index_entry('liblore/', utc('13-Aug-2026 01:05'), None),
         ]
         assert without_marker(dirsigner.render_index(
-            '/pub/software/devel/', entries)) == NGINX_DEVEL
+            '/pub/software/devel/', entries)) == blank_dir_stamps(NGINX_DEVEL)
 
     def test_uses_crlf_line_endings(self) -> None:
         page = dirsigner.render_index('/', [])

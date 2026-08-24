@@ -49,6 +49,9 @@ HASH_ALGORITHMS = ('md5', 'sha1', 'sha256', 'sha512')
 INDEX_FILE = 'index.html'
 # Width of the name column in the index, matching nginx's autoindex module
 INDEX_NAME_WIDTH = 50
+# Width of the 'dd-Mon-yyyy HH:MM' timestamp column, which we blank out for
+# directories but still have to pad to keep the size column aligned
+INDEX_STAMP_WIDTH = 17
 # First line of every index.html we write, so we can tell our own listings
 # apart from hand-written ones and leave those alone. Deliberately carries no
 # version or timestamp: it has to stay byte-stable, or every run would find
@@ -234,9 +237,18 @@ def format_size(size: int) -> str:
 def format_index_entry(name: str, mtime: int, size: int | None) -> str:
     """Format one line of a directory index, nginx autoindex style.
 
-    Pass size=None for a subdirectory, which gets a '-' in the size column.
-    Names longer than the name column are shown truncated, but always link
-    to the full name.
+    Pass size=None for a subdirectory, which gets a '-' in the size column
+    and a blank timestamp. Names longer than the name column are shown
+    truncated, but always link to the full name.
+
+    Leaving the timestamp off directories is a deliberate departure from
+    nginx autoindex, which showed it. A directory's mtime moves whenever
+    anything is added to or removed from it, including the index.html we
+    write there ourselves, so listing it made every parent page change
+    every time we touched a child and turned one real change into a
+    cascade of rewrites up the tree. The stamp was never much use anyway:
+    it says when the directory was last modified, not when its contents
+    were.
     """
     if len(name) > INDEX_NAME_WIDTH:
         shown = html.escape(name[:INDEX_NAME_WIDTH - 3], quote=False) + '..&gt;'
@@ -245,8 +257,13 @@ def format_index_entry(name: str, mtime: int, size: int | None) -> str:
         shown = html.escape(name, quote=False)
         padding = ' ' * (INDEX_NAME_WIDTH - len(name))
 
-    stamp = time.strftime('%d-%b-%Y %H:%M', time.gmtime(mtime))
-    column = '-' if size is None else format_size(size)
+    if size is None:
+        # Same width as a real stamp, so the size column still lines up
+        stamp = ' ' * INDEX_STAMP_WIDTH
+        column = '-'
+    else:
+        stamp = time.strftime('%d-%b-%Y %H:%M', time.gmtime(mtime))
+        column = format_size(size)
 
     # One space after the padded name, then the size right-aligned in 8
     return '<a href="%s">%s</a>%s %s%8s' % (urllib.parse.quote(name), shown, padding, stamp, column)
