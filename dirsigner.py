@@ -37,7 +37,7 @@ import gpg
 import gpg.constants.sig
 from packaging.version import InvalidVersion, Version
 
-VERSION = '0.1'
+VERSION = '0.2'
 CHUNK_SIZE = 8192
 HASH_ALGORITHMS = ('md5', 'sha1', 'sha256', 'sha512')
 
