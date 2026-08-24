@@ -16,6 +16,10 @@
 
 __author__ = 'Konstantin Ryabitsev'
 
+# Targets python-3.12. Other scripts in this collection aim lower, so do not
+# copy idioms out of here without checking they work wherever you are taking
+# them.
+
 import argparse
 import fnmatch
 import hashlib
@@ -30,7 +34,7 @@ import time
 import urllib.parse
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, lockf
 from io import BytesIO
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 import gpg
 import gpg.constants.sig
@@ -222,7 +226,7 @@ def format_size(size: int) -> str:
     return '%d%s' % (scaled, unit)
 
 
-def format_index_entry(name: str, mtime: int, size: Optional[int]) -> str:
+def format_index_entry(name: str, mtime: int, size: int | None) -> str:
     """Format one line of a directory index, nginx autoindex style.
 
     Pass size=None for a subdirectory, which gets a '-' in the size column.
@@ -243,7 +247,7 @@ def format_index_entry(name: str, mtime: int, size: Optional[int]) -> str:
     return '<a href="%s">%s</a>%s %s%8s' % (urllib.parse.quote(name), shown, padding, stamp, column)
 
 
-def stat_index_entry(root: str, name: str) -> Optional[str]:
+def stat_index_entry(root: str, name: str) -> str | None:
     """Format an index entry for something we have to look at on disk.
 
     Symlinks are followed, the way the server's autoindex followed them, so
@@ -339,7 +343,7 @@ def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: l
 
     # A single lstat answers both "is it there" and "is it a symlink"
     try:
-        istat: Optional[os.stat_result] = os.lstat(index_file)
+        istat: os.stat_result | None = os.lstat(index_file)
     except OSError:
         istat = None
 
