@@ -8,13 +8,12 @@ Use the load_script() helper to import them in tests.
 import importlib.util
 import sys
 from pathlib import Path
-
-import pytest
+from types import ModuleType
 
 HELPERS_DIR = Path(__file__).resolve().parent.parent
 
 
-def load_script(script_name: str):
+def load_script(script_name: str) -> ModuleType:
     """Import a helper script as a module.
 
     Handles hyphenated filenames by converting them to a valid module
@@ -37,6 +36,9 @@ def load_script(script_name: str):
         return sys.modules[module_name]
 
     spec = importlib.util.spec_from_file_location(module_name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Could not build an import spec for {script_path}')
+
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
