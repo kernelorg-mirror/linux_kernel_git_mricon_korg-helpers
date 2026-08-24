@@ -18,7 +18,6 @@ __author__ = 'Konstantin Ryabitsev'
 
 import argparse
 import fnmatch
-import functools
 import hashlib
 import html
 import json
@@ -147,24 +146,6 @@ def get_version_info(filen: str) -> tuple[str, Version, str]:
         ver = _safe_version('0')
 
     return name, ver, '.'.join(tail)
-
-
-def version_sort(x: str, y: str) -> int:
-    namex, verx, tailx = get_version_info(x)
-    namey, very, taily = get_version_info(y)
-    if namex > namey:
-        return 1
-    if namex < namey:
-        return -1
-    if verx > very:
-        return 1
-    if verx < very:
-        return -1
-    if tailx > taily:
-        return 1
-    if tailx < taily:
-        return -1
-    return 0
 
 
 def load_status(statusfile: str) -> dict[str, FileStatus]:
@@ -438,18 +419,21 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             if excluded:
                 continue
 
-            if os.path.islink(full_path):
-                # Listed in the index, but never checksummed: the target is
-                # either elsewhere in the tree and signed there, or outside it.
-                logger.debug('Not checksumming symlink %s' % name)
-                found_links.append(name)
-                continue
-
-            # Get stats on the file and compare to what we have in the status
+            # Get stats on the file and compare to what we have in the status.
+            # This is the only stat we make per file, so everything below has
+            # to come out of st_mode rather than calling os.path.islink and
+            # friends, which would stat all over again.
             try:
                 fstat = os.lstat(full_path)
             except OSError:
                 logger.debug('Was not able to stat %s, ignoring' % full_path)
+                continue
+
+            if stat.S_ISLNK(fstat.st_mode):
+                # Listed in the index, but never checksummed: the target is
+                # either elsewhere in the tree and signed there, or outside it.
+                logger.debug('Not checksumming symlink %s' % name)
+                found_links.append(name)
                 continue
 
             found_files.append(name)
@@ -494,9 +478,12 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
                     'hash': file_hash,
                     }
 
-        # Weed out status entries for files that are no longer there
+        # Weed out status entries for files that are no longer there. Uses a
+        # set because directories here can hold thousands of files, and a
+        # linear scan of found_files per entry makes this quadratic.
+        present = set(found_files)
         for entry in list(status.keys()):
-            if entry not in found_files:
+            if entry not in present:
                 logger.info('File %s from status is no longer there' % entry)
                 del status[entry]
                 dir_changed = True
@@ -514,7 +501,7 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             # Debug rather than info: this runs for every directory on every
             # run now, whether anything changed or not.
             logger.debug('Version-sorting %s' % root)
-            found_files.sort(key=functools.cmp_to_key(version_sort))
+            found_files.sort(key=get_version_info)
 
         if dir_changed:
             write_sums_file(root, found_files, status, hash_algorithm)
@@ -526,10 +513,9 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
         for name in dirs:
             full_path = os.path.join(root, name)
 
-            if os.path.islink(full_path):
-                logger.debug('Ignoring symlink %s' % name)
-                continue
-
+            # No islink check here: os.walk never descends into a symlinked
+            # directory anyway, and skipping the exclude check for one meant
+            # -x could not keep it out of the index.
             excluded = False
             for exclude in excludes:
                 if fnmatch.fnmatch(name, exclude) or fnmatch.fnmatch(full_path, exclude):
@@ -552,7 +538,7 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
             # Symlinks were never in a sums file, so unlike the files above
             # there is no published order to preserve and we can just sort.
-            found_links.sort(key=functools.cmp_to_key(version_sort) if vsort else None)
+            found_links.sort(key=get_version_info if vsort else None)
 
             relpath = os.path.relpath(root, tree)
             urlpath = prefix if relpath == '.' else prefix + relpath + '/'

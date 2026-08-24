@@ -1,7 +1,6 @@
 """Tests for dirsigner.py."""
 
 import calendar
-import functools
 import hashlib
 import importlib.util
 import json
@@ -177,22 +176,33 @@ class TestGetVersionInfo:
         assert tail == ''
 
 
-class TestVersionSort:
-    """Tests for the version-aware comparator."""
+def vsorted(names: list[str]) -> list[str]:
+    """Sort the way --version-sort does."""
+    return sorted(names, key=dirsigner.get_version_info)
 
-    def test_identical(self) -> None:
-        assert dirsigner.version_sort('linux-6.1.tar.gz', 'linux-6.1.tar.gz') == 0
+
+class TestVersionSort:
+    """Tests for the ordering get_version_info gives us as a sort key.
+
+    get_version_info returns (name, version, tail), so sorting on it compares
+    those three in order. These tests pin that ordering down.
+    """
+
+    def test_identical_names_are_equal(self) -> None:
+        a, b = 'linux-6.1.tar.gz', 'linux-6.1.tar.gz'
+        assert dirsigner.get_version_info(a) == dirsigner.get_version_info(b)
 
     def test_name_wins_over_version(self) -> None:
-        assert dirsigner.version_sort('aaa-1.0.gz', 'zzz-9.0.gz') < 0
-        assert dirsigner.version_sort('zzz-1.0.gz', 'aaa-9.0.gz') > 0
+        assert vsorted(['zzz-1.0.gz', 'aaa-9.0.gz']) == ['aaa-9.0.gz', 'zzz-1.0.gz']
 
     def test_version_is_numeric_not_lexical(self) -> None:
         # This is the whole point of --version-sort: 1.10 comes after 1.2.
-        assert dirsigner.version_sort('linux-1.2.tar.gz', 'linux-1.10.tar.gz') < 0
+        assert vsorted(['linux-1.10.tar.gz', 'linux-1.2.tar.gz']) == [
+            'linux-1.2.tar.gz', 'linux-1.10.tar.gz']
 
     def test_tail_breaks_the_tie(self) -> None:
-        assert dirsigner.version_sort('linux-6.1.tar.gz', 'linux-6.1.tar.sign') < 0
+        assert vsorted(['linux-6.1.tar.sign', 'linux-6.1.tar.gz']) == [
+            'linux-6.1.tar.gz', 'linux-6.1.tar.sign']
 
     def test_sorts_a_realistic_listing(self) -> None:
         names = [
@@ -202,14 +212,18 @@ class TestVersionSort:
             'linux-6.12.2.tar.sign',
             'linux-6.9.tar.xz',
         ]
-        names.sort(key=functools.cmp_to_key(dirsigner.version_sort))
-        assert names == [
+        assert vsorted(names) == [
             'linux-6.9.tar.xz',
             'linux-6.12.2.tar.sign',
             'linux-6.12.2.tar.xz',
             'linux-6.12.10.tar.xz',
             'patch-6.12.1.xz',
         ]
+
+    def test_unparseable_names_still_sort_by_name(self) -> None:
+        # Anything without a name-version shape lands at version 0, so the
+        # name is all we have left to go on. It must not blow up.
+        assert vsorted(['zebra', 'apple', 'a-', '-1']) == ['-1', 'a-', 'apple', 'zebra']
 
 
 class TestStatusFile:
@@ -921,6 +935,14 @@ class TestSymlinksInIndex:
         written = [os.path.join(root, dirsigner.INDEX_FILE) for root, _, files
                    in os.walk(str(tmp_path)) if dirsigner.INDEX_FILE in files]
         assert written == [str(tmp_path / 'index.html'), str(tmp_path / 'v6.12' / 'index.html')]
+
+    def test_excluded_symlinked_directories_are_not_listed(self, tmp_path: Path) -> None:
+        make_tree(tmp_path, {'real/blob': 'content', 'keep/blob': 'content'})
+        (tmp_path / 'skipme').symlink_to('real')
+        dirsigner.sign_tree(str(tmp_path), ['skipme'], 'sha256', index=True)
+        listed = [line.split('"')[1] for line in
+                  (tmp_path / 'index.html').read_text().splitlines() if '<a href' in line]
+        assert listed == ['../', 'keep/', 'real/'], 'excludes must apply to symlinked dirs'
 
     def test_excluded_symlinks_are_not_listed(self, tmp_path: Path) -> None:
         make_tree(tmp_path, {'blob': 'content'})
