@@ -20,14 +20,17 @@ import argparse
 import fnmatch
 import functools
 import hashlib
+import html
 import json
 import logging
 import os
 import re
 import sys
+import time
+import urllib.parse
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, lockf
 from io import BytesIO
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 import gpg
 import gpg.constants.sig
@@ -36,6 +39,10 @@ from packaging.version import InvalidVersion, Version
 VERSION = '0.1'
 CHUNK_SIZE = 8192
 HASH_ALGORITHMS = ('md5', 'sha1', 'sha256', 'sha512')
+
+INDEX_FILE = 'index.html'
+# Width of the name column in the index, matching nginx's autoindex module
+INDEX_NAME_WIDTH = 50
 
 logger = logging.getLogger('dirsigner')
 
@@ -91,6 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('-s', '--version-sort', dest='vsort', action='store_true',
                         default=False,
                         help='Sort entries in the sums file by version (default: %(default)s)')
+    parser.add_argument('-i', '--index', dest='index', action='store_true',
+                        default=False,
+                        help=('Also write an nginx-style index.html in every directory '
+                              '(default: %(default)s)'))
+    parser.add_argument('-u', '--url-prefix', dest='urlprefix',
+                        default='/',
+                        help=('URL path the tree is served under, used in index.html '
+                              'titles (default: %(default)s)'))
     parser.add_argument('-k', '--lock-file', dest='lockfile',
                         default='.dirsigner.lock',
                         help='Path to the lockfile (default: %(default)s)')
@@ -200,8 +215,124 @@ def get_file_hash(full_path: str, hash_algorithm: str) -> str:
     return m.hexdigest()
 
 
+def format_size(size: int) -> str:
+    """Render a file size the way nginx's autoindex module does."""
+    if size > 1024 ** 3 - 1:
+        scale, unit = 1024 ** 3, 'G'
+    elif size > 1024 ** 2 - 1:
+        scale, unit = 1024 ** 2, 'M'
+    elif size > 9999:
+        scale, unit = 1024, 'K'
+    else:
+        return '%d' % size
+
+    # nginx rounds to the nearest whole unit instead of truncating
+    scaled = size // scale
+    if size % scale > scale // 2 - 1:
+        scaled += 1
+
+    return '%d%s' % (scaled, unit)
+
+
+def format_index_entry(name: str, mtime: int, size: Optional[int]) -> str:
+    """Format one line of a directory index, nginx autoindex style.
+
+    Pass size=None for a subdirectory, which gets a '-' in the size column.
+    Names longer than the name column are shown truncated, but always link
+    to the full name.
+    """
+    if len(name) > INDEX_NAME_WIDTH:
+        shown = html.escape(name[:INDEX_NAME_WIDTH - 3], quote=False) + '..&gt;'
+        padding = ''
+    else:
+        shown = html.escape(name, quote=False)
+        padding = ' ' * (INDEX_NAME_WIDTH - len(name))
+
+    stamp = time.strftime('%d-%b-%Y %H:%M', time.gmtime(mtime))
+    column = '-' if size is None else format_size(size)
+
+    # One space after the padded name, then the size right-aligned in 8
+    return '<a href="%s">%s</a>%s %s%8s' % (urllib.parse.quote(name), shown, padding, stamp, column)
+
+
+def render_index(urlpath: str, entries: list[str]) -> bytes:
+    """Wrap formatted entries in the page nginx would have served."""
+    title = html.escape(urlpath, quote=False)
+    lines = [
+        '<html>',
+        '<head><title>Index of %s</title></head>' % title,
+        '<body>',
+        '<h1>Index of %s</h1><hr><pre><a href="../">../</a>' % title,
+    ]
+    lines += entries
+    lines += ['</pre><hr></body>', '</html>', '']
+
+    return '\r\n'.join(lines).encode('utf-8')
+
+
+def write_index_file(root: str, urlpath: str, found_files: list[str], subdirs: list[str],
+                     status: dict[str, FileStatus], hash_algorithm: str) -> None:
+    """Write index.html for a single directory.
+
+    Subdirectories come first, then the files in the same order they appear
+    in the sums file, then the sums file itself. Dotfiles are left out, the
+    way nginx leaves them out. Sizes and mtimes come from the status we
+    already collected, so this costs no extra stat calls beyond the
+    subdirectories and the sums file.
+    """
+    index_file = os.path.join(root, INDEX_FILE)
+    entries = []
+
+    for name in subdirs:
+        try:
+            dstat = os.lstat(os.path.join(root, name))
+        except OSError:
+            logger.debug('Was not able to stat %s, leaving it out of the index' % name)
+            continue
+        entries.append(format_index_entry(name + '/', int(dstat.st_mtime), None))
+
+    listed = [name for name in found_files if not name.startswith('.')]
+
+    # The sums file is excluded from its own checksums, but it should still
+    # show up in the listing, same as it did with the server's autoindex.
+    sums_name = hash_algorithm + 'sums.asc'
+    if os.path.exists(os.path.join(root, sums_name)):
+        listed.append(sums_name)
+
+    for name in listed:
+        if name in status:
+            entries.append(format_index_entry(name, status[name]['mtime'], status[name]['size']))
+            continue
+        try:
+            fstat = os.lstat(os.path.join(root, name))
+        except OSError:
+            logger.debug('Was not able to stat %s, leaving it out of the index' % name)
+            continue
+        entries.append(format_index_entry(name, int(fstat.st_mtime), fstat.st_size))
+
+    if not entries:
+        if os.path.exists(index_file):
+            logger.info('Removing obsolete %s' % index_file)
+            os.unlink(index_file)
+        return
+
+    contents = render_index(urlpath, entries)
+
+    # Only write when something actually changed, so we don't churn mtimes
+    if os.path.exists(index_file):
+        with open(index_file, 'rb') as ifh:
+            if ifh.read() == contents:
+                logger.debug('%s is already up to date' % index_file)
+                return
+
+    with open(index_file, 'wb') as ifh:
+        ifh.write(contents)
+
+    logger.info('Wrote %s' % index_file)
+
+
 def write_sums_file(root: str, found_files: list[str], status: dict[str, FileStatus],
-                    hash_algorithm: str, vsort: bool = False) -> None:
+                    hash_algorithm: str) -> None:
     # Clean out any stale sums files
     for supported_algorithm in HASH_ALGORITHMS:
         sums_file = os.path.join(root, supported_algorithm + 'sums.asc')
@@ -212,9 +343,6 @@ def write_sums_file(root: str, found_files: list[str], status: dict[str, FileSta
         return
 
     tfh = BytesIO()
-    if vsort:
-        logger.info('Version-sorting %s', root)
-        found_files.sort(key=functools.cmp_to_key(version_sort))
     for filename in found_files:
         checksum = status[filename]['hash']
         tfh.write(('%s  %s\n' % (checksum, filename)).encode('utf-8'))
@@ -232,7 +360,8 @@ def write_sums_file(root: str, found_files: list[str], status: dict[str, FileSta
     logger.info('Wrote %s' % sums_file)
 
 
-def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool = False) -> None:
+def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool = False,
+              index: bool = False, urlprefix: str = '/') -> None:
     logger.info('Recursively scanning %s' % tree)
 
     # Make sure '*sums.asc' and .dirsigner.* are always in excludes
@@ -240,8 +369,15 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
         excludes.append('*sums.asc')
     if '.dirsigner.*' not in excludes:
         excludes.append('.dirsigner.*')
+    # index.html is written after the sums file, so it can never be in it
+    if index and INDEX_FILE not in excludes:
+        excludes.append(INDEX_FILE)
 
     logger.debug('Exclude list: %s' % ' '.join(excludes))
+
+    prefix = '/' + urlprefix.strip('/')
+    if not prefix.endswith('/'):
+        prefix += '/'
 
     for root, dirs, files in os.walk(tree, topdown=True):
         logger.debug('Entered %s' % root)
@@ -329,8 +465,18 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
             # Always generate one if we don't have it
             dir_changed = True
 
+        # Sorted here rather than in write_sums_file, so that the index
+        # lists files in exactly the order the sums file does. Without
+        # vsort that is whatever order the filesystem handed us, which we
+        # must not change: it would rewrite and re-sign every sums file.
+        if vsort:
+            # Debug rather than info: this runs for every directory on every
+            # run now, whether anything changed or not.
+            logger.debug('Version-sorting %s' % root)
+            found_files.sort(key=functools.cmp_to_key(version_sort))
+
         if dir_changed:
-            write_sums_file(root, found_files, status, hash_algorithm, vsort=vsort)
+            write_sums_file(root, found_files, status, hash_algorithm)
             # Save status after each changed dir
             save_status(statusfile, status)
 
@@ -355,6 +501,17 @@ def sign_tree(tree: str, excludes: list[str], hash_algorithm: str, vsort: bool =
 
         for name in to_rm:
             dirs.remove(name)
+
+        if index:
+            # Subdirectories sort by name, which is what the server's
+            # autoindex did. version_sort would be no help here: it needs a
+            # name-version-extension filename and treats everything else as
+            # version 0. Sorting also makes the walk order stable.
+            dirs.sort()
+
+            relpath = os.path.relpath(root, tree)
+            urlpath = prefix if relpath == '.' else prefix + relpath + '/'
+            write_index_file(root, urlpath, found_files, dirs, status, hash_algorithm)
 
 
 def main() -> None:
@@ -400,7 +557,8 @@ def main() -> None:
 
     logger.debug('Lock obtained')
 
-    sign_tree(opts.tree, opts.excludes, opts.hash_algorithm, vsort=opts.vsort)
+    sign_tree(opts.tree, opts.excludes, opts.hash_algorithm, vsort=opts.vsort,
+              index=opts.index, urlprefix=opts.urlprefix)
     lockf(lock_fh, LOCK_UN)
     logger.debug('Lock released')
 
