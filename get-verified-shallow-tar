@@ -201,6 +201,13 @@ if [[ ! -d ${TARGETDIR} ]]; then
     echo "${TARGETDIR} does not exist"
     exit 1
 fi
+# Everything below is derived from TARGETDIR, and we chdir into the work
+# directory to check the tarball, so a relative TARGETDIR (the default is
+# ".") would leave those paths pointing somewhere else entirely.
+if ! TARGETDIR=$(cd "${TARGETDIR}" && pwd); then
+    echo "Could not enter ${TARGETDIR}"
+    exit 1
+fi
 
 # A branch name may contain a slash, which a filename may not, so the
 # publisher turns "/" into "-". Do the same to find the file.
