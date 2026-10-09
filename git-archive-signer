@@ -57,10 +57,14 @@ if [[ -z ${TAG} ]]; then
     fi
 fi
 
-# The archive prefix will be created as $TARNAME-$TAG/ (sans leading v)
-# Change it here if it doesn't correspond to your needs
+# The archive prefix will be created as $TARNAME-$VERSION/, where VERSION
+# is the tag without a leading "v" or "$TARNAME-", so that both v1.2.3 and
+# foo-1.2.3 give foo-1.2.3/. This is what the kernel.org side builds, with
+# archive-signer.relregex = name-version for foo-1.2.3 style tags.
 # We'll add the trailing / where it is needed, so don't add it here
-PREFIX="${TARNAME}-${TAG#v}"
+VERSION="${TAG#v}"
+VERSION="${VERSION#${TARNAME}-}"
+PREFIX="${TARNAME}-${VERSION}"
 
 # Do we already have a signature note for this tag?
 # Start by fetching the origin notes
