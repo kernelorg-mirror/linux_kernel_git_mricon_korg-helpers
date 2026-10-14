@@ -4,6 +4,7 @@ import email
 import hashlib
 import hmac
 import json
+import os
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
@@ -154,6 +155,30 @@ def test_write_failure_saves_payload_and_asks_for_retry(tmp_path: Path, monkeypa
 
     assert resp.status_code == 500
     assert [p.name.endswith('-failed.json') for p in emerg_files(tmp_path)] == [True]
+
+
+def test_notify_file_is_touched_only_after_a_write(tmp_path: Path) -> None:
+    notify = tmp_path / 'updated'
+    notify.touch()
+    os.utime(notify, (0, 0))
+    client = make_client(make_config(tmp_path, notify_file=str(notify)))
+
+    unarchivable = make_payload(message='From: a@example.org\n\nno subject\n')
+    assert post(client, unarchivable).status_code == 200
+    assert notify.stat().st_mtime == 0
+
+    assert post(client, make_payload()).status_code == 200
+    assert notify.stat().st_mtime > 0
+
+
+def test_notify_failure_keeps_the_write(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    config = make_config(tmp_path, notify_file=str(tmp_path / 'nonexistent' / 'updated'))
+
+    # The message is archived, so groups.io must not be asked to resend it.
+    assert post(make_client(config), make_payload()).status_code == 200
+    assert len(read_inbox(tmp_path / 'inboxes' / 'devel.groups.io')) == 1
+    assert emerg_files(tmp_path) == []
+    assert 'Could not touch notify_file' in caplog.text
 
 
 def test_missing_emerg_dir_does_not_crash(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

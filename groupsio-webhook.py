@@ -18,6 +18,7 @@ import os
 import re
 import socket
 from configparser import ConfigParser, ExtendedInterpolation
+from pathlib import Path
 from typing import Any
 
 import ezpi
@@ -45,6 +46,7 @@ class GroupsioListener:
         self.psk = psk
         self.inboxdir = main.get('inboxdir')
         self.emerg_dir = main.get('emerg_dir')
+        self.notify_file = main.get('notify_file')
         self.debug = main.get('loglevel', 'info') == 'debug'
         self.auto_epoch = main.get('auto_epoch', 'size')
         if self.auto_epoch not in AUTO_EPOCH_MODES:
@@ -131,7 +133,21 @@ class GroupsioListener:
             return falcon.HTTP_500
 
         logger.info('Wrote %s msg %s to %s', groupaddr, msgnum, inbox)
+        self._notify()
         return falcon.HTTP_200
+
+    def _notify(self) -> None:
+        # Indexing and anything else that follows a write is not ours to run:
+        # it would hold up the response, and its failures would make groups.io
+        # retry an already archived message. Touching a file lets something
+        # like a systemd path unit pick it up instead.
+        if not self.notify_file:
+            return
+        try:
+            Path(self.notify_file).touch()
+        except OSError:
+            # The message is archived, so this is not the sender's problem.
+            logger.exception('Could not touch notify_file %s', self.notify_file)
 
     def _get_inbox(self, groupaddr: str) -> str | None:
         if groupaddr in self.config:
