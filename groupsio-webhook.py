@@ -58,7 +58,7 @@ class GroupsioListener(object):
 
     def on_get(self, req, resp): # noqa
         resp.status = falcon.HTTP_200
-        resp.body = "We don't serve GETs here\n"
+        resp.text = "We don't serve GETs here\n"
 
     def _inject_message(self, doc: dict, req) -> bool:
         success = False
@@ -156,7 +156,7 @@ class GroupsioListener(object):
 
     def _save_emerg(self, filen: str, bdata: bytes):
         emerg_dir = self._config['main'].get('emerg_dir')
-        if not (emerg_dir or os.path.isdir(emerg_dir)):
+        if not emerg_dir or not os.path.isdir(emerg_dir):
             return
         efile = os.path.join(emerg_dir, filen)
         with open(efile, 'wb') as fh:
@@ -166,7 +166,7 @@ class GroupsioListener(object):
     def on_post(self, req, resp):
         if not req.content_length:
             resp.status = falcon.HTTP_500
-            resp.body = 'Payload required\n'
+            resp.text = 'Payload required\n'
             return
 
         logger.info('Received POST from %s', req.remote_addr)
@@ -175,11 +175,11 @@ class GroupsioListener(object):
             vdigest = req.get_header('X-Groupsio-Signature')
             if not vdigest:
                 resp.status = falcon.HTTP_401
-                resp.body = 'HMAC signature header required\n'
+                resp.text = 'HMAC signature header required\n'
                 return
             if not self._verify_psk(self.psk, raw, vdigest):
                 resp.status = falcon.HTTP_401
-                resp.body = 'HMAC signature verification failed\n'
+                resp.text = 'HMAC signature verification failed\n'
                 return
 
         if self._config['main'].get('loglevel', 'info') == 'debug':
@@ -192,7 +192,7 @@ class GroupsioListener(object):
             doc = json.loads(raw)
         except Exception as ex:
             resp.status = falcon.HTTP_500
-            resp.body = 'Failed to parse payload as json\n'
+            resp.text = 'Failed to parse payload as json\n'
             logger.critical('Failed to parse incoming json:')
             logger.critical(str(ex))
             return
@@ -205,10 +205,10 @@ class GroupsioListener(object):
 
         if success:
             resp.status = falcon.HTTP_200
-            resp.body = 'OK thanks\n'
+            resp.text = 'OK thanks\n'
         else:
             resp.status = falcon.HTTP_500
-            resp.body = 'Something went wrong, sorry.\n'
+            resp.text = 'Something went wrong, sorry.\n'
 
 
 parser = ConfigParser(interpolation=ExtendedInterpolation())
