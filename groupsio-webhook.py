@@ -1,225 +1,208 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# This webhook receives events from groups_io and injects them into the
-# local mail queue to be processed as if it came in via the SMTP gateway.
+# This webhook receives message events from groups.io and writes them
+# straight into local public-inbox v2 repositories using ezpi.
 #
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 
-import falcon  # noqa
-import json
-import socket
+import datetime
 import email
+import email.message
 import email.utils
-import email.header
-import email.policy
 import hmac
-import smtplib
-import os
-import sys
+import json
 import logging
 import logging.handlers
-import datetime
-
+import os
+import re
+import socket
 from configparser import ConfigParser, ExtendedInterpolation
+from typing import Any
+
+import ezpi
+import falcon
 
 logger = logging.getLogger('groupsio-webhook')
 logger.setLevel(logging.DEBUG)
 
-emlpolicy = email.policy.EmailPolicy(utf8=True, cte_type='8bit', max_line_length=None)
+# The group address becomes a directory name, so only allow characters that
+# real list addresses use; this rules out path separators and traversal.
+GROUPADDR_RE = re.compile(r'^[a-z0-9][a-z0-9._+-]*@[a-z0-9-]+(\.[a-z0-9-]+)+$')
+
+AUTO_EPOCH_MODES = ('size', 'annual')
 
 
-# noinspection PyBroadException, PyMethodMayBeStatic
-class GroupsioListener(object):
-    _config: ConfigParser
-    psk: str
+class GroupsioListener:
+    def __init__(self, config: ConfigParser) -> None:
+        self.config = config
+        main = config['main']
+        psk = main.get('groupsio_psk')
+        # Inboxes get created on demand, so unsigned requests must never be
+        # accepted, or anyone could create inboxes and inject messages.
+        if not psk:
+            raise ValueError('groupsio_psk must be set in [main]')
+        self.psk = psk
+        self.inboxdir = main.get('inboxdir')
+        self.emerg_dir = main.get('emerg_dir')
+        self.debug = main.get('loglevel', 'info') == 'debug'
+        self.auto_epoch = main.get('auto_epoch', 'size')
+        if self.auto_epoch not in AUTO_EPOCH_MODES:
+            raise ValueError(f'auto_epoch must be one of {", ".join(AUTO_EPOCH_MODES)}')
 
-    def __init__(self, _config: ConfigParser) -> None:
-        self._config = _config
-        self.psk = _config['main'].get('groupsio_psk')
-
-        logfile = _config['main'].get('logfile')
-        loglevel = _config['main'].get('loglevel', 'info')
-        if logfile:
-            self._init_logger(logfile, loglevel)
-
-    def _init_logger(self, logfile: str, loglevel: str) -> None:
-        global logger
-        lch = logging.handlers.WatchedFileHandler(os.path.expanduser(logfile))
-        lfmt = logging.Formatter('[%(process)d] %(asctime)s - %(levelname)s - %(message)s')
-        lch.setFormatter(lfmt)
-        if loglevel == 'critical':
-            lch.setLevel(logging.CRITICAL)
-        elif loglevel == 'debug':
-            lch.setLevel(logging.DEBUG)
-        else:
-            lch.setLevel(logging.INFO)
-        logger.addHandler(lch)
-
-    def on_get(self, req, resp): # noqa
+    def on_get(self, req: falcon.Request, resp: falcon.Response) -> None:
         resp.status = falcon.HTTP_200
         resp.text = "We don't serve GETs here\n"
 
-    def _inject_message(self, doc: dict, req) -> bool:
-        success = False
-        msgnum = doc['msg_num']
-        groupaddr = doc['group']['email_address']
-        groupurl = doc['group']['group_url']
-        logger.info('Received %s msg %s', groupaddr, msgnum)
-        logger.debug('---%s START---', msgnum)
-        logger.debug(doc['message'])
-        logger.debug('---%s END---', msgnum)
-
-        try:
-            msg = email.message_from_string(doc['message'])
-            try:
-                theirname = socket.gethostbyaddr(req.remote_addr)[0]
-                them = f'{theirname} [{req.remote_addr}]'
-            except:
-                them = f'[{req.remote_addr}]'
-            try:
-                us = socket.gethostname()
-            except:
-                us = 'localhost'
-            logger.debug('us=%s', us)
-            logger.debug('them=%s', them)
-
-            listid = groupaddr.replace('@', '.')
-            scheme = req.scheme.upper()
-            rdate = email.utils.formatdate()
-            rline = f'from {them} by {us} with {scheme} for <{groupaddr}>; {rdate}'
-            rhdr = email.header.make_header([(rline.encode(), 'us-ascii')], maxlinelen=78)
-            if msg.get('list-id'):
-                msg.replace_header('List-Id', f'<{listid}>')
-            else:
-                msg.add_header('List-Id', f'<{listid}>')
-            msg.add_header('X-Webhook-Received', rhdr.encode())
-            msg.add_header('X-Groupsio-URL', f'{groupurl}/message/{msgnum}')
-
-            # do we have a repodir for this list?
-            if groupaddr in self._config.sections():
-                pirepo = self._config[groupaddr].get('pirepo')
-                success = self._write_pi(pirepo, msg)
-
-            if not success:
-                try:
-                    mailfrom = doc['member_info']['email']
-                except:
-                    mailfrom = 'webhook@localhost'
-                success = self._send_smtp(msg, mailfrom)
-
-        except Exception as ex:
-            logger.critical('Failed processing message %s:', msgnum)
-            logger.critical(str(ex))
-            filen = f'{groupaddr}-{msgnum}.txt'
-            self._save_emerg(filen, doc['message'].encode())
-
-        return success
-
-    def _write_pi(self, pirepo: str, msg: email.message.Message) -> bool:
-        success = False
-        try:
-            import ezpi  # noqa
-            ezpi.add_rfc822(pirepo, msg)
-            ezpi.run_hook(pirepo)
-            logger.info('Wrote to public-inbox at %s', pirepo)
-            success = True
-        except Exception as ex:
-            logger.critical('Could not write to pirepo')
-            logger.critical(str(ex))
-
-        return success
-
-    def _send_smtp(self, msg: email.message.Message, mailfrom: str) -> bool:
-        mailhost = self._config['main'].get('mailhost', 'localhost')
-        mailto = self._config['main'].get('mailto', 'webhook@archiver.kernel.org')
-        bdata = msg.as_string(policy=emlpolicy).encode()
-        try:
-            smtp = smtplib.SMTP(mailhost)
-            smtp.sendmail(mailfrom, [mailto], bdata)
-            smtp.close()
-            logger.info('Successfully sent via SMTP to <%s>', mailto)
-        except Exception as ex:
-            logger.critical('Could not send SMTP')
-            logger.critical(str(ex))
-            dt = datetime.datetime.now()
-            fname = dt.strftime('%Y%m%d-%H%M%S-%f') + '.eml'
-            self._save_emerg(fname, bdata)
-            return False
-
-        return True
-
-    def _verify_psk(self, psk, raw, vdigest):
-        hm = hmac.new(psk.encode(), digestmod='sha256')
-        hm.update(raw)
-        return hmac.compare_digest(vdigest, hm.hexdigest())
-
-    def _save_emerg(self, filen: str, bdata: bytes):
-        emerg_dir = self._config['main'].get('emerg_dir')
-        if not emerg_dir or not os.path.isdir(emerg_dir):
-            return
-        efile = os.path.join(emerg_dir, filen)
-        with open(efile, 'wb') as fh:
-            fh.write(bdata)
-            logger.debug('Wrote emergency content into %s', efile)
-
-    def on_post(self, req, resp):
-        if not req.content_length:
-            resp.status = falcon.HTTP_500
+    def on_post(self, req: falcon.Request, resp: falcon.Response) -> None:
+        logger.info('Received POST from %s', req.remote_addr)
+        raw = req.bounded_stream.read()
+        if not raw:
+            resp.status = falcon.HTTP_400
             resp.text = 'Payload required\n'
             return
 
-        logger.info('Received POST from %s', req.remote_addr)
-        raw = req.stream.read()
-        if self.psk:
-            vdigest = req.get_header('X-Groupsio-Signature')
-            if not vdigest:
-                resp.status = falcon.HTTP_401
-                resp.text = 'HMAC signature header required\n'
-                return
-            if not self._verify_psk(self.psk, raw, vdigest):
-                resp.status = falcon.HTTP_401
-                resp.text = 'HMAC signature verification failed\n'
-                return
+        vdigest = req.get_header('X-Groupsio-Signature')
+        if not vdigest:
+            resp.status = falcon.HTTP_401
+            resp.text = 'HMAC signature header required\n'
+            return
+        if not self._verify_psk(raw, vdigest):
+            resp.status = falcon.HTTP_401
+            resp.text = 'HMAC signature verification failed\n'
+            return
 
-        if self._config['main'].get('loglevel', 'info') == 'debug':
-            # In debug mode, we save all json submissions in the emerg dir
-            dt = datetime.datetime.now()
-            fname = dt.strftime('%Y%m%d-%H%M%S-%f') + '.js'
-            self._save_emerg(fname, raw)
+        if self.debug:
+            self._save_emerg(raw, 'debug')
 
         try:
             doc = json.loads(raw)
-        except Exception as ex:
-            resp.status = falcon.HTTP_500
+        except ValueError:
+            logger.exception('Failed to parse incoming json')
+            resp.status = falcon.HTTP_400
             resp.text = 'Failed to parse payload as json\n'
-            logger.critical('Failed to parse incoming json:')
-            logger.critical(str(ex))
             return
 
-        success = True
-        if 'message' in doc and len(doc.get('message')):
-            success = self._inject_message(doc, req)
-        else:
+        if not isinstance(doc, dict) or not doc.get('message'):
             logger.debug('No message in payload, skipping')
-
-        if success:
             resp.status = falcon.HTTP_200
             resp.text = 'OK thanks\n'
+            return
+
+        resp.status = self._handle_message(doc, raw, req)
+        if resp.status == falcon.HTTP_200:
+            resp.text = 'OK thanks\n'
         else:
-            resp.status = falcon.HTTP_500
             resp.text = 'Something went wrong, sorry.\n'
 
+    def _handle_message(self, doc: dict[str, Any], raw: bytes, req: falcon.Request) -> str:
+        try:
+            msgnum = doc['msg_num']
+            groupaddr = doc['group']['email_address'].lower()
+            groupurl = doc['group']['group_url']
+            msg = email.message_from_string(doc['message'])
+        except (KeyError, TypeError, AttributeError):
+            logger.critical('Payload is malformed')
+            self._save_emerg(raw, 'malformed')
+            return falcon.HTTP_400
 
-parser = ConfigParser(interpolation=ExtendedInterpolation())
-cfgfile = os.getenv('CONFIG')
-if not cfgfile or not os.path.exists(cfgfile):
-    sys.stderr.write('CONFIG env var is not set or is not valid')
-    sys.exit(1)
+        logger.info('Received %s msg %s', groupaddr, msgnum)
+        inbox = self._get_inbox(groupaddr)
+        if inbox is None:
+            # A signed payload for a list we don't archive is not an error on
+            # groups.io's side, so keep it for a human and stop the retries.
+            logger.critical('No inbox configured for %s, saving msg %s', groupaddr, msgnum)
+            self._save_emerg(raw, 'noinbox')
+            return falcon.HTTP_200
 
-parser.read(cfgfile)
+        self._add_headers(msg, groupaddr, f'{groupurl}/message/{msgnum}', req)
+        try:
+            ezpi.add_rfc822_v2(inbox, msg, auto_epoch=self.auto_epoch)
+        except ValueError:
+            # Missing From or Subject: retrying will never fix this.
+            logger.exception('Message %s for %s is not archivable', msgnum, groupaddr)
+            self._save_emerg(raw, 'invalid')
+            return falcon.HTTP_200
+        except Exception:
+            # Lock or git failures may be transient, so ask groups.io to retry;
+            # anything else unexpected still must not lose the payload.
+            logger.exception('Could not write msg %s to %s', msgnum, inbox)
+            self._save_emerg(raw, 'failed')
+            return falcon.HTTP_500
 
-gl = GroupsioListener(parser)
-app = falcon.App()
-mp = os.getenv('MOUNTPOINT', '/groupsio_webhook')
-app.add_route(mp, gl)
+        logger.info('Wrote %s msg %s to %s', groupaddr, msgnum, inbox)
+        return falcon.HTTP_200
+
+    def _get_inbox(self, groupaddr: str) -> str | None:
+        if groupaddr in self.config:
+            inbox = self.config[groupaddr].get('inbox')
+            if inbox:
+                return os.path.expanduser(inbox)
+        if not self.inboxdir or not GROUPADDR_RE.match(groupaddr):
+            return None
+        return os.path.join(os.path.expanduser(self.inboxdir), groupaddr.replace('@', '.'))
+
+    @staticmethod
+    def _add_headers(msg: email.message.Message, groupaddr: str, msgurl: str, req: falcon.Request) -> None:
+        try:
+            them = f'{socket.gethostbyaddr(req.remote_addr)[0]} [{req.remote_addr}]'
+        except OSError:
+            them = f'[{req.remote_addr}]'
+        us = socket.gethostname() or 'localhost'
+        rdate = email.utils.formatdate()
+        rline = f'from {them} by {us} with {req.scheme.upper()} for <{groupaddr}>; {rdate}'
+
+        listid = f'<{groupaddr.replace("@", ".")}>'
+        if msg.get('List-Id'):
+            msg.replace_header('List-Id', listid)
+        else:
+            msg.add_header('List-Id', listid)
+        msg.add_header('X-Webhook-Received', rline)
+        msg.add_header('X-Groupsio-URL', msgurl)
+
+    def _verify_psk(self, raw: bytes, vdigest: str) -> bool:
+        hm = hmac.new(self.psk.encode(), raw, digestmod='sha256')
+        return hmac.compare_digest(vdigest, hm.hexdigest())
+
+    def _save_emerg(self, raw: bytes, reason: str) -> None:
+        # Keep the whole signed payload rather than just the message, so it
+        # can be replayed against the webhook once the problem is fixed.
+        if not self.emerg_dir or not os.path.isdir(self.emerg_dir):
+            logger.critical('No usable emerg_dir, payload was not saved')
+            return
+        ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        efile = os.path.join(self.emerg_dir, f'{ts}-{os.getpid()}-{reason}.json')
+        with open(efile, 'wb') as fh:
+            fh.write(raw)
+        logger.info('Saved payload into %s', efile)
+
+
+def _init_logger(logfile: str, loglevel: str) -> None:
+    lch = logging.handlers.WatchedFileHandler(os.path.expanduser(logfile))
+    lch.setFormatter(logging.Formatter('[%(process)d] %(asctime)s - %(levelname)s - %(message)s'))
+    lch.setLevel({'critical': logging.CRITICAL, 'debug': logging.DEBUG}.get(loglevel, logging.INFO))
+    logger.addHandler(lch)
+
+
+def create_app(config: ConfigParser, mountpoint: str = '/groupsio_webhook') -> falcon.App:
+    logfile = config['main'].get('logfile')
+    if logfile:
+        _init_logger(logfile, config['main'].get('loglevel', 'info'))
+    app = falcon.App()
+    app.add_route(mountpoint, GroupsioListener(config))
+    return app
+
+
+def __getattr__(name: str) -> falcon.App:
+    # uwsgi looks up "app" on the module; building it lazily keeps the module
+    # importable (e.g. by tests) without a CONFIG file in the environment.
+    if name != 'app':
+        raise AttributeError(name)
+    cfgfile = os.getenv('CONFIG')
+    if not cfgfile or not os.path.exists(cfgfile):
+        raise RuntimeError('CONFIG env var is not set or is not valid')
+    config = ConfigParser(interpolation=ExtendedInterpolation())
+    config.read(cfgfile)
+    app = create_app(config, os.getenv('MOUNTPOINT', '/groupsio_webhook'))
+    globals()['app'] = app
+    return app
