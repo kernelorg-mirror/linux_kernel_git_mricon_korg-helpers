@@ -1,6 +1,7 @@
 """Tests for groupsio-webhook.py."""
 
 import email
+import importlib.util
 import hashlib
 import hmac
 import json
@@ -196,3 +197,16 @@ def test_missing_emerg_dir_does_not_crash(tmp_path: Path, caplog: pytest.LogCapt
 def test_rejects_bad_config(tmp_path: Path, main: dict[str, str], error: str) -> None:
     with pytest.raises(ValueError, match=error):
         gw.create_app(make_config(tmp_path, **main))
+
+
+def test_app_is_built_at_import_from_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # uwsgi reads the callable from the module's namespace, as here.
+    cfgfile = tmp_path / 'webhook.conf'
+    with cfgfile.open('w') as fh:
+        make_config(tmp_path).write(fh)
+    monkeypatch.setenv('CONFIG', str(cfgfile))
+    spec = importlib.util.spec_from_file_location('gw_uwsgi', Path(gw.__file__))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert isinstance(vars(module).get('app'), pytest.importorskip('falcon').App)

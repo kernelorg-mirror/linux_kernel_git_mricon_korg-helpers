@@ -209,16 +209,13 @@ def create_app(config: ConfigParser, mountpoint: str = '/groupsio_webhook') -> f
     return app
 
 
-def __getattr__(name: str) -> falcon.App:
-    # uwsgi looks up "app" on the module; building it lazily keeps the module
-    # importable (e.g. by tests) without a CONFIG file in the environment.
-    if name != 'app':
-        raise AttributeError(name)
-    cfgfile = os.getenv('CONFIG')
-    if not cfgfile or not os.path.exists(cfgfile):
-        raise RuntimeError('CONFIG env var is not set or is not valid')
-    config = ConfigParser(interpolation=ExtendedInterpolation())
-    config.read(cfgfile)
-    app = create_app(config, os.getenv('MOUNTPOINT', '/groupsio_webhook'))
-    globals()['app'] = app
-    return app
+# uwsgi takes "app" straight from the module's namespace and never asks a
+# module __getattr__, so the app has to exist once the module is loaded.
+# Without CONFIG, as in the tests, the module only provides create_app().
+_cfgfile = os.getenv('CONFIG')
+if _cfgfile is not None:
+    if not os.path.exists(_cfgfile):
+        raise RuntimeError(f'CONFIG file {_cfgfile} does not exist')
+    _config = ConfigParser(interpolation=ExtendedInterpolation())
+    _config.read(_cfgfile)
+    app = create_app(_config, os.getenv('MOUNTPOINT', '/groupsio_webhook'))
