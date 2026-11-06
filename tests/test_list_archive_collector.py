@@ -265,6 +265,20 @@ def test_lookaside_without_lore_copy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert msg['To'] is None
 
 
+def test_missing_message_id_is_stable(tmp_path: Path) -> None:
+    """Real posts can lack a Message-ID; the one we make must not change
+    between runs, or every re-run would archive them again."""
+    raw = b'From: john at example.org (John)\nSubject: [PATCH] fix\nDate: Tue, 3 Jan 2012 04:23:44 -0800\n\npatch\n'
+    out = tmp_path / 'out.mbox'
+    writer = lac.ArchiveWriter(str(out), as_maildir=False, listid=LISTID)
+    for msg in (raw, raw, raw.replace(b'patch', b'other patch')):
+        writer.add(lac.parse_pipermail_message(msg))
+    writer.close()
+    first, again, other = (msg['Message-Id'] for msg in read_mbox(out))
+    assert first == again != other
+    assert first.endswith('@msgid-missing>')
+
+
 def write_gz(path: Path, data: bytes) -> Path:
     with gzip.open(path, 'wb') as fh:
         fh.write(data)

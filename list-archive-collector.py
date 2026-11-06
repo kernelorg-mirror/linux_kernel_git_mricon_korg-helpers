@@ -24,6 +24,7 @@ import email.message
 import email.policy
 import email.utils
 import gzip
+import hashlib
 import html.parser
 import logging
 import mailbox
@@ -337,6 +338,19 @@ class ArchiveWriter:
         self.counts = {'added': 0, 'spam': 0, 'unwritable': 0}
 
     def add(self, msg: email.message.Message) -> None:
+        if not msg.get('Message-Id'):
+            # Real posts in old archives can lack one. Making it from the
+            # message as collected, before our own changes, gives the same
+            # one on every run, so re-runs do not archive the post again.
+            try:
+                digest = hashlib.sha256(msg.as_bytes(policy=EMLPOLICY)).hexdigest()
+            except Exception:
+                # The write below fails the same way and counts it
+                digest = None
+            if digest is not None:
+                msg['Message-Id'] = f'<{digest[:32]}@msgid-missing>'
+                logger.debug('    made up %s', msg['Message-Id'])
+
         if self.listid:
             del msg['List-Id']
             msg['List-Id'] = f'<{self.listid}>'
