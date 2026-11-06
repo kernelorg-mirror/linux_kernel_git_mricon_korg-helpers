@@ -9,6 +9,7 @@ import email.message
 import mailbox
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import load_script
@@ -43,12 +44,14 @@ def write_mbox(path: Path, *msgs: bytes) -> Path:
 
 
 def run(tmp_path: Path, *msgs: bytes, listids: list[str] | None = None,
-        knownids: set[str] | None = None, extrahdrs: list[tuple[str, str]] | None = None) -> dict[str, int]:
+        knownids: Any = None, extrahdrs: list[tuple[str, str]] | None = None) -> dict[str, int]:
     source = write_mbox(tmp_path / 'source.mbox', *msgs)
     outdir = tmp_path / 'out'
     outdir.mkdir(exist_ok=True)
+    if knownids is None:
+        knownids = lam.KnownMessages()
     counts: dict[str, int] = lam.process_archives(
-        [str(source)], lam.MailboxWriter(str(outdir), False), knownids if knownids is not None else set(),
+        [str(source)], lam.MailboxWriter(str(outdir), False), knownids,
         listids if listids is not None else [LISTID], str(tmp_path / 'rejected.mbox'), extrahdrs or [])
     return counts
 
@@ -159,7 +162,7 @@ def test_extra_headers_are_added(tmp_path: Path) -> None:
 ], ids=['no-msgid', 'duplicate', 'other-list', 'no-date', 'bogus-date'])
 def test_rejected_messages_are_kept_unchanged(tmp_path: Path, msg: bytes, knownids: set[str], reason: str) -> None:
     """Rejects are for reviewing the script's decisions, so they must be the original message."""
-    run(tmp_path, msg.replace(b'\n\n', b'\nX-Spam-Status: No\n\n', 1), knownids=knownids)
+    run(tmp_path, msg.replace(b'\n\n', b'\nX-Spam-Status: No\n\n', 1), knownids=lam.KnownMessages.from_ids(knownids))
     assert archived(tmp_path) == []
     [rej] = rejected(tmp_path)
     assert rej['X-Import-Rejected-Reason'] == reason
@@ -167,21 +170,37 @@ def test_rejected_messages_are_kept_unchanged(tmp_path: Path, msg: bytes, knowni
 
 
 def test_resent_message_id_is_used_without_message_id(tmp_path: Path) -> None:
-    knownids: set[str] = set()
+    knownids = lam.KnownMessages()
     run(tmp_path, make_msg(('Resent-Message-Id', ' <resent@example.org> '), msgid=None), knownids=knownids)
     assert len(archived(tmp_path)) == 1
-    assert knownids == {'<resent@example.org>'}
+    assert knownids.ids() == {'<resent@example.org>'}
 
 
-def test_duplicates_across_sources_are_archived_once(tmp_path: Path) -> None:
-    sources = [str(write_mbox(tmp_path / f'source{i}.mbox', make_msg())) for i in range(2)]
+@pytest.mark.parametrize(('second_body', 'archived_count'), [
+    (b'Body text\n', 1),
+    (b'A different message\n', 2),
+], ids=['same-message-twice', 'reused-message-id'])
+def test_duplicates_across_sources(tmp_path: Path, second_body: bytes, archived_count: int) -> None:
+    """Copies of one message are archived once, but senders like Launchpad reuse
+    Message-IDs for different messages, and those must all be kept."""
+    sources = [str(write_mbox(tmp_path / 'source0.mbox', make_msg())),
+               str(write_mbox(tmp_path / 'source1.mbox', make_msg().replace(b'Body text\n', second_body)))]
     (tmp_path / 'out').mkdir()
-    knownids: set[str] = set()
+    knownids = lam.KnownMessages()
     lam.process_archives(sources, lam.MailboxWriter(str(tmp_path / 'out'), False), knownids, [LISTID],
                          str(tmp_path / 'rejected.mbox'), [])
-    assert len(archived(tmp_path)) == 1
-    assert [rej['X-Import-Rejected-Reason'] for rej in rejected(tmp_path)] == ['Duplicate Message-ID']
-    assert knownids == {'<one@example.org>'}
+    msgs = archived(tmp_path)
+    assert len(msgs) == archived_count
+    assert len(rejected(tmp_path)) == 2 - archived_count
+    assert '<one@example.org>' in knownids.ids()
+    if archived_count == 2:
+        # public-inbox files a reused Message-ID's message under the next one,
+        # so it must have its own; stable, so re-runs know the message.
+        assert msgs[0].get_all('Message-Id') == ['<one@example.org>']
+        reused, extra = msgs[1].get_all('Message-Id', [])
+        assert reused == '<one@example.org>'
+        assert extra.endswith('@msgid-reused>')
+        assert extra in knownids.ids()
 
 
 @pytest.mark.parametrize(('received', 'mbxname'), [
@@ -209,7 +228,7 @@ def test_maildir_source_and_output(tmp_path: Path) -> None:
     source = mailbox.Maildir(tmp_path / 'source')
     source.add(make_msg())
     outdir = tmp_path / 'out'
-    counts = lam.process_archives([str(tmp_path / 'source')], lam.MailboxWriter(str(outdir), True), set(),
+    counts = lam.process_archives([str(tmp_path / 'source')], lam.MailboxWriter(str(outdir), True), lam.KnownMessages(),
                                   [LISTID], None, [])
     assert counts == {str(outdir): 1}
     assert [msg['Message-Id'] for msg in mailbox.Maildir(outdir)] == ['<one@example.org>']
@@ -270,6 +289,20 @@ def test_public_inbox_output_skips_what_the_inbox_has(tmp_path: Path) -> None:
     assert [msg['Message-Id'] for msg in msgs] == ['<live@example.org>', '<old@example.org>']
     assert msgs[1]['X-Spam-Status'] is None
     assert [rej['X-Import-Rejected-Reason'] for rej in rejected(tmp_path)] == ['Duplicate Message-ID'] * 3
+
+
+def test_public_inbox_keeps_reused_message_ids(tmp_path: Path) -> None:
+    """The inbox knows its messages' bodies, so only real copies count as duplicates."""
+    ezpi = pytest.importorskip('ezpi')
+    v2path = tmp_path / 'inbox'
+    ezpi.add_rfc822_v2(str(v2path), make_msg())
+    source = write_mbox(tmp_path / 'source.mbox', make_msg(), make_msg().replace(b'Body text', b'Other text'))
+    argv = ['-s', str(source), '-p', str(v2path), '-l', LISTID, '-r', str(tmp_path / 'rejected.mbox')]
+    lam.main(argv)
+    lam.main(argv)
+    msgs = inbox_messages(v2path)
+    assert [msg.get_payload() for msg in msgs] == ['Body text\n', 'Other text\n']
+    assert len(msgs[1].get_all('Message-Id', [])) == 2
 
 
 def test_public_inbox_rejects_what_it_cannot_archive(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ import email.parser
 import email.policy
 import email.utils
 import fnmatch
+import hashlib
 import logging
 import mailbox
 import os
@@ -135,6 +136,51 @@ def get_msgid(msg: email.message.Message) -> str:
         # Most likely a FOLDER-INTERNAL DATA marker or some other system message
         raise MessageRejected('No Message-ID')
     return str(msgid).strip()
+
+
+def body_hash(msgbytes: bytes) -> str:
+    return hashlib.sha256(msgbytes.partition(b'\n\n')[2]).hexdigest()
+
+
+class KnownMessages:
+    """The Message-IDs we already have, with their bodies where we know them.
+
+    The same message often arrives more than once, and must be archived
+    once. But some senders (Launchpad, for one) reuse a Message-ID for
+    different messages, and those must all be kept, so a message is only a
+    duplicate if its body matches too. For Message-IDs that come from a
+    list of IDs, we cannot compare bodies, so any match is a duplicate.
+    """
+
+    def __init__(self) -> None:
+        # None: known, but with a body we have never seen
+        self.bodies: dict[str, set[str] | None] = dict()
+
+    @classmethod
+    def from_ids(cls, msgids: set[str]) -> 'KnownMessages':
+        known = cls()
+        for msgid in msgids:
+            known.add(msgid)
+        return known
+
+    def add(self, msgid: str, bodyhash: str | None = None) -> None:
+        if bodyhash is None:
+            self.bodies.setdefault(msgid, None)
+            return
+        hashes = self.bodies.get(msgid)
+        if hashes is None:
+            self.bodies[msgid] = {bodyhash}
+        else:
+            hashes.add(bodyhash)
+
+    def is_duplicate(self, msgid: str, bodyhash: str) -> bool:
+        if msgid not in self.bodies:
+            return False
+        hashes = self.bodies[msgid]
+        return hashes is None or bodyhash in hashes
+
+    def ids(self) -> set[str]:
+        return set(self.bodies)
 
 
 def get_archive_month(msg: email.message.Message) -> tuple[int, int]:
@@ -255,19 +301,20 @@ class PublicInboxWriter:
         self.ezpi = ezpi
         self.v2path = v2path
 
-    def known_ids(self) -> set[str]:
+    def known_messages(self) -> KnownMessages:
         # Walk the git history instead of trusting msgmap.sqlite3, which is
-        # only as current as the last public-inbox-index run.
-        knownids: set[str] = set()
+        # only as current as the last public-inbox-index run, and which
+        # cannot tell us the bodies.
+        known = KnownMessages()
         if not os.path.exists(self.v2path):
-            return knownids
+            return known
         parser = email.parser.BytesParser(policy=email.policy.compat32)
         for _, _, raw in self.ezpi.iter_messages(self.v2path):
             try:
-                knownids.add(get_msgid(parser.parsebytes(raw, headersonly=True)))
+                known.add(get_msgid(parser.parsebytes(raw, headersonly=True)), body_hash(raw))
             except MessageRejected:
                 pass
-        return knownids
+        return known
 
     def add(self, msgbytes: bytes, year: int, month: int) -> str:
         try:
@@ -288,7 +335,7 @@ def show_progress(text: str, final: bool = False) -> None:
         sys.stderr.flush()
 
 
-def process_archives(sources: list[str], writer: ArchiveWriter, knownids: set[str], listids: list[str],
+def process_archives(sources: list[str], writer: ArchiveWriter, knownids: KnownMessages, listids: list[str],
                      rejectsfile: str | None, extrahdrs: list[tuple[str, str]]) -> dict[str, int]:
     """Archive all new list messages from sources with writer.
 
@@ -310,12 +357,23 @@ def process_archives(sources: list[str], writer: ArchiveWriter, knownids: set[st
             show_progress(f'  {counter}/{total} (skipped: {skipped or "none"})')
             try:
                 msgid = get_msgid(msg)
-                if msgid in knownids:
+                # Sanitizing only changes headers, so this is the body we archive
+                bodyhash = body_hash(msg.as_bytes(policy=EMLPOLICY))
+                if knownids.is_duplicate(msgid, bodyhash):
                     # We already have it, or the sources contain multiple
                     # deliveries of it; the first one we found wins.
                     raise MessageRejected('Duplicate Message-ID')
                 year, month = get_archive_month(msg)
                 sanitize_message(msg, listfilter, extrahdrs)
+                extramsgid = None
+                if msgid in knownids.ids():
+                    # A different message with a Message-ID we already have.
+                    # Like public-inbox does on import, give it a Message-ID
+                    # of its own as well, or the indexer skips it. Derived
+                    # from what makes it unique, so re-runs make the same one.
+                    digest = hashlib.sha256(f'{msgid} {bodyhash}'.encode('utf-8', 'surrogateescape')).hexdigest()
+                    extramsgid = f'<{digest[:32]}@msgid-reused>'
+                    msg['Message-Id'] = extramsgid
                 # as_bytes keeps undecodable 8bit content as it was received
                 outname = writer.add(msg.as_bytes(policy=EMLPOLICY), year, month)
             except MessageRejected as ex:
@@ -327,7 +385,9 @@ def process_archives(sources: list[str], writer: ArchiveWriter, knownids: set[st
                     rejectsbox.add(msg)
                 continue
 
-            knownids.add(msgid)
+            knownids.add(msgid, bodyhash)
+            if extramsgid is not None:
+                knownids.add(extramsgid, bodyhash)
             writecount[outname] = writecount.get(outname, 0) + 1
 
         inbox.close()
@@ -425,30 +485,32 @@ def main(argv: list[str] | None = None) -> None:
     if args.as_maildir and not args.exportdir:
         parser.error('--as-maildir needs --exportdir')
 
-    knownids: set[str] = set()
-    if args.known_ids and os.path.exists(args.known_ids):
-        knownids = load_known_ids(args.known_ids)
-        logger.info('Loaded %s message-ids from %s', len(knownids), args.known_ids)
-
     writer: ArchiveWriter
+    knownids = KnownMessages()
     if args.pi_inbox:
         piwriter = PublicInboxWriter(args.pi_inbox)
-        inboxids = piwriter.known_ids()
-        logger.info('Loaded %s message-ids from %s', len(inboxids), args.pi_inbox)
-        knownids |= inboxids
+        knownids = piwriter.known_messages()
+        logger.info('Loaded %s message-ids from %s', len(knownids.ids()), args.pi_inbox)
         writer = piwriter
     else:
         if not args.as_maildir:
             os.makedirs(args.exportdir, exist_ok=True)
         writer = MailboxWriter(args.exportdir, args.as_maildir)
 
-    before = len(knownids)
+    if args.known_ids and os.path.exists(args.known_ids):
+        fileids = load_known_ids(args.known_ids)
+        for msgid in fileids:
+            knownids.add(msgid)
+        logger.info('Loaded %s message-ids from %s', len(fileids), args.known_ids)
+
+    before = len(knownids.ids())
     process_archives(args.source, writer, knownids, args.list_ids, args.rejected, extrahdrs)
 
     # We never write into a public-inbox msgmap; public-inbox owns it.
     if args.known_ids and not args.known_ids.endswith('.sqlite3'):
-        save_known_ids(args.known_ids, knownids)
-        logger.info('Wrote %s message-ids into %s (%s new)', len(knownids), args.known_ids, len(knownids) - before)
+        allids = knownids.ids()
+        save_known_ids(args.known_ids, allids)
+        logger.info('Wrote %s message-ids into %s (%s new)', len(allids), args.known_ids, len(allids) - before)
 
 
 if __name__ == '__main__':
