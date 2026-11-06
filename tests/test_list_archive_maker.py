@@ -48,8 +48,8 @@ def run(tmp_path: Path, *msgs: bytes, listids: list[str] | None = None,
     outdir = tmp_path / 'out'
     outdir.mkdir(exist_ok=True)
     counts: dict[str, int] = lam.process_archives(
-        [str(source)], str(outdir), knownids if knownids is not None else set(),
-        listids if listids is not None else [LISTID], str(tmp_path / 'rejected.mbox'), False, extrahdrs or [])
+        [str(source)], lam.MailboxWriter(str(outdir), False), knownids if knownids is not None else set(),
+        listids if listids is not None else [LISTID], str(tmp_path / 'rejected.mbox'), extrahdrs or [])
     return counts
 
 
@@ -177,8 +177,8 @@ def test_duplicates_across_sources_are_archived_once(tmp_path: Path) -> None:
     sources = [str(write_mbox(tmp_path / f'source{i}.mbox', make_msg())) for i in range(2)]
     (tmp_path / 'out').mkdir()
     knownids: set[str] = set()
-    lam.process_archives(sources, str(tmp_path / 'out'), knownids, [LISTID], str(tmp_path / 'rejected.mbox'),
-                         False, [])
+    lam.process_archives(sources, lam.MailboxWriter(str(tmp_path / 'out'), False), knownids, [LISTID],
+                         str(tmp_path / 'rejected.mbox'), [])
     assert len(archived(tmp_path)) == 1
     assert [rej['X-Import-Rejected-Reason'] for rej in rejected(tmp_path)] == ['Duplicate Message-ID']
     assert knownids == {'<one@example.org>'}
@@ -209,7 +209,8 @@ def test_maildir_source_and_output(tmp_path: Path) -> None:
     source = mailbox.Maildir(tmp_path / 'source')
     source.add(make_msg())
     outdir = tmp_path / 'out'
-    counts = lam.process_archives([str(tmp_path / 'source')], str(outdir), set(), [LISTID], None, True, [])
+    counts = lam.process_archives([str(tmp_path / 'source')], lam.MailboxWriter(str(outdir), True), set(),
+                                  [LISTID], None, [])
     assert counts == {str(outdir): 1}
     assert [msg['Message-Id'] for msg in mailbox.Maildir(outdir)] == ['<one@example.org>']
 
@@ -248,3 +249,34 @@ def test_main_records_archived_ids(tmp_path: Path) -> None:
     lam.main(argv)
     assert len(archived(tmp_path)) == 1
     assert len(rejected(tmp_path)) == 1
+
+
+def inbox_messages(v2path: Path) -> list[email.message.Message]:
+    ezpi = pytest.importorskip('ezpi')
+    return [email.message_from_bytes(raw) for _, _, raw in ezpi.iter_messages(str(v2path))]
+
+
+def test_public_inbox_output_skips_what_the_inbox_has(tmp_path: Path) -> None:
+    """Backfills often overlap with what the live list already archived."""
+    ezpi = pytest.importorskip('ezpi')
+    v2path = tmp_path / 'inbox'
+    ezpi.add_rfc822_v2(str(v2path), make_msg(msgid='<live@example.org>'))
+    source = write_mbox(tmp_path / 'source.mbox', make_msg(msgid='<live@example.org>'),
+                       make_msg(('X-Spam-Status', 'No'), msgid='<old@example.org>'))
+    argv = ['-s', str(source), '-p', str(v2path), '-l', LISTID, '-r', str(tmp_path / 'rejected.mbox')]
+    lam.main(argv)
+    lam.main(argv)
+    msgs = inbox_messages(v2path)
+    assert [msg['Message-Id'] for msg in msgs] == ['<live@example.org>', '<old@example.org>']
+    assert msgs[1]['X-Spam-Status'] is None
+    assert [rej['X-Import-Rejected-Reason'] for rej in rejected(tmp_path)] == ['Duplicate Message-ID'] * 3
+
+
+def test_public_inbox_rejects_what_it_cannot_archive(tmp_path: Path) -> None:
+    """public-inbox needs a From and a Subject; such messages must not just vanish."""
+    pytest.importorskip('ezpi')
+    source = write_mbox(tmp_path / 'source.mbox', make_msg().replace(b'Subject: Hello\n', b''))
+    lam.main(['-s', str(source), '-p', str(tmp_path / 'inbox'), '-l', LISTID, '-r', str(tmp_path / 'rejected.mbox')])
+    assert not (tmp_path / 'inbox').exists() or inbox_messages(tmp_path / 'inbox') == []
+    [rej] = rejected(tmp_path)
+    assert rej['X-Import-Rejected-Reason'].startswith('Not archivable')

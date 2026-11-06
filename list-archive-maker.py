@@ -17,11 +17,16 @@
 # The results will be written out into a "collected" dir in the YYYY-MM.mbx format.
 # You can review these files to make sure the script did the right thing.
 #
+# To backfill a public-inbox v2 inbox instead, skipping anything it already has:
+#   list-archive-maker.py -s old-list.mbox -l old-list.example.org \
+#                         -p /path/to/inbox -r rejected.mbox
+#
 # Author:  Konstantin Ryabitsev <konstantin@linuxfoundation.org>
 #
 
 import argparse
 import email.message
+import email.parser
 import email.policy
 import email.utils
 import fnmatch
@@ -31,6 +36,7 @@ import os
 import sqlite3
 import sys
 from dataclasses import dataclass
+from typing import Protocol
 
 __author__ = 'Konstantin Ryabitsev <konstantin@linuxfoundation.org>'
 __VERSION__ = '2.1'
@@ -210,6 +216,71 @@ def open_mailbox(path: str) -> Mailbox:
     return mailbox.mbox(path)
 
 
+class ArchiveWriter(Protocol):
+    def add(self, msgbytes: bytes, year: int, month: int) -> str:
+        """Archive the message, returning where it was written."""
+
+    def close(self) -> None: ...
+
+
+class MailboxWriter:
+    """Write into one YYYY-MM.mbx mailbox per month, or into a single maildir."""
+
+    def __init__(self, outdir: str, asmaildir: bool) -> None:
+        self.outdir = outdir
+        self.asmaildir = asmaildir
+        self.outboxes: dict[str, Mailbox] = dict()
+
+    def add(self, msgbytes: bytes, year: int, month: int) -> str:
+        if self.asmaildir:
+            mboxname = self.outdir
+        else:
+            mboxname = os.path.join(self.outdir, f'{year:04d}-{month:02d}.mbx')
+        if mboxname not in self.outboxes:
+            self.outboxes[mboxname] = mailbox.Maildir(mboxname) if self.asmaildir else mailbox.mbox(mboxname)
+        self.outboxes[mboxname].add(msgbytes)
+        return mboxname
+
+    def close(self) -> None:
+        for outbox in self.outboxes.values():
+            outbox.close()
+
+
+class PublicInboxWriter:
+    """Write into a public-inbox v2 inbox, creating it if needed."""
+
+    def __init__(self, v2path: str) -> None:
+        # Imported here, so writing mailboxes keeps working without ezpi
+        import ezpi
+        self.ezpi = ezpi
+        self.v2path = v2path
+
+    def known_ids(self) -> set[str]:
+        # Walk the git history instead of trusting msgmap.sqlite3, which is
+        # only as current as the last public-inbox-index run.
+        knownids: set[str] = set()
+        if not os.path.exists(self.v2path):
+            return knownids
+        parser = email.parser.BytesParser(policy=email.policy.compat32)
+        for _, _, raw in self.ezpi.iter_messages(self.v2path):
+            try:
+                knownids.add(get_msgid(parser.parsebytes(raw, headersonly=True)))
+            except MessageRejected:
+                pass
+        return knownids
+
+    def add(self, msgbytes: bytes, year: int, month: int) -> str:
+        try:
+            self.ezpi.add_rfc822_v2(self.v2path, msgbytes)
+        except ValueError as ex:
+            # ezpi refuses messages without a From or Subject
+            raise MessageRejected(f'Not archivable: {ex}') from ex
+        return self.v2path
+
+    def close(self) -> None:
+        pass
+
+
 def show_progress(text: str, final: bool = False) -> None:
     # Large archives take a while; only redraw a progress line for humans.
     if sys.stderr.isatty() and logger.isEnabledFor(logging.INFO):
@@ -217,15 +288,14 @@ def show_progress(text: str, final: bool = False) -> None:
         sys.stderr.flush()
 
 
-def process_archives(sources: list[str], outdir: str, knownids: set[str], listids: list[str],
-                     rejectsfile: str | None, asmaildir: bool, extrahdrs: list[tuple[str, str]]) -> dict[str, int]:
-    """Archive all new list messages from sources into outdir.
+def process_archives(sources: list[str], writer: ArchiveWriter, knownids: set[str], listids: list[str],
+                     rejectsfile: str | None, extrahdrs: list[tuple[str, str]]) -> dict[str, int]:
+    """Archive all new list messages from sources with writer.
 
     Archived Message-IDs are added to knownids. Returns how many messages
-    were written to each output mailbox.
+    were written to each output.
     """
     listfilter = ListFilter.from_listids(listids)
-    outboxes: dict[str, Mailbox] = dict()
     writecount: dict[str, int] = dict()
     rejectsbox = mailbox.mbox(rejectsfile) if rejectsfile else None
 
@@ -246,6 +316,8 @@ def process_archives(sources: list[str], outdir: str, knownids: set[str], listid
                     raise MessageRejected('Duplicate Message-ID')
                 year, month = get_archive_month(msg)
                 sanitize_message(msg, listfilter, extrahdrs)
+                # as_bytes keeps undecodable 8bit content as it was received
+                outname = writer.add(msg.as_bytes(policy=EMLPOLICY), year, month)
             except MessageRejected as ex:
                 reason = str(ex)
                 rejects[reason] = rejects.get(reason, 0) + 1
@@ -255,15 +327,8 @@ def process_archives(sources: list[str], outdir: str, knownids: set[str], listid
                     rejectsbox.add(msg)
                 continue
 
-            mboxname = outdir if asmaildir else os.path.join(outdir, f'{year:04d}-{month:02d}.mbx')
-            if mboxname not in outboxes:
-                outboxes[mboxname] = mailbox.Maildir(mboxname) if asmaildir else mailbox.mbox(mboxname)
-                writecount[mboxname] = 0
-
-            # as_bytes keeps undecodable 8bit content as it was received
-            outboxes[mboxname].add(msg.as_bytes(policy=EMLPOLICY))
             knownids.add(msgid)
-            writecount[mboxname] += 1
+            writecount[outname] = writecount.get(outname, 0) + 1
 
         inbox.close()
         skipped = ', '.join(f'{count} {reason}' for reason, count in rejects.items())
@@ -271,12 +336,12 @@ def process_archives(sources: list[str], outdir: str, knownids: set[str], listid
 
     if rejectsbox is not None:
         rejectsbox.close()
+    writer.close()
 
-    if not outboxes:
+    if not writecount:
         logger.info('No new messages found.')
-    for mboxname in sorted(outboxes):
-        logger.info('%s: %s new (%s total)', mboxname, writecount[mboxname], len(outboxes[mboxname]))
-        outboxes[mboxname].close()
+    for outname in sorted(writecount):
+        logger.info('%s: %s new', outname, writecount[outname])
 
     return writecount
 
@@ -318,10 +383,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('-s', '--source', nargs='+', required=True,
                         help='Mbox files or maildir directories with archives, can be multiple')
-    parser.add_argument('-e', '--exportdir', required=True,
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument('-e', '--exportdir',
                         help='Export dir where to put sanitized archives')
+    output.add_argument('-p', '--pi-inbox', metavar='V2PATH',
+                        help=('Write into this public-inbox v2 inbox (created if missing), '
+                              'skipping messages it already has; needs ezpi'))
     parser.add_argument('-m', '--as-maildir', action='store_true', default=False,
-                        help='Export as maildir instead of mailboxes')
+                        help='Export as maildir instead of mailboxes (with -e)')
     parser.add_argument('-k', '--known-ids',
                         help='File with known Message-IDs (one per line, or public-inbox msgmap.sqlite3)')
     parser.add_argument('-l', '--list-ids', nargs='+', default=list(),
@@ -353,17 +422,28 @@ def main(argv: list[str] | None = None) -> None:
     except argparse.ArgumentTypeError as ex:
         parser.error(str(ex))
 
-    if not args.as_maildir:
-        os.makedirs(args.exportdir, exist_ok=True)
+    if args.as_maildir and not args.exportdir:
+        parser.error('--as-maildir needs --exportdir')
 
     knownids: set[str] = set()
     if args.known_ids and os.path.exists(args.known_ids):
         knownids = load_known_ids(args.known_ids)
         logger.info('Loaded %s message-ids from %s', len(knownids), args.known_ids)
 
+    writer: ArchiveWriter
+    if args.pi_inbox:
+        piwriter = PublicInboxWriter(args.pi_inbox)
+        inboxids = piwriter.known_ids()
+        logger.info('Loaded %s message-ids from %s', len(inboxids), args.pi_inbox)
+        knownids |= inboxids
+        writer = piwriter
+    else:
+        if not args.as_maildir:
+            os.makedirs(args.exportdir, exist_ok=True)
+        writer = MailboxWriter(args.exportdir, args.as_maildir)
+
     before = len(knownids)
-    process_archives(args.source, args.exportdir, knownids, args.list_ids, args.rejected, args.as_maildir,
-                     extrahdrs)
+    process_archives(args.source, writer, knownids, args.list_ids, args.rejected, extrahdrs)
 
     # We never write into a public-inbox msgmap; public-inbox owns it.
     if args.known_ids and not args.known_ids.endswith('.sqlite3'):
