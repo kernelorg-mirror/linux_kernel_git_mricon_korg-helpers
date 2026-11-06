@@ -305,6 +305,26 @@ def test_public_inbox_keeps_reused_message_ids(tmp_path: Path) -> None:
     assert len(msgs[1].get_all('Message-Id', [])) == 2
 
 
+def test_public_inbox_is_packed_while_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ezpi slows down with every loose object, so big backfills must not pile them up."""
+    pytest.importorskip('ezpi')
+    monkeypatch.setattr(lam, 'REPACK_EVERY', 2)
+    packed: list[int] = list()
+    repack = lam.PublicInboxWriter.repack
+
+    def counting_repack(self: Any) -> None:
+        packed.append(self.written)
+        repack(self)
+
+    monkeypatch.setattr(lam.PublicInboxWriter, 'repack', counting_repack)
+    source = write_mbox(tmp_path / 'source.mbox', *[make_msg(msgid=f'<{num}@example.org>') for num in range(3)])
+    lam.main(['-s', str(source), '-p', str(tmp_path / 'inbox'), '-l', LISTID])
+    assert packed == [2, 3]
+    objects = tmp_path / 'inbox' / 'git' / '0.git' / 'objects'
+    assert [path for path in objects.glob('??/*')] == []
+    assert list(objects.glob('pack/*.pack'))
+
+
 def test_public_inbox_rejects_what_it_cannot_archive(tmp_path: Path) -> None:
     """public-inbox needs a From and a Subject; such messages must not just vanish."""
     pytest.importorskip('ezpi')

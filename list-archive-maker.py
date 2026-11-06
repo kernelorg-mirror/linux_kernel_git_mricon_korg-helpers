@@ -35,6 +35,7 @@ import logging
 import mailbox
 import os
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Protocol
@@ -79,6 +80,11 @@ WANTHDRS = {'return-path',
 ADDRHDRS = ('to', 'cc', 'resent-to', 'x-mailing-list')
 
 Mailbox = mailbox.mbox | mailbox.Maildir
+
+# ezpi checks the size of the epoch before every write by looking at each
+# loose object, and never packs, so writes get slower as loose objects
+# pile up. Packing every this many messages keeps backfills fast.
+REPACK_EVERY = 1000
 
 
 class MessageRejected(Exception):
@@ -300,6 +306,9 @@ class PublicInboxWriter:
         import ezpi
         self.ezpi = ezpi
         self.v2path = v2path
+        self.written = 0
+        # Every epoch we wrote to, in case one fills up and a new one starts
+        self.epochs: set[str] = set()
 
     def known_messages(self) -> KnownMessages:
         # Walk the git history instead of trusting msgmap.sqlite3, which is
@@ -322,10 +331,24 @@ class PublicInboxWriter:
         except ValueError as ex:
             # ezpi refuses messages without a From or Subject
             raise MessageRejected(f'Not archivable: {ex}') from ex
+        self.epochs.add(self.ezpi.get_latest_epoch(self.v2path)[1])
+        self.written += 1
+        if self.written % REPACK_EVERY == 0:
+            self.repack()
         return self.v2path
 
+    def repack(self) -> None:
+        # Incremental, without -a: repacking a whole large epoch each time
+        # would be slow in its own way. -d only removes loose objects that
+        # are now packed, and we never prune, so this is safe while
+        # public-inbox-watch writes to the same inbox.
+        for epoch in sorted(self.epochs):
+            logger.debug('Packing %s', epoch)
+            subprocess.run(['git', '--git-dir', epoch, 'repack', '-d', '-q'], check=True)
+
     def close(self) -> None:
-        pass
+        if self.written % REPACK_EVERY:
+            self.repack()
 
 
 def show_progress(text: str, final: bool = False) -> None:
