@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 #
 # List archive collator and sanitizer
 #
@@ -290,13 +289,14 @@ def load_known_ids(path: str) -> set[str]:
             return {f'<{row[0]}>' for row in dbconn.execute('SELECT mid FROM msgmap')}
         finally:
             dbconn.close()
-    with open(path, 'r') as fh:
+    with open(path, encoding='utf-8', errors='surrogateescape') as fh:
         return set(fh.read().splitlines())
 
 
 def save_known_ids(path: str, knownids: set[str]) -> None:
-    # Sorted, so the file is easy to diff between runs
-    with open(path, 'w') as fh:
+    # Sorted, so the file is easy to diff between runs. Message-IDs with
+    # undecodable 8bit bytes must survive the round trip unchanged.
+    with open(path, 'w', encoding='utf-8', errors='surrogateescape') as fh:
         fh.writelines(f'{msgid}\n' for msgid in sorted(knownids))
 
 

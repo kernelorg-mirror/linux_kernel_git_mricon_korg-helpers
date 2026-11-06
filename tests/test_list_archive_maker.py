@@ -214,10 +214,14 @@ def test_maildir_source_and_output(tmp_path: Path) -> None:
     assert [msg['Message-Id'] for msg in mailbox.Maildir(outdir)] == ['<one@example.org>']
 
 
-def test_known_ids_round_trip(tmp_path: Path) -> None:
+@pytest.mark.parametrize('knownids', [
+    {'<b@example.org>', '<a@example.org>'},
+    {'<caf\u00e9@example.org>', '<caf\udce9@example.org>'},
+], ids=['ascii', 'utf8-and-undecodable-8bit'])
+def test_known_ids_round_trip(tmp_path: Path, knownids: set[str]) -> None:
     path = tmp_path / 'known.list'
-    lam.save_known_ids(str(path), {'<b@example.org>', '<a@example.org>'})
-    assert lam.load_known_ids(str(path)) == {'<a@example.org>', '<b@example.org>'}
+    lam.save_known_ids(str(path), knownids)
+    assert lam.load_known_ids(str(path)) == knownids
 
 
 def test_known_ids_from_public_inbox_msgmap(tmp_path: Path) -> None:
