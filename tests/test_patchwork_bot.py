@@ -2049,56 +2049,81 @@ class TestCheckReposLogging:
     """check_repos() must announce its start/end and a bot version, and
     aggregate per-repo stats into a run summary -- that summary is the
     thing to grep for when checking whether a run happened and what it did.
+    A repo whose run fails must not stop the repos after it: the same
+    failure (e.g. no maintainer rights on one of its projects) repeats on
+    every run, so letting it escape would stall every repo after it.
     """
 
-    def test_start_and_finish_lines_include_bot_version_and_totals(self, tmp_path, caplog):
+    @pytest.fixture(autouse=True)
+    def _setup_globals(self, tmp_path, caplog):
         orig_cmdargs = getattr(pwbot, 'cmdargs', None)
         orig_config = getattr(pwbot, 'CONFIG', None)
         orig_cachedir = pwbot.CACHEDIR
         pwbot.cmdargs = SimpleNamespace(reposdir=str(tmp_path))
-        pwbot.CONFIG = {'repos': {}}
         pwbot.CACHEDIR = str(tmp_path)
         caplog.set_level(logging.INFO, logger='gitpwcron')
-        try:
+        yield
+        pwbot.cmdargs = orig_cmdargs
+        pwbot.CONFIG = orig_config
+        pwbot.CACHEDIR = orig_cachedir
+
+    @staticmethod
+    def _stats(patches_updated=0, refs_held_back=0, pending_recorded=0, pending_cleared=0):
+        return {'patches_updated': patches_updated, 'refs_held_back': refs_held_back,
+                'pending_recorded': pending_recorded, 'pending_cleared': pending_cleared}
+
+    def _run(self, tmp_path, outcomes):
+        """Run with one repo per outcomes key; each value is the stats
+        pwrun() returns for that repo or the exception it raises."""
+        for name in outcomes:
+            (tmp_path / name).mkdir()
+        pwbot.CONFIG = {'repos': {name: {} for name in outcomes}}
+
+        def fake_pwrun(repo, _settings):
+            result = outcomes[repo.rsplit('/', 1)[-1]]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch.object(pwbot, 'pwrun', side_effect=fake_pwrun) as pw:
             pwbot.check_repos()
-        finally:
-            pwbot.cmdargs = orig_cmdargs
-            pwbot.CONFIG = orig_config
-            pwbot.CACHEDIR = orig_cachedir
+        return [c.args[0].rsplit('/', 1)[-1] for c in pw.call_args_list]
+
+    def test_start_and_finish_lines_include_bot_version_and_totals(self, tmp_path, caplog):
+        self._run(tmp_path, {})
 
         assert f'starting regular run (bot version {pwbot.BOT_VERSION})' in caplog.text
-        assert 'finished regular run: 0 repos processed, 0 patches updated, ' \
+        assert 'finished regular run: 0 repos processed, 0 repos failed, 0 patches updated, ' \
                '0 refs held back, 0 pending ops recorded, 0 pending ops cleared' in caplog.text
 
     def test_totals_aggregate_across_repos(self, tmp_path, caplog):
-        orig_cmdargs = getattr(pwbot, 'cmdargs', None)
-        orig_config = getattr(pwbot, 'CONFIG', None)
-        orig_cachedir = pwbot.CACHEDIR
-        repo_a = tmp_path / 'repo-a'
-        repo_b = tmp_path / 'repo-b'
-        repo_a.mkdir()
-        repo_b.mkdir()
-        pwbot.cmdargs = SimpleNamespace(reposdir=str(tmp_path))
-        pwbot.CONFIG = {'repos': {'repo-a': {}, 'repo-b': {}}}
-        pwbot.CACHEDIR = str(tmp_path)
-        caplog.set_level(logging.INFO, logger='gitpwcron')
+        self._run(tmp_path, {
+            'repo-a': self._stats(patches_updated=2, refs_held_back=1, pending_recorded=1),
+            'repo-b': self._stats(patches_updated=3, pending_cleared=2),
+        })
 
-        stats_by_repo = {
-            str(repo_a): {'patches_updated': 2, 'refs_held_back': 1,
-                          'pending_recorded': 1, 'pending_cleared': 0},
-            str(repo_b): {'patches_updated': 3, 'refs_held_back': 0,
-                          'pending_recorded': 0, 'pending_cleared': 2},
-        }
-        try:
-            with patch.object(pwbot, 'pwrun', side_effect=lambda repo, _settings: stats_by_repo[repo]):
-                pwbot.check_repos()
-        finally:
-            pwbot.cmdargs = orig_cmdargs
-            pwbot.CONFIG = orig_config
-            pwbot.CACHEDIR = orig_cachedir
-
-        assert 'finished regular run: 2 repos processed, 5 patches updated, ' \
+        assert 'finished regular run: 2 repos processed, 0 repos failed, 5 patches updated, ' \
                '1 refs held back, 1 pending ops recorded, 2 pending ops cleared' in caplog.text
+
+    @pytest.mark.parametrize('error', [
+        pwbot.PatchworkFetchError('patch update', 14990005, 403),
+        pwbot.CircuitOpenError('Circuit open for https://pw'),
+        pwbot.requests.exceptions.ConnectionError('connection reset'),
+    ], ids=['forbidden', 'circuit-open', 'connection-error'])
+    def test_failed_repo_does_not_stop_later_repos(self, tmp_path, caplog, error):
+        called = self._run(tmp_path, {
+            'net': error,
+            'net-next': self._stats(patches_updated=4),
+        })
+
+        assert called == ['net', 'net-next']
+        failure = next(r for r in caplog.records if r.levelno == logging.CRITICAL)
+        # CRITICAL is what -q lets through to cron mail; the error text tells
+        # the admin what to fix.
+        assert 'net' in failure.getMessage()
+        assert str(error) in failure.getMessage()
+        assert 'finished regular run: 1 repos processed, 1 repos failed, 4 patches updated, ' \
+               '0 refs held back, 0 pending ops recorded, 0 pending ops cleared' in caplog.text
 
 
 class TestRunHousekeeping:

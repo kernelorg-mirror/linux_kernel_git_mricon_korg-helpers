@@ -46,7 +46,7 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
-BOT_VERSION: str = '2026112001'
+BOT_VERSION: str = '2026112002'
 DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
@@ -1927,6 +1927,7 @@ def check_repos() -> None:
         sys.exit(1)
 
     repos_processed = 0
+    repos_failed = 0
     totals: Dict[str, int] = {
         'patches_updated': 0,
         'refs_held_back': 0,
@@ -1942,14 +1943,25 @@ def check_repos() -> None:
         if not os.path.isdir(fullpath) and not settings.get('branch'):
             logger.info('Worktree must specify "branch" setting: %s', repo)
             continue
-        repo_stats = pwrun(fullpath, settings)
+        # A failure in one repo (e.g. no maintainer rights on one of its
+        # projects, so patchwork answers 403) repeats on every run, so it must
+        # not take every repo after it down with it. pwrun() saves the repo's
+        # heads only once it finishes, so the failed repo is retried in full
+        # next run. Logged at CRITICAL so that it still reaches cron mail
+        # under -q.
+        try:
+            repo_stats = pwrun(fullpath, settings)
+        except (PatchworkFetchError, CircuitOpenError, requests.exceptions.RequestException) as ex:
+            logger.critical('Processing %s failed: %s', repo, ex)
+            repos_failed += 1
+            continue
         repos_processed += 1
         for key in totals:
             totals[key] += repo_stats[key]
 
-    logger.info('=== finished regular run: %d repos processed, %d patches updated, '
+    logger.info('=== finished regular run: %d repos processed, %d repos failed, %d patches updated, '
                 '%d refs held back, %d pending ops recorded, %d pending ops cleared ===',
-                repos_processed, totals['patches_updated'], totals['refs_held_back'],
+                repos_processed, repos_failed, totals['patches_updated'], totals['refs_held_back'],
                 totals['pending_recorded'], totals['pending_cleared'])
 
 
