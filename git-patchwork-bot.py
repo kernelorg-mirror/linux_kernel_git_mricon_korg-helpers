@@ -46,7 +46,7 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
-BOT_VERSION: str = '2026081802'
+BOT_VERSION: str = '2026112001'
 DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
@@ -1953,6 +1953,40 @@ def check_repos() -> None:
                 totals['pending_recorded'], totals['pending_cleared'])
 
 
+def run_housekeeping() -> None:
+    logger.info('=== starting housekeeping run (bot version %s) ===', BOT_VERSION)
+    totals = {'superseded': 0, 'archived': 0, 'series_checked': 0}
+    processed = 0
+    failed = 0
+    for pserver, sconfig in CONFIG['patchworks'].items():
+        for pname in sconfig['projects']:
+            # A project-specific failure (e.g. no maintainer rights, so
+            # patchwork answers 403) repeats on every run, so it must not
+            # take every project after it down with it. Logged at CRITICAL
+            # so that it still reaches cron mail under -q.
+            try:
+                hk_stats = housekeeping(pname)
+            except CircuitOpenError as ex:
+                # The server itself is struggling; leave its remaining
+                # projects alone until the next run.
+                logger.critical('Housekeeping for %s failed, skipping the rest of %s: %s',
+                                pname, pserver, ex)
+                failed += 1
+                break
+            except (PatchworkFetchError, requests.exceptions.RequestException) as ex:
+                logger.critical('Housekeeping for %s failed: %s', pname, ex)
+                failed += 1
+                continue
+            processed += 1
+            for key in totals:
+                totals[key] += hk_stats[key]
+
+    logger.info('=== finished housekeeping run: %d projects processed, %d projects failed, '
+                '%d series checked, %d series superseded, %d patches archived ===',
+                processed, failed, totals['series_checked'], totals['superseded'],
+                totals['archived'])
+
+
 def pwhash_differ() -> None:
     diff = sys.stdin.read()
     inhash = get_patchwork_hash(diff)
@@ -2075,20 +2109,8 @@ if __name__ == '__main__':
         pwhash_differ()
         sys.exit(0)
 
-    if cmdargs.housekeeping or cmdargs.pwhash:
-        logger.info('=== starting housekeeping run (bot version %s) ===', BOT_VERSION)
-        _hk_totals = {'superseded': 0, 'archived': 0, 'series_checked': 0}
-        _hk_projects = 0
-        for _pserver, _sconfig in CONFIG['patchworks'].items():
-            for _pname in _sconfig['projects']:
-                _hk_stats = housekeeping(_pname)
-                _hk_projects += 1
-                for _key in _hk_totals:
-                    _hk_totals[_key] += _hk_stats[_key]
-        logger.info('=== finished housekeeping run: %d projects processed, %d series checked, '
-                    '%d series superseded, %d patches archived ===',
-                    _hk_projects, _hk_totals['series_checked'], _hk_totals['superseded'],
-                    _hk_totals['archived'])
+    if cmdargs.housekeeping:
+        run_housekeeping()
     else:
         if not cmdargs.reposdir:
             logger.critical('-r is required for this mode')

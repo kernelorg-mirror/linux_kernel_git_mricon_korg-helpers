@@ -2099,3 +2099,76 @@ class TestCheckReposLogging:
 
         assert 'finished regular run: 2 repos processed, 5 patches updated, ' \
                '1 refs held back, 1 pending ops recorded, 2 pending ops cleared' in caplog.text
+
+
+class TestRunHousekeeping:
+    """run_housekeeping() walks every configured project. A failure in one
+    project (e.g. the bot lacking maintainer rights there, so patchwork
+    answers 403) must not stop the others: the same failure repeats on
+    every run, so letting it escape stalls housekeeping everywhere after
+    that project for good.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_globals(self, caplog):
+        orig_config = getattr(pwbot, 'CONFIG', None)
+        caplog.set_level(logging.INFO, logger='gitpwcron')
+        yield
+        pwbot.CONFIG = orig_config
+
+    def _run(self, servers, outcomes):
+        """Run with servers={url: [pnames]}; outcomes maps pname to the
+        stats housekeeping() returns or the exception it raises."""
+        pwbot.CONFIG = {'patchworks': {url: {'projects': {p: {} for p in pnames}}
+                                       for url, pnames in servers.items()}}
+
+        def fake_housekeeping(pname):
+            result = outcomes[pname]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with patch.object(pwbot, 'housekeeping', side_effect=fake_housekeeping) as hk:
+            pwbot.run_housekeeping()
+        return [c.args[0] for c in hk.call_args_list]
+
+    @staticmethod
+    def _stats(superseded=0, archived=0, series_checked=0):
+        return {'superseded': superseded, 'archived': archived, 'series_checked': series_checked}
+
+    @pytest.mark.parametrize('error', [
+        pwbot.PatchworkFetchError('patch update', 14990005, 403),
+        pwbot.requests.exceptions.ConnectionError('connection reset'),
+    ], ids=['forbidden', 'connection-error'])
+    def test_failed_project_does_not_stop_later_projects(self, caplog, error):
+        called = self._run({'https://pw': ['ipsec', 'netdevbpf']}, {
+            'ipsec': error,
+            'netdevbpf': self._stats(superseded=5, archived=2, series_checked=40),
+        })
+
+        assert called == ['ipsec', 'netdevbpf']
+        failure = next(r for r in caplog.records if 'ipsec' in r.getMessage()
+                       and r.levelno == logging.CRITICAL)
+        # CRITICAL is what -q lets through to cron mail; the error text tells
+        # the admin what to fix.
+        assert str(error) in failure.getMessage()
+        assert 'finished housekeeping run: 1 projects processed, 1 projects failed, ' \
+               '40 series checked, 5 series superseded, 2 patches archived' in caplog.text
+
+    def test_open_circuit_skips_rest_of_that_server_only(self, caplog):
+        called = self._run({'https://pw': ['alpha', 'beta'], 'https://other': ['gamma']}, {
+            'alpha': pwbot.CircuitOpenError('Circuit open for https://pw'),
+            'beta': self._stats(),
+            'gamma': self._stats(series_checked=3),
+        })
+
+        # A tripped breaker means the server is struggling, so its remaining
+        # projects are left alone; another server is unaffected.
+        assert called == ['alpha', 'gamma']
+        assert 'finished housekeeping run: 1 projects processed, 1 projects failed, ' \
+               '3 series checked, 0 series superseded, 0 patches archived' in caplog.text
+
+    def test_start_line_includes_bot_version(self, caplog):
+        self._run({'https://pw': ['alpha']}, {'alpha': self._stats()})
+        assert f'starting housekeeping run (bot version {pwbot.BOT_VERSION})' in caplog.text
+        assert 'finished housekeeping run: 1 projects processed, 0 projects failed' in caplog.text
