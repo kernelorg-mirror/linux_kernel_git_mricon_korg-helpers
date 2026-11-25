@@ -923,6 +923,36 @@ class TestDatabase:
         assert str(version) == pwbot.DB_VERSION
 
 
+class TestPwrunFirstRun:
+    """The first run for a repo only records its heads.
+
+    Every repo has its own pw.db, so a new database is normal for a repo that
+    was just added to the config, but alarming for any other. The log must
+    name the repo and the database, or an admin cannot tell the two apart.
+    """
+
+    HEADS = [('refs/heads/for-next', 'aaaaaaa')]
+
+    def test_first_run_records_heads_and_names_the_repo(self, tmp_path, caplog, monkeypatch):
+        repo_dir = tmp_path / 'tegra' / 'linux.git'
+        repo_dir.mkdir(parents=True)
+        monkeypatch.setattr(pwbot, 'cmdargs', SimpleNamespace(ancestors=None), raising=False)
+        caplog.set_level(logging.INFO, logger='gitpwcron')
+
+        with patch.object(pwbot, 'git_get_repo_heads', return_value=self.HEADS), \
+             patch.object(pwbot, 'git_get_new_revs') as new_revs:
+            stats = pwbot.pwrun(str(repo_dir), {'projects': {'linux-tegra': {}}})
+
+        dbpath = repo_dir / 'pw.db'
+        assert f'New repo {repo_dir}: created {dbpath}' in caplog.text
+        # Nothing is analyzed until the heads move past the recorded ones.
+        new_revs.assert_not_called()
+        assert stats['patches_updated'] == 0
+        conn = sqlite3.connect(str(dbpath))
+        assert pwbot.db_get_repo_heads(conn.cursor()) == self.HEADS
+        conn.close()
+
+
 class TestAutoArchive:
     """Tests for the autoarchive branch of housekeeping().
 

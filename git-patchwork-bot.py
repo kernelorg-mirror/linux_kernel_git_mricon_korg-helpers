@@ -46,7 +46,7 @@ from urllib3.util.retry import Retry
 charset.add_charset('utf-8', charset.SHORTEST)
 
 __VERSION__: str = '2.0'
-BOT_VERSION: str = '2026112002'
+BOT_VERSION: str = '2026112501'
 DB_VERSION: str = '2'
 REST_API_VERSION: str = '1.2'
 MSGID_LINK_RE: re.Pattern[str] = re.compile(
@@ -614,7 +614,6 @@ def db_init_common_sqlite_db(c: sqlite3.Cursor) -> None:
 
 
 def db_init_pw_sqlite_db(c: sqlite3.Cursor) -> None:
-    logger.info('Initializing new sqlite3 db with metadata version %s', DB_VERSION)
     db_init_common_sqlite_db(c)
     c.execute('''
         CREATE TABLE heads (
@@ -1601,6 +1600,7 @@ def pwrun(repo: str, rsettings: Dict[str, Any]) -> Dict[str, int]:
     db_ensure_pending_ops(c)
 
     if not db_exists:
+        logger.info('New repo %s: created %s, will process changes from the next run', repo, dbpath)
         db_init_pw_sqlite_db(c)
         initial_git_heads = git_get_repo_heads(repo, branch=rsettings.get('branch', '--heads'),
                                                ancestry=cmdargs.ancestors)
